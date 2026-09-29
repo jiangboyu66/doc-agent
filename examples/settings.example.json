@@ -1,0 +1,26 @@
+{
+  "model": "deepseek-flash",
+  "thinking": "enabled",
+  "reasoningEffort": "high",
+  "permissionMode": "default",
+  "trackChanges": true,
+  "author": "张三",
+  "maxBudgetUsd": 1,
+  "permissions": {
+    "allow": ["doc_format_text", "doc_add_comment", "doc_export"],
+    "ask": ["doc_delete_blocks"],
+    "deny": []
+  },
+  "hooks": {
+    "PreToolUse": [
+      { "matcher": "doc_delete_blocks", "hooks": [{ "type": "command", "command": "node examples/hooks/limit-delete.mjs", "timeout": 10 }] }
+    ],
+    "PostToolUse": [
+      { "matcher": "doc_(replace_text|format_text|set_paragraph|insert_blocks|delete_blocks|insert_table_row|add_comment)", "hooks": [{ "type": "command", "command": "node examples/hooks/audit-log.mjs" }] }
+    ]
+  },
+  "features": {
+    "SUBAGENTS": true,
+    "AUTO_COMPACT": true
+  }
+}

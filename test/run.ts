@@ -1,0 +1,505 @@
+/**
+ * 自动化测试（npm test）
+ *
+ *  1. 引擎保真：字节级往返、最小修改、格式继承、修订/批注、引用过期检测（docx / markdown / html）
+ *  2. 代理主循环：用"脚本化的模拟模型"跑完整的 QueryEngine——并行只读工具、权限确认（允许 / 记住 / 拒绝）、
+ *     plan 模式拦截、先读后改、并行子代理、保真守卫、消息配对修复、压缩。
+ *
+ * 不调用真实的 DeepSeek API，不需要 API Key。设置 DOC_AGENT_TEST_DOCX=某个.docx 可额外对真实文档做往返与编辑测试。
+ */
+
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+// 数据目录、用户目录必须在导入任何模块之前指向临时目录（PATHS 在模块加载时确定）
+const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "doc-agent-test-"));
+process.env.DOC_AGENT_DATA_DIR = path.join(tmp, "data");
+process.env.DOC_AGENT_USER_DIR = path.join(tmp, "user");
+
+const here = path.dirname(fileURLToPath(import.meta.url));
+const fixture = (n: string) => fs.readFile(path.join(here, "fixtures", n));
+
+const { DocxDocument } = await import("../src/documents/docx/DocxDocument.js");
+const { MarkdownDocument } = await import("../src/documents/markdown/MarkdownDocument.js");
+const { HtmlDocument } = await import("../src/documents/html/HtmlDocument.js");
+const { ZipPackage } = await import("../src/documents/docx/zip.js");
+const { computeHunks } = await import("../src/documents/textMatch.js");
+const { Session } = await import("../src/session/Session.js");
+const { QueryEngine } = await import("../src/QueryEngine.js");
+const { bootstrap } = await import("../src/bootstrap.js");
+const { normalizeMessagesForAPI } = await import("../src/services/api/normalize.js");
+const { microCompact } = await import("../src/services/compact.js");
+const { processUserInput } = await import("../src/commands.js");
+type ApiMessage = import("../src/services/api/deepseek.js").ApiMessage;
+type ModelClient = import("../src/services/api/deepseek.js").ModelClient;
+type CompletionResult = import("../src/services/api/deepseek.js").CompletionResult;
+type EngineEvent = import("../src/bridge/protocol.js").EngineEvent;
+type PermissionRequest = import("../src/bridge/protocol.js").PermissionRequest;
+type PermissionResponse = import("../src/bridge/protocol.js").PermissionResponse;
+
+// ---------------------------------------------------------------------------
+// 迷你测试框架
+// ---------------------------------------------------------------------------
+
+const results: Array<{ name: string; ok: boolean; err?: string }> = [];
+async function test(name: string, fn: () => unknown | Promise<unknown>) {
+  try {
+    await fn();
+    results.push({ name, ok: true });
+    console.log(`  \x1b[32m✓\x1b[0m ${name}`);
+  } catch (e: any) {
+    results.push({ name, ok: false, err: e?.stack ?? String(e) });
+    console.log(`  \x1b[31m✗ ${name}\x1b[0m\n    ${String(e?.message ?? e).split("\n").join("\n    ")}`);
+  }
+}
+function assert(cond: unknown, msg: string): asserts cond {
+  if (!cond) throw new Error(msg);
+}
+function eq<T>(a: T, b: T, msg: string) {
+  if (a !== b) throw new Error(`${msg}\n      期望：${JSON.stringify(b)}\n      实际：${JSON.stringify(a)}`);
+}
+const count = (s: string, sub: string | RegExp) => (typeof sub === "string" ? s.split(sub).length - 1 : (s.match(new RegExp(sub, "g")) ?? []).length);
+const docText = (buf: Buffer) => new DocxDocument(buf).listBlocks().map((b) => b.text).join("\n");
+const docXml = (buf: Buffer) => new ZipPackage(buf).readText("word/document.xml");
+const O = (track = false) => ({ track, author: "测试 作者", date: "2026-09-29T00:00:00Z" });
+
+// ---------------------------------------------------------------------------
+console.log("\n文本差分");
+// ---------------------------------------------------------------------------
+
+await test("最小差分只覆盖真正变化的字符", () => {
+  const hunks = computeHunks("First A. Author1, Fellow", "Zhang San1, Fellow");
+  assert(hunks.length >= 1, "应产生差分");
+  const old = "First A. Author1, Fellow";
+  for (const h of hunks) assert(!old.slice(h.start, h.end).includes("1,"), `上标数字不应落入修改区：${JSON.stringify(h)}`);
+});
+
+await test("差分位置按旧文本计算（中英混排）", () => {
+  const a = "Another paragraph with a link and much more.";
+  const b = "Another paragraph with a link and so much more.";
+  const hunks = computeHunks(a, b);
+  let out = a;
+  for (const h of [...hunks].sort((x, y) => y.start - x.start)) out = out.slice(0, h.start) + h.text + out.slice(h.end);
+  eq(out, b, "应用差分后应得到新文本");
+});
+
+// ---------------------------------------------------------------------------
+console.log("\nWord（.docx）");
+// ---------------------------------------------------------------------------
+
+const sampleDocx = await fixture("sample.docx");
+
+await test("未修改时字节级完全一致", () => {
+  const d = new DocxDocument(sampleDocx);
+  assert(Buffer.compare(d.serialize(), sampleDocx) === 0, "序列化结果与原文件不是字节一致");
+});
+
+await test("替换文字：只改动一个段落，其余部件字节一致，加粗 run 保留", () => {
+  const d = new DocxDocument(sampleDocx);
+  const r = d.replaceText({ oldText: "智能代理", newText: "文档代理" }, O());
+  eq(r.changedRefs.length, 1, "应只修改一个段落");
+  const rep = d.fidelity(sampleDocx);
+  assert(rep.ok, `保真检查失败：${rep.problems.join("；")}`);
+  eq(rep.modifiedParts.length, 1, "应只有 document.xml 被修改");
+  eq(rep.modifiedParts[0].changedBlocks.length, 1, "document.xml 中应只有一个段落变化");
+  const xml = docXml(d.serialize());
+  // 最小差分只改"智能"→"文档"，"代理"所在的 run 原样保留
+  assert(xml.includes("<w:t>文档</w:t>") && !xml.includes("智能"), "文字未替换");
+  const block = d.listBlocks().find((b) => b.text.includes("文档代理"))!;
+  assert(d.describeFormat(block.ref).includes("加粗"), "同段落中的加粗 run 应保持加粗");
+});
+
+await test("直引号可以匹配文档中的弯引号", () => {
+  const d = new DocxDocument(sampleDocx);
+  d.replaceText({ oldText: "It's a well-known pangram.", newText: "It's a famous pangram." }, O());
+  assert(d.listBlocks().some((b) => b.text.includes("famous pangram")), "替换失败");
+});
+
+await test("修改相邻文字时上标 run 原样保留", () => {
+  const d = new DocxDocument(sampleDocx);
+  const before = count(docXml(sampleDocx), 'w:val="superscript"');
+  d.replaceText({ oldText: "后面是普通文字", newText: "后面是正文文字" }, O());
+  const xml = docXml(d.serialize());
+  eq(count(xml, 'w:val="superscript"'), before, "上标数量变化");
+  assert(/<w:vertAlign w:val="superscript"\/><\/w:rPr><w:t>2<\/w:t>/.test(xml), "上标 2 丢失");
+  assert(/<w:color w:val="C00000"\/>[\s\S]*?<w:t>红色强调文字<\/w:t>/.test(xml), "红色格式丢失");
+});
+
+await test("修订模式生成 w:ins / w:del，作者含空格也正确", () => {
+  const d = new DocxDocument(sampleDocx);
+  d.replaceText({ oldText: "最小化修改", newText: "最小化、可追溯的修改" }, O(true));
+  const xml = docXml(d.serialize());
+  assert(count(xml, "<w:ins ") >= 1, "缺少 w:ins");
+  assert(/w:author="测试 作者"/.test(xml), "作者名错误");
+  assert(d.fidelity(sampleDocx).ok, "修订模式下保真检查失败");
+});
+
+await test("修订模式下删除文字用 w:delText", () => {
+  const d = new DocxDocument(sampleDocx);
+  d.replaceText({ oldText: "第一步：读取文档。", newText: "第一步：读取。" }, O(true));
+  const xml = docXml(d.serialize());
+  assert(/<w:del [^>]*>[\s\S]*?<w:delText[^>]*>文档<\/w:delText>/.test(xml), "删除的文字应在 w:delText 中");
+});
+
+await test("文字格式 / 段落格式（修订模式带 rPrChange / pPrChange）", () => {
+  const d = new DocxDocument(sampleDocx);
+  const ref = d.search("结论段落", {})[0].ref;
+  d.formatText({ ref, text: "结论", format: { bold: true, color: "1F4E79" } }, O(true));
+  d.setParagraph({ refs: [ref], format: { alignment: "justify", space_after_pt: 6 } }, O(true));
+  const xml = docXml(d.serialize());
+  assert(xml.includes("w:rPrChange") && xml.includes("w:pPrChange"), "缺少格式修订记录");
+  assert(xml.includes('<w:jc w:val="both"/>'), "对齐未生效");
+});
+
+await test("插入段落沿用同样式段落格式；插入后旧的序号引用报过期", () => {
+  const d = new DocxDocument(sampleDocx);
+  const anchor = d.search("第一步", {})[0].ref;
+  const oldRef = d.search("结论段落", {})[0].ref;
+  const r = d.insertBlocks({ anchor, position: "after", blocks: [{ text: "第一步半：规划修改。" }, { text: "3. 结果", style: "Heading 1" }] }, O());
+  eq(r.changedRefs.length, 2, "应插入两个段落");
+  const blocks = d.listBlocks();
+  const inserted = blocks.find((b) => b.text === "第一步半：规划修改。")!;
+  eq(inserted.style, blocks.find((b) => b.text.startsWith("第一步："))!.style, "新段落应沿用列表样式");
+  eq(blocks.find((b) => b.text === "3. 结果")!.kind, "heading", "新标题应识别为标题");
+  if (/^P\d+@v\d+$/.test(oldRef)) {
+    let code = "";
+    try { d.getBlock(oldRef); } catch (e: any) { code = e.code; }
+    eq(code, "stale_ref", "旧引用应报过期");
+  }
+});
+
+await test("删除段落 / 表格插行 / 批注", () => {
+  const d = new DocxDocument(sampleDocx);
+  d.deleteBlocks({ refs: [d.search("The quick brown fox", {})[0].ref] }, O());
+  const cell = d.search("速度", {})[0];
+  d.insertTableRow({ ref: cell.ref, position: "after", cells: ["a", "加速度", "m/s²"] }, O(true));
+  d.addComment({ ref: d.search("深度学习", {})[0].ref, text: "深度学习", comment: "请补充参考文献" }, O());
+  const out = d.serialize();
+  const pkg = new ZipPackage(out);
+  assert(pkg.readText("word/comments.xml").includes("请补充参考文献"), "批注内容缺失");
+  assert(pkg.readText("[Content_Types].xml").includes("comments+xml"), "缺少批注的内容类型");
+  assert(pkg.readText("word/_rels/document.xml.rels").includes("comments.xml"), "缺少批注关系");
+  const xml = docXml(out);
+  assert(!xml.includes("The quick brown fox"), "段落未删除");
+  assert(xml.includes("加速度"), "表格行未插入");
+  const rep = d.fidelity(sampleDocx);
+  assert(rep.ok, rep.problems.join("；"));
+  // 重新加载能正常解析
+  const again = new DocxDocument(out);
+  assert(again.listBlocks().some((b) => b.text === "加速度"), "重新加载后找不到新增的行");
+});
+
+await test("找不到 / 多处匹配时给出可操作的错误", () => {
+  const d = new DocxDocument(sampleDocx);
+  let e1: any, e2: any;
+  try { d.replaceText({ oldText: "不存在的句子", newText: "x" }, O()); } catch (e) { e1 = e; }
+  try { d.replaceText({ oldText: "第", newText: "x" }, O()); } catch (e) { e2 = e; }
+  eq(e1?.code, "not_found", "应报 not_found");
+  eq(e2?.code, "ambiguous", "应报 ambiguous");
+});
+
+if (process.env.DOC_AGENT_TEST_DOCX) {
+  await test(`真实文档往返：${path.basename(process.env.DOC_AGENT_TEST_DOCX)}`, async () => {
+    const buf = await fs.readFile(process.env.DOC_AGENT_TEST_DOCX!);
+    const d = new DocxDocument(buf);
+    assert(Buffer.compare(d.serialize(), buf) === 0, "往返不一致");
+    const b = d.listBlocks().find((x) => x.text.length > 30 && !x.text.includes("⟨"))!;
+    const word = b.text.slice(5, 15);
+    d.replaceText({ ref: b.ref, oldText: word, newText: word + "（改）" }, O(true));
+    const rep = d.fidelity(buf);
+    assert(rep.ok, rep.problems.join("；"));
+    console.log(`      ${rep.identicalParts}/${rep.totalParts} 个部件字节一致`);
+  });
+}
+
+// ---------------------------------------------------------------------------
+console.log("\nMarkdown / HTML");
+// ---------------------------------------------------------------------------
+
+await test("Markdown：往返一致，修改保留行内标记与 CRLF 换行", async () => {
+  const src = (await fixture("sample.md")).toString("utf8").replace(/\r?\n/g, "\r\n");
+  const d = new MarkdownDocument(Buffer.from(src));
+  eq(d.serialize().toString("utf8"), src, "往返不一致");
+  d.replaceText({ oldText: "第一段", newText: "首段" }, O());
+  const out = d.serialize().toString("utf8");
+  assert(out.includes("**首段**"), "加粗标记丢失");
+  assert(out.includes("[链接](https://example.com)"), "链接被破坏");
+  eq(count(out, "\r\n"), count(src, "\r\n"), "换行符数量变化");
+  assert(!/[^\r]\n/.test(out), "混入了 LF 换行");
+});
+
+await test("HTML：实体、属性与未修改部分原样保留", async () => {
+  const src = (await fixture("sample.html")).toString("utf8");
+  const d = new HtmlDocument(Buffer.from(src));
+  eq(d.serialize().toString("utf8"), src, "往返不一致");
+  d.replaceText({ oldText: "and much more", newText: "and so much more" }, O());
+  d.replaceText({ oldText: "副标题", newText: "小标题" }, O());
+  const out = d.serialize().toString("utf8");
+  assert(out.includes("and so much more"), `替换结果错误：${out.match(/Another.*<\/p>/)?.[0]}`);
+  assert(out.includes("标题 &amp; 小标题"), "实体被破坏");
+  assert(out.includes('<p class="note">这是 <b>加粗</b> 的段落，包含&nbsp;实体。</p>'), "未修改段落发生变化");
+  assert(out.includes("<style>p.note { color: #555; }</style>"), "样式表发生变化");
+});
+
+// ---------------------------------------------------------------------------
+console.log("\n代理主循环（模拟模型）");
+// ---------------------------------------------------------------------------
+
+type Step = (req: { system: string; messages: ApiMessage[]; tools: Array<{ function: { name: string } }> }) => Partial<CompletionResult>;
+let callSeq = 0;
+const tc = (name: string, args: unknown) => ({ id: `call_${++callSeq}`, type: "function" as const, function: { name, arguments: JSON.stringify(args) } });
+
+/** 脚本化模型：主代理按脚本逐步回答；子代理（工具列表里没有 agent）统一返回一段审校意见 */
+class MockClient implements ModelClient {
+  model = "deepseek-flash";
+  thinking = true;
+  requests: Array<{ messages: ApiMessage[]; tools: string[] }> = [];
+  subActive = 0;
+  subMaxConcurrent = 0;
+  constructor(private steps: Step[]) {}
+  async complete(req: any, opts: any): Promise<CompletionResult> {
+    const tools = req.tools.map((t: any) => t.function.name);
+    this.requests.push({ messages: structuredClone(req.messages), tools });
+    const base = { content: "", reasoning: "（思考）", toolCalls: [], finishReason: "stop", usage: { promptTokens: 1000, cachedTokens: 800, completionTokens: 50 } };
+    if (!tools.includes("agent") && !tools.includes("todo_write")) {
+      // 子代理
+      this.subActive++;
+      this.subMaxConcurrent = Math.max(this.subMaxConcurrent, this.subActive);
+      await new Promise((r) => setTimeout(r, 30));
+      this.subActive--;
+      return { ...base, content: "审校完成：未发现问题。" };
+    }
+    const step = this.steps.shift();
+    if (!step) return { ...base, content: "完成。" };
+    const r = step(req);
+    if (r.content) opts.onChunk?.({ kind: "text", text: r.content });
+    return { ...base, ...r } as CompletionResult;
+  }
+}
+
+const runtime = await bootstrap({ permissionMode: "default" });
+
+async function newSession(name = "sample.docx") {
+  return Session.create(await fixture(name), name, { mode: "default", trackChanges: false, author: "测试" });
+}
+
+async function drive(session: Awaited<ReturnType<typeof Session.create>>, client: ModelClient, prompt: string, decide: (r: PermissionRequest) => PermissionResponse) {
+  const events: EngineEvent[] = [];
+  const asked: PermissionRequest[] = [];
+  const engine = new QueryEngine(session, {
+    client, settings: runtime.settings, skills: runtime.skills, agents: runtime.agents, memory: "",
+    canUseTool: async (req) => { asked.push(req); return decide(req); },
+  });
+  for await (const e of engine.submitMessage(prompt, new AbortController().signal)) events.push(e);
+  return { events, asked, engine };
+}
+
+/** 历史中每个 tool_call 都有且只有一个对应结果，且紧随其后 */
+function assertPaired(history: ApiMessage[]) {
+  for (let i = 0; i < history.length; i++) {
+    const m = history[i];
+    if (m.role !== "assistant" || !m.tool_calls?.length) continue;
+    const ids = m.tool_calls.map((t) => t.id);
+    const following = history.slice(i + 1, i + 1 + ids.length);
+    for (const id of ids) assert(following.some((f) => f.role === "tool" && f.tool_call_id === id), `tool_call ${id} 缺少紧随的结果`);
+  }
+}
+
+await test("完整流程：并行读取 → 预览确认 → 修改 → 并行子代理审校", async () => {
+  const s = await newSession();
+  let findRef = "";
+  const client = new MockClient([
+    () => ({ toolCalls: [tc("doc_outline", {}), tc("doc_search", { query: "智能代理" })] }),
+    (req) => {
+      const last = req.messages[req.messages.length - 1] as any;
+      findRef = /(#[0-9A-F]{8}|P\d+@v\d+)/.exec(last.content)?.[1] ?? "";
+      return { toolCalls: [tc("doc_replace_text", { ref: findRef, old_text: "智能代理", new_text: "文档代理", reason: "术语统一" })] };
+    },
+    () => ({ toolCalls: [tc("agent", { subagent_type: "reviewer", description: "审前半", prompt: "审校前半部分" }), tc("agent", { subagent_type: "reviewer", description: "审后半", prompt: "审校后半部分" })] }),
+    () => ({ content: "已把“智能代理”改为“文档代理”，审校未发现问题。" }),
+  ]);
+  const { events, asked } = await drive(s, client, "把智能代理改成文档代理，然后审校", () => ({ decision: "allow", remember: "session" }));
+  assert(findRef, "模型应从搜索结果拿到段落引用");
+  eq(asked.length, 1, "应只请求一次确认");
+  assert(asked[0].preview?.[0]?.after.includes("文档代理"), "确认请求应带有干跑预览");
+  eq(s.meta.currentVersion, 1, "应提交一个新版本");
+  assert(s.meta.sessionRules.some((r) => r.startsWith("doc_replace_text")), "“本次会话都允许”应记录会话规则");
+  assert(docText(s.current()).includes("文档代理"), "文档未修改");
+  assert(events.some((e) => e.type === "doc_changed"), "缺少 doc_changed 事件");
+  eq(events.filter((e) => e.type === "subagent" && e.status === "start").length, 2, "应启动两个子代理");
+  eq(client.subMaxConcurrent, 2, "两个只读子代理应并行执行");
+  eq(events[events.length - 1].type, "done", "最后一个事件应是 done");
+  assertPaired(s.history);
+  // 带思考模式时每个 assistant 消息都回传了 reasoning_content
+  for (const r of client.requests) for (const m of r.messages) if (m.role === "assistant") assert(typeof (m as any).reasoning_content === "string", "assistant 消息缺少 reasoning_content");
+  // 系统提醒只出现在用户消息里，系统提示词保持稳定（利于前缀缓存）
+  assert((s.history[0] as any).content.includes("<system-reminder>"), "用户消息应附带 system-reminder");
+});
+
+await test("会话规则生效：同类修改不再询问；/undo 回到上一版本", async () => {
+  const s = await newSession();
+  s.meta.sessionRules.push("doc_replace_text");
+  const client = new MockClient([
+    () => ({ toolCalls: [tc("doc_read", { offset: 0, limit: 50 })] }),
+    () => ({ toolCalls: [tc("doc_replace_text", { old_text: "最小化修改", new_text: "精确修改" })] }),
+    () => ({ content: "好了" }),
+  ]);
+  const { asked } = await drive(s, client, "改一下", () => ({ decision: "deny" }));
+  eq(asked.length, 0, "已有会话规则时不应再询问");
+  eq(s.meta.currentVersion, 1, "应生成版本 1");
+  const out = await processUserInput("/undo", { session: s, runtime, compact: async () => ({ before: 0, after: 0 }) });
+  eq(out.kind, "local", "/undo 应是本地命令");
+  assert(!docText(s.current()).includes("精确修改") && docText(s.current()).includes("最小化修改"), "/undo 后文档应回到修改前");
+});
+
+await test("拒绝并反馈：文档不变，反馈回传给模型", async () => {
+  const s = await newSession();
+  const client = new MockClient([
+    () => ({ toolCalls: [tc("doc_read", {})] }),
+    () => ({ toolCalls: [tc("doc_replace_text", { old_text: "深度学习", new_text: "机器学习" })] }),
+    () => ({ content: "明白，不改了。" }),
+  ]);
+  await drive(s, client, "改术语", () => ({ decision: "deny", feedback: "保留原术语" }));
+  eq(s.meta.currentVersion, 0, "被拒绝时不应产生新版本");
+  const toolMsgs = s.history.filter((m) => m.role === "tool").map((m) => (m as any).content as string);
+  assert(toolMsgs.some((c) => c.includes("保留原术语")), "用户反馈应回传给模型");
+  assertPaired(s.history);
+});
+
+await test("先读后改：未读取文档时写工具被拒绝", async () => {
+  const s = await newSession();
+  const client = new MockClient([
+    () => ({ toolCalls: [tc("doc_replace_text", { old_text: "深度学习", new_text: "机器学习" })] }),
+    () => ({ content: "好" }),
+  ]);
+  const { asked } = await drive(s, client, "直接改", () => ({ decision: "allow" }));
+  eq(asked.length, 0, "未读取时不应走到确认环节");
+  eq(s.meta.currentVersion, 0, "不应修改");
+});
+
+await test("plan 模式：写工具被拦截，exit_plan_mode 经确认后切换模式", async () => {
+  const s = await newSession();
+  s.meta.mode = "plan";
+  const client = new MockClient([
+    (req) => {
+      assert(req.tools.some((t) => t.function.name === "exit_plan_mode"), "plan 模式下应提供 exit_plan_mode");
+      return { toolCalls: [tc("doc_read", {}), tc("doc_replace_text", { old_text: "深度学习", new_text: "机器学习" })] };
+    },
+    () => ({ toolCalls: [tc("exit_plan_mode", { plan: "1. 把深度学习改为机器学习" })] }),
+    () => ({ content: "计划已确认" }),
+  ]);
+  const { asked, events } = await drive(s, client, "先出计划", () => ({ decision: "allow" }));
+  eq(s.meta.currentVersion, 0, "plan 模式下不应修改文档");
+  eq(asked.length, 1, "只有 exit_plan_mode 需要确认");
+  eq(asked[0].tool, "exit_plan_mode", "确认的应是计划");
+  eq(s.meta.mode, "default", "确认计划后应退出 plan 模式");
+  assert(events.some((e) => e.type === "mode_changed"), "缺少 mode_changed 事件");
+});
+
+await test("acceptEdits 模式：非破坏性修改自动放行，删除仍需确认", async () => {
+  const s = await newSession();
+  s.meta.mode = "acceptEdits";
+  let ref = "";
+  const client = new MockClient([
+    () => ({ toolCalls: [tc("doc_search", { query: "pangram" })] }),
+    (req) => {
+      ref = /(#[0-9A-F]{8}|P\d+@v\d+)/.exec((req.messages[req.messages.length - 1] as any).content)![1];
+      return { toolCalls: [tc("doc_replace_text", { old_text: "lazy dog", new_text: "sleepy dog" }), tc("doc_delete_blocks", { refs: [ref] })] };
+    },
+    () => ({ content: "ok" }),
+  ]);
+  const { asked } = await drive(s, client, "改", () => ({ decision: "deny" }));
+  eq(asked.length, 1, "只有删除需要确认");
+  eq(asked[0].tool, "doc_delete_blocks", "应确认删除操作");
+  eq(s.meta.currentVersion, 1, "替换应自动生效");
+});
+
+await test("工具报错时文档回滚、错误信息回传模型继续", async () => {
+  const s = await newSession();
+  s.meta.mode = "bypassPermissions";
+  const client = new MockClient([
+    () => ({ toolCalls: [tc("doc_read", {})] }),
+    () => ({ toolCalls: [tc("doc_replace_text", { old_text: "第", new_text: "X" }), tc("doc_replace_text", { old_text: "结论段落", new_text: "总结段落" })] }),
+    () => ({ content: "ok" }),
+  ]);
+  await drive(s, client, "改", () => ({ decision: "allow" }));
+  const toolMsgs = s.history.filter((m) => m.role === "tool").map((m) => (m as any).content as string);
+  assert(toolMsgs.some((c) => c.startsWith("错误：") && c.includes("处")), "多处匹配的错误应回传");
+  eq(s.meta.currentVersion, 1, "第二个修改应成功");
+  const text = docText(s.current());
+  assert(!text.includes("X") && text.includes("总结段落"), "失败的修改不应残留");
+});
+
+await test("干跑预览不会因为结构版本被误判为过期引用", async () => {
+  const s = await newSession();
+  s.meta.mode = "bypassPermissions";
+  // 先插入段落让结构版本递增，再在 default 模式下用新引用修改（需要干跑预览）
+  const client = new MockClient([
+    () => ({ toolCalls: [tc("doc_read", {})] }),
+    (req) => {
+      const anchor = /(#[0-9A-F]{8}|P\d+@v\d+)\]?[^\n]*第一步/.exec((req.messages[req.messages.length - 1] as any).content)?.[1];
+      return { toolCalls: [tc("doc_insert_blocks", { anchor, position: "after", blocks: [{ text: "新增一步。" }] })] };
+    },
+    () => { s.meta.mode = "default"; return { toolCalls: [tc("doc_search", { query: "结论段落" })] }; },
+    (req) => {
+      const ref = /(#[0-9A-F]{8}|P\d+@v\d+)/.exec((req.messages[req.messages.length - 1] as any).content)![1];
+      return { toolCalls: [tc("doc_replace_text", { ref, old_text: "结论", new_text: "总结" })] };
+    },
+    () => ({ content: "ok" }),
+  ]);
+  const { asked } = await drive(s, client, "改", () => ({ decision: "allow" }));
+  eq(s.doc.structureVersion >= 1, true, "插入后结构版本应递增");
+  eq(asked.length, 1, "修改应请求确认（而不是在干跑时报错）");
+  assert(asked[0].preview?.length, "应有预览");
+  assert(docText(s.current()).includes("总结段落"), "修改未生效");
+  // 重新加载会话，结构版本保持
+  const again = await Session.load(s.id);
+  eq(again.doc.structureVersion, s.doc.structureVersion, "重新加载后结构版本应保持");
+});
+
+await test("消息规范化：补齐缺失的工具结果、丢弃孤立结果", () => {
+  const broken: ApiMessage[] = [
+    { role: "user", content: "hi" },
+    { role: "assistant", content: null, tool_calls: [{ id: "a", type: "function", function: { name: "doc_read", arguments: "{}" } }] },
+    { role: "user", content: "again" },
+    { role: "tool", tool_call_id: "zzz", content: "orphan" },
+  ];
+  const n = normalizeMessagesForAPI(broken, true);
+  assertPaired(n);
+  assert(!n.some((m) => m.role === "tool" && m.tool_call_id === "zzz"), "孤立的工具结果应被丢弃");
+  assert(n.filter((m) => m.role === "assistant").every((m) => (m as any).reasoning_content !== undefined), "思考模式下应补 reasoning_content");
+});
+
+await test("微压缩：只折叠较早的大段工具输出", () => {
+  const h: ApiMessage[] = [];
+  for (let i = 0; i < 10; i++) {
+    h.push({ role: "assistant", content: null, tool_calls: [{ id: `t${i}`, type: "function", function: { name: "doc_read", arguments: "{}" } }] });
+    h.push({ role: "tool", tool_call_id: `t${i}`, content: "x".repeat(3000) });
+  }
+  const saved = microCompact(h, 6);
+  assert(saved > 0, "应节省上下文");
+  eq(h.filter((m) => m.role === "tool" && m.content.length > 2000).length, 6, "最近 6 个结果应保留");
+});
+
+await test("本地斜杠命令不调用模型", async () => {
+  const s = await newSession();
+  for (const cmd of ["/help", "/cost", "/mode acceptEdits", "/history", "/verify", "/skills", "/agents"]) {
+    const r = await processUserInput(cmd, { session: s, runtime, compact: async () => ({ before: 0, after: 0 }) });
+    eq(r.kind, "local", `${cmd} 应为本地命令`);
+  }
+  eq(s.meta.mode, "acceptEdits", "/mode 应切换模式");
+  const r = await processUserInput("/proofread 第二节", { session: s, runtime, compact: async () => ({ before: 0, after: 0 }) });
+  eq(r.kind, "prompt", "技能命令应转成提示词");
+});
+
+// ---------------------------------------------------------------------------
+
+await fs.rm(tmp, { recursive: true, force: true });
+const failed = results.filter((r) => !r.ok);
+console.log(`\n${results.length - failed.length}/${results.length} 通过`);
+if (failed.length) {
+  for (const f of failed) console.log(`\n\x1b[31m${f.name}\x1b[0m\n${f.err}`);
+  process.exit(1);
+}

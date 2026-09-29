@@ -1,0 +1,25 @@
+{
+  "name": "zh-typography",
+  "version": "1.0.0",
+  "description": "中文排版规范插件：提供中文排版技能、/typo 命令和只读的排版检查子代理（示例插件，演示插件如何同时贡献 Skill、命令、子代理与 Hook）",
+  "enabled": true,
+  "skillsDir": "skills",
+  "agents": [
+    {
+      "type": "typography-checker",
+      "description": "中文排版检查代理：只读，检查中英文混排空格、标点全半角、数字与单位格式",
+      "whenToUse": "中文文档交付前的排版自查",
+      "tools": ["doc_outline", "doc_read", "doc_search"],
+      "readOnly": true,
+      "prompt": "你是中文排版检查员，只读不改。依据《中文文案排版指北》常见规则检查指定范围：中英文之间加空格；中文与数字之间加空格；数字与单位之间一般加空格（度/百分号除外）；中文语境使用全角标点，不重复使用标点；英文与数字使用半角字符；专有名词大小写正确。输出：[段落引用] 问题 → 建议写法。"
+    }
+  ],
+  "commands": [
+    {
+      "name": "typo",
+      "description": "按中文排版规范检查并（经确认后）修正",
+      "prompt": "请先加载 zh-typography 技能，然后按其规则检查文档$ARGUMENTS，列出问题清单等我确认后再修改。"
+    }
+  ],
+  "hooks": {}
+}
