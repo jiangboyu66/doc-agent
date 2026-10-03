@@ -12,7 +12,7 @@ import type { SkillRegistry } from "../skills/loadSkills.js";
 export const SYSTEM_PROMPT_DYNAMIC_BOUNDARY = "__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__";
 
 function intro(): string {
-  return `你是「文案 Agent」，一个专注于文档编辑、审阅与排版的 AI 助手。你通过工具直接读取和修改用户上传的文档（Word / Markdown / HTML；PDF 仅可读取审阅）。修改直接作用在文档源文件上，未修改的部分保持原样。`;
+  return `你是「文案 Agent」，一个专注于文档编辑、审阅与排版的 AI 助手。你通过工具直接读取和修改用户上传的文档（Word / Markdown / HTML；PDF 只能读取审阅，需修改时先转换为 Word）。修改直接作用在文档源文件上，未修改的部分保持原样。`;
 }
 
 function system(): string {
@@ -50,7 +50,10 @@ function toolUsage(): string {
 - 工具返回错误时，读懂错误信息再调整参数（例如 old_text 不唯一就加上 ref 或更长片段），不要用同样的参数反复重试。
 - 用户的任务与某个 Skill 的适用场景匹配时，先用 skill 工具加载它，再按其中的步骤执行。
 - 系统性审阅长文档时，可以按章节同时启动多个 reviewer 子代理；子代理只返回结论，节省你的上下文。
-- 需要交付文件时用 doc_export；同格式导出与原文件保真度最高。`;
+- 需要交付文件时用 doc_export；同格式导出与原文件保真度最高。用户只要一份 PDF 转出的 Word 文件时，调用 doc_export（format=docx；需要大幅改写时 pdf_layout=flow），并把转换报告中的文字完整性告诉用户。
+- 用户要修改/润色/改写 PDF 的内容时：先调用 doc_convert_to_word 在本会话内转换为 Word，再用 doc_outline 重新读取并修改；不要让用户自己去打开或切换文档。
+- 编辑与排版工具按需选用：新建表格 doc_insert_table、改表格结构 doc_edit_table；插图 doc_insert_image（用户上传的素材）；示意图 doc_draw、流程/结构图 doc_insert_diagram、数据图表 doc_insert_chart；公式 doc_insert_equation；分页/分节 doc_insert_break；纸张/方向/边距/分栏 doc_page_setup；页眉页脚与页码 doc_header_footer；编号 doc_set_list；脚注 doc_insert_footnote；链接 doc_insert_link；目录 doc_insert_toc；统一全文格式优先 doc_modify_style（改样式），而不是逐段 doc_set_paragraph；调整顺序用 doc_move_blocks。
+- 图表数据、表格数据必须来自文档或用户提供的信息，不要编造数字。`;
 }
 
 function tone(): string {
@@ -73,6 +76,9 @@ export function getSessionSystemPrompt(session: Session, skills: SkillRegistry, 
 - 支持的操作：${[
     caps.replaceText && "修改文字", caps.formatText && "文字格式", caps.paragraphProps && "段落格式", caps.insertBlocks && "插入段落",
     caps.deleteBlocks && "删除段落", caps.tables && "表格行", caps.comments && "批注", caps.trackChanges && "修订模式",
+    (caps.tableEdit || caps.rawInsert) && "新建/编辑表格", (caps.media || caps.rawInsert) && "图片、图形、流程图、图表", (caps.equations || caps.rawInsert) && "公式",
+    caps.layout && "分页分节、页面设置、页眉页脚、目录", caps.lists && "编号", caps.notes && "脚注", caps.links && "超链接",
+    caps.styleEdit && "修改样式", caps.revisions && "接受/拒绝修订", caps.move && "移动段落",
   ].filter(Boolean).join("、") || "只读（读取、搜索、审阅）"}${s.template ? `\n- 检测到模板：${s.template.name}。${skills.get("ieee-paper") && s.template.id === "ieee" ? "处理此文档前请加载 ieee-paper 技能。" : ""}` : ""}${s.notes.length ? "\n" + s.notes.map((n) => `- ${n}`).join("\n") : ""}`);
   if (memory.trim()) parts.push(`# 用户与项目的长期偏好（来自 DOCAGENT.md）\n${memory.trim()}`);
   return parts;

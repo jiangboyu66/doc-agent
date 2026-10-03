@@ -40,7 +40,7 @@ export type EngineEvent =
 export type PermissionMode = "default" | "acceptEdits" | "plan" | "bypassPermissions";
 export type DocFormat = "docx" | "markdown" | "html" | "pdf";
 
-export interface VersionInfo { v: number; label: string; at: number; changedRefs: string[] }
+export interface VersionInfo { v: number; label: string; at: number; changedRefs: string[]; format?: DocFormat }
 
 export interface SessionMeta {
   id: string;
@@ -55,6 +55,10 @@ export interface SessionMeta {
   cost: { requests: number; promptTokens: number; cachedTokens: number; completionTokens: number; costUsd: number; apiMs: number };
   versions: VersionInfo[];
   currentVersion: number;
+  origin?: { fromSession: string; fromFile: string; engine: string; mode?: string; report: string; coverage: number };
+  thinking?: boolean;
+  sourceFormat?: DocFormat;
+  sourceFile?: string;
 }
 
 export interface DocumentSummary {
@@ -73,7 +77,7 @@ export interface DocumentSummary {
 
 export type TranscriptItem =
   | { kind: "user"; text: string }
-  | { kind: "assistant"; text: string }
+  | { kind: "assistant"; text: string; reasoning?: string }
   | { kind: "tool"; id: string; name: string; title: string; ok: boolean; content: string };
 
 export interface SessionDetail {
@@ -87,8 +91,10 @@ export interface SessionDetail {
 export interface RuntimeInfo {
   model: string;
   thinking: string;
+  thinkingAvailable?: boolean;
   apiKey: boolean;
   external: { pandoc: string | null; soffice: string | null };
+  pdfEngines?: { builtin: boolean; pdf2docx: boolean; libreoffice: boolean };
   features: Record<string, boolean>;
   skills: Array<{ name: string; description: string; source: string }>;
   agents: Array<{ type: string; description: string; readOnly: boolean }>;

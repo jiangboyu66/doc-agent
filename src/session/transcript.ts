@@ -5,7 +5,7 @@ import { findTool } from "../tools.js";
 
 export type TranscriptItem =
   | { kind: "user"; text: string }
-  | { kind: "assistant"; text: string }
+  | { kind: "assistant"; text: string; reasoning?: string }
   | { kind: "tool"; id: string; name: string; title: string; ok: boolean; content: string };
 
 export function buildTranscript(history: ApiMessage[]): TranscriptItem[] {
@@ -16,7 +16,8 @@ export function buildTranscript(history: ApiMessage[]): TranscriptItem[] {
       const text = m.content.replace(/<system-reminder>[\s\S]*?<\/system-reminder>\s*/g, "").trim();
       if (text) out.push({ kind: "user", text: text.startsWith("用户调用了 /") ? text.split("\n")[0] : text });
     } else if (m.role === "assistant") {
-      if (m.content?.trim()) out.push({ kind: "assistant", text: m.content });
+      // 思考过程一并还原（刷新页面后仍可展开查看）
+      if (m.content?.trim() || m.reasoning_content?.trim()) out.push({ kind: "assistant", text: m.content ?? "", reasoning: m.reasoning_content?.trim() || undefined });
       for (const t of m.tool_calls ?? []) {
         let title = t.function.name;
         try {

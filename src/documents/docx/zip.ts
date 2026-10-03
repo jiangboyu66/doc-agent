@@ -254,3 +254,24 @@ function buildEntry(name: string, data: Buffer, origFlags: number, origCentral: 
   }
   return { local: Buffer.concat([local, nameBuf, comp]), cen };
 }
+
+/** 新建一个 ZIP 包（用于从零生成 docx，例如 PDF 转 Word） */
+export function createZip(files: Array<{ name: string; data: Buffer }>): Buffer {
+  const out: Buffer[] = [];
+  const central: Buffer[] = [];
+  let offset = 0;
+  for (const f of files) {
+    const { local, cen } = buildEntry(f.name, f.data, 0x800, null, offset);
+    out.push(local);
+    central.push(cen);
+    offset += local.length;
+  }
+  const cdBuf = Buffer.concat(central);
+  const eocd = Buffer.alloc(22);
+  eocd.writeUInt32LE(SIG_EOCD, 0);
+  eocd.writeUInt16LE(central.length, 8);
+  eocd.writeUInt16LE(central.length, 10);
+  eocd.writeUInt32LE(cdBuf.length, 12);
+  eocd.writeUInt32LE(offset, 16);
+  return Buffer.concat([...out, cdBuf, eocd]);
+}

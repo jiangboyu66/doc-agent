@@ -23,6 +23,7 @@ import { processUserInput } from "../commands.js";
 import { exportDocument, type ExportFormat } from "../services/convert.js";
 import type { EngineEvent, PermissionRequest, PermissionResponse } from "../bridge/protocol.js";
 import type { PermissionMode } from "../config/settings.js";
+import { convertPdfSession } from "../session/convertPdf.js";
 
 function showDiff(before: string, after: string): string {
   if (!before) return chalk.green(after);
@@ -143,11 +144,12 @@ async function main() {
     .argument("[file]", "要编辑的文档（.docx / .md / .html / .pdf）")
     .option("--resume <id>", "恢复已有会话")
     .option("-p, --print <prompt>", "无人值守模式：执行这条指令后退出")
-    .option("--output <file>", "无人值守模式结束后导出到该文件（按扩展名决定格式）")
+    .option("--output <file>", "导出到该文件（按扩展名决定格式）；不带 -p 时直接转换导出，例如 PDF → .docx")
     .option("--mode <mode>", "权限模式 default|acceptEdits|plan|bypassPermissions")
     .option("--track", "开启 Word 修订模式")
     .option("--model <model>", "模型，如 deepseek-flash / deepseek-v4-pro")
-    .option("--author <name>", "修订与批注的作者名");
+    .option("--author <name>", "修订与批注的作者名")
+    .option("--convert [mode]", "PDF：先转换为可编辑的 Word 再处理（exact = 逐行保留原排版，默认；flow = 自动换行便于大改）");
   program.parse();
   const opts = program.opts();
   const file = program.args[0];
@@ -170,8 +172,34 @@ async function main() {
     for (const m of list.slice(0, 10)) console.log(`  ${m.id}  ${m.filename}  v${m.currentVersion}  ${new Date(m.updatedAt).toLocaleString("zh-CN", { hour12: false })}`);
     return;
   }
+  // PDF 只读：按需转换为 Word 会话
+  if (session.meta.format === "pdf") {
+    let convert = opts.convert !== undefined;
+    if (!convert && !opts.print && !opts.output && process.stdin.isTTY) {
+      const { yes } = await prompts({ type: "confirm", name: "yes", message: "PDF 只能阅读审阅。是否先转换为可编辑的 Word 文档？", initial: true });
+      convert = !!yes;
+    }
+    if (convert) {
+      const mode = opts.convert === "flow" ? "flow" : "exact";
+      console.log(chalk.dim("正在把 PDF 转换为 Word…"));
+      const r = await convertPdfSession(session, { mode, defaults: { mode: runtime.settings.permissionMode, trackChanges: runtime.settings.trackChanges, author: runtime.settings.author } });
+      console.log(chalk.green(r.text));
+      session = r.session;
+    }
+  }
   if (opts.mode) session.meta.mode = opts.mode;
   if (opts.track) session.meta.trackChanges = session.doc.capabilities.trackChanges;
+
+  // 只给了 --output、没有 -p：直接导出/转换后退出（不调用模型，例如 PDF → Word）
+  if (opts.output && !opts.print) {
+    const ext = path.extname(opts.output).slice(1).toLowerCase();
+    const fmt = (ext === "md" ? "markdown" : ext) as ExportFormat;
+    const out = await exportDocument(session.current(), session.meta.format, fmt, { pdfMode: opts.convert === "flow" ? "flow" : "exact" });
+    await fs.writeFile(opts.output, out.data);
+    console.log(chalk.green(`已导出到 ${opts.output}`));
+    console.log(chalk.dim(out.note));
+    return;
+  }
 
   const s = session.doc.summary();
   console.log(chalk.bold(`\n文案 Agent · ${session.meta.filename}`) + chalk.dim(`（${s.format}，${s.blockCount} 段，约 ${s.charCount} 字）`));

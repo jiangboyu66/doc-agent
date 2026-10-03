@@ -29,6 +29,49 @@ export const REL_TYPES = {
 
 export const CT_COMMENTS = "application/vnd.openxmlformats-officedocument.wordprocessingml.comments+xml";
 
+export const REL_EXTRA = {
+  image: "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image",
+  hyperlink: "http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink",
+  chart: "http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart",
+  package: "http://schemas.openxmlformats.org/officeDocument/2006/relationships/package",
+  settings: "http://schemas.openxmlformats.org/officeDocument/2006/relationships/settings",
+};
+
+export const CT = {
+  header: "application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml",
+  footer: "application/vnd.openxmlformats-officedocument.wordprocessingml.footer+xml",
+  footnotes: "application/vnd.openxmlformats-officedocument.wordprocessingml.footnotes+xml",
+  endnotes: "application/vnd.openxmlformats-officedocument.wordprocessingml.endnotes+xml",
+  numbering: "application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml",
+  chart: "application/vnd.openxmlformats-officedocument.drawingml.chart+xml",
+  xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+};
+
+/** CT_SectPr 子元素顺序 */
+export const SECTPR_ORDER = [
+  "headerReference", "footerReference", "footnotePr", "endnotePr", "type", "pgSz", "pgMar", "paperSrc", "pgBorders",
+  "lnNumType", "pgNumType", "cols", "formProt", "vAlign", "noEndnote", "titlePg", "textDirection", "bidi", "rtlGutter",
+  "docGrid", "printerSettings", "sectPrChange",
+];
+
+/** CT_TcPr 子元素顺序 */
+export const TCPR_ORDER = [
+  "cnfStyle", "tcW", "gridSpan", "hMerge", "vMerge", "tcBorders", "shd", "noWrap", "tcMar", "textDirection", "tcFitText",
+  "vAlign", "hideMark", "headers", "cellIns", "cellDel", "cellMerge", "tcPrChange",
+];
+
+/** CT_TblPr 子元素顺序 */
+export const TBLPR_ORDER = [
+  "tblStyle", "tblpPr", "tblOverlap", "bidiVisual", "tblStyleRowBandSize", "tblStyleColBandSize", "tblW", "jc",
+  "tblCellSpacing", "tblInd", "tblBorders", "shd", "tblLayout", "tblCellMar", "tblLook", "tblCaption", "tblDescription", "tblPrChange",
+];
+
+/** CT_Style 子元素顺序 */
+export const STYLE_ORDER = [
+  "name", "aliases", "basedOn", "next", "link", "autoRedefine", "hidden", "uiPriority", "semiHidden", "unhideWhenUsed",
+  "qFormat", "locked", "personal", "personalCompose", "personalReply", "rsid", "pPr", "rPr", "tblPr", "trPr", "tcPr", "tblStylePr",
+];
+
 /** CT_RPr 子元素顺序 */
 export const RPR_ORDER = [
   "ins", "del", "moveFrom", "moveTo",

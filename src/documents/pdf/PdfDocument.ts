@@ -81,7 +81,7 @@ export class PdfDocument implements DocumentAdapter {
       format: "pdf", blockCount: this.blocks.length, charCount: this.blocks.reduce((s, b) => s + b.text.replace(/\s/g, "").length, 0),
       headings: [], parts: [`${this.pages} 页`], tables: 0, images: 0, sections: this.pages, trackedChanges: 0, comments: 0,
       notes: [
-        "PDF 为最终版式格式，本系统对 PDF 只提供读取、搜索与审阅，不提供改写（任何改写都无法保证版式不变）。",
+        "PDF 为最终版式格式，不能直接改写。需要修改时，先用「转换为 Word」生成可编辑的 Word 文档（按原排版逐行还原），再在 Word 文档上修改。",
         this.blocks.length === 0 ? "未提取到文字：可能是扫描件（图片型 PDF），需要 OCR。" : "段落由文字坐标推断，可能与视觉分段略有差异。",
       ],
     };
@@ -101,7 +101,7 @@ export class PdfDocument implements DocumentAdapter {
     return hits;
   }
   private ro(): never {
-    throw new DocError("PDF 是只读格式，无法在保持版式不变的前提下修改文字。请提供原始 Word/Markdown/HTML 文件进行编辑。", "unsupported");
+    throw new DocError("PDF 是只读格式，不能直接修改。请让用户点击界面上的「转换为 Word」（或命令 /convert），生成可编辑的 Word 文档后再修改。", "unsupported");
   }
   replaceText(): EditResult { return this.ro(); }
   formatText(): EditResult { return this.ro(); }

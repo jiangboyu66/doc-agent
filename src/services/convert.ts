@@ -79,12 +79,28 @@ export interface ExportOutcome {
  * 把当前文档导出为目标格式。
  * 同格式导出 = 编辑后的原文件本身（完全保真）；跨格式导出必然是近似转换，会明确标注。
  */
-export async function exportDocument(current: Buffer, from: DocFormat, to: ExportFormat): Promise<ExportOutcome> {
+export interface ExportOptions {
+  /** PDF → Word 的排版方式：exact 逐行保留原排版（默认）/ flow 自动换行 */
+  pdfMode?: "exact" | "flow";
+  /** PDF → Word 的转换引擎 */
+  pdfEngine?: "builtin" | "pdf2docx" | "libreoffice";
+}
+
+export async function exportDocument(current: Buffer, from: DocFormat, to: ExportFormat, opts: ExportOptions = {}): Promise<ExportOutcome> {
   const extOf: Record<ExportFormat, string> = { docx: "docx", pdf: "pdf", html: "html", markdown: "md" };
   if ((from === to) || (from === "markdown" && to === "markdown")) {
     return { data: current, ext: extOf[to], lossy: false, note: "与原文件同格式：导出的就是编辑后的原文件，未修改部分逐字节保持不变。" };
   }
-  if (from === "pdf") throw new Error("PDF 为只读来源，不支持导出为其他格式。");
+  if (from === "pdf") {
+    // PDF → Word：内置版面重建引擎；再从 Word 转 HTML / Markdown
+    const { pdfToDocx, describeReport } = await import("./pdfConvert/index.js");
+    const { data, report } = await pdfToDocx(current, { mode: opts.pdfMode ?? "exact", engine: opts.pdfEngine ?? "builtin" });
+    if (to === "docx") return { data, ext: "docx", lossy: true, note: describeReport(report) };
+    const fromArg = "docx", toArg = to === "markdown" ? "gfm" : to;
+    const extra = to === "html" ? ["--standalone", "--metadata", "title=Document"] : [];
+    const out = await pandoc(data, fromArg, toArg, extOf[to], extra);
+    return { data: out, ext: extOf[to], lossy: true, note: "先由 PDF 重建为 Word，再转换格式；版式只能近似保留。" };
+  }
   if (to === "pdf") {
     const ext = from === "markdown" ? "md" : from;
     const source = from === "markdown" ? await pandoc(current, "gfm", "docx", "docx") : current;

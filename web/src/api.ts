@@ -15,17 +15,26 @@ export const api = {
     fd.append("file", file);
     return fetch("/api/sessions", { method: "POST", body: fd }).then((r) => json<{ meta: SessionMeta; summary: DocumentSummary }>(r));
   },
+  uploadAssets(id: string, files: File[]) {
+    const fd = new FormData();
+    for (const f of files) fd.append("files", f);
+    return fetch(`/api/sessions/${id}/assets`, { method: "POST", body: fd }).then((r) => json<{ assets: string[]; all: string[] }>(r));
+  },
   remove: (id: string) => fetch(`/api/sessions/${id}`, { method: "DELETE" }).then((r) => json<{ ok: true }>(r)),
-  settings: (id: string, patch: Partial<Pick<SessionMeta, "mode" | "trackChanges" | "author">>) =>
+  settings: (id: string, patch: Partial<Pick<SessionMeta, "mode" | "trackChanges" | "author" | "thinking">>) =>
     fetch(`/api/sessions/${id}/settings`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(patch) }).then((r) => json<{ meta: SessionMeta }>(r)),
   permission: (id: string, requestId: string, body: { decision: "allow" | "deny"; remember?: "session" | "project"; feedback?: string }) =>
     fetch(`/api/sessions/${id}/permissions/${requestId}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }).then((r) => json<{ ok: true }>(r)),
   interrupt: (id: string) => fetch(`/api/sessions/${id}/interrupt`, { method: "POST" }).then((r) => json<{ ok: true }>(r)),
   rollback: (id: string, version: number) =>
     fetch(`/api/sessions/${id}/rollback`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ version }) }).then((r) => json<{ meta: SessionMeta; version: number }>(r)),
-  exportAs: (id: string, format: string) =>
-    fetch(`/api/sessions/${id}/export`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ format }) }).then((r) =>
+  exportAs: (id: string, format: string, pdf?: { mode: "exact" | "flow"; engine: string }) =>
+    fetch(`/api/sessions/${id}/export`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ format, ...(pdf ?? {}) }) }).then((r) =>
       json<{ name: string; url: string; note: string; lossy: boolean }>(r)
+    ),
+  convert: (id: string, body: { engine: string; mode: "exact" | "flow"; inPlace?: boolean }) =>
+    fetch(`/api/sessions/${id}/convert`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }).then((r) =>
+      json<{ meta: SessionMeta; text: string }>(r)
     ),
   documentUrl: (id: string, opts: { version?: number; original?: boolean; download?: boolean } = {}) => {
     const q = new URLSearchParams();

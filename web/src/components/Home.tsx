@@ -32,7 +32,7 @@ export function Home({ runtime, onOpen }: { runtime: RuntimeInfo | null; onOpen:
     <main className="home">
       <header className="home-head">
         <h1 className="serif">文案 Agent</h1>
-        <p className="lede">面向 Word、Markdown、HTML 的保真编辑助手。只改你要改的，其余每一个字节保持原样。</p>
+        <p className="lede">面向 Word、Markdown、HTML、PDF 的保真编辑助手。只改你要改的，其余每一个字节保持原样。</p>
       </header>
 
       {runtime && (!runtime.apiKey || !runtime.external.soffice) && (
@@ -56,7 +56,7 @@ export function Home({ runtime, onOpen }: { runtime: RuntimeInfo | null; onOpen:
         <input ref={input} type="file" hidden accept=".docx,.md,.markdown,.html,.htm,.pdf" onChange={(e) => upload(e.target.files?.[0])} />
         <div className="drop-icon" aria-hidden>⬆</div>
         <div className="drop-title">{uploading ? "正在解析文档…" : "拖入文档，或点击选择文件"}</div>
-        <div className="muted small">支持 .docx · .md · .html · .pdf（PDF 只读，用于审阅）</div>
+        <div className="muted small">支持 .docx · .md · .html · .pdf（PDF 可一键转换为 Word 后编辑）</div>
       </div>
       {err && <div className="notice error">{err}</div>}
 

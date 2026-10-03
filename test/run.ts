@@ -153,7 +153,7 @@ await test("文字格式 / 段落格式（修订模式带 rPrChange / pPrChange�
   assert(xml.includes('<w:jc w:val="both"/>'), "对齐未生效");
 });
 
-await test("插入段落沿用同样式段落格式；插入后旧的序号引用报过期", () => {
+await test("插入段落沿用同样式段落格式；插入后旧的序号引用仍指向原段落，段落被删后报过期", () => {
   const d = new DocxDocument(sampleDocx);
   const anchor = d.search("第一步", {})[0].ref;
   const oldRef = d.search("结论段落", {})[0].ref;
@@ -164,9 +164,11 @@ await test("插入段落沿用同样式段落格式；插入后旧的序号引�
   eq(inserted.style, blocks.find((b) => b.text.startsWith("第一步："))!.style, "新段落应沿用列表样式");
   eq(blocks.find((b) => b.text === "3. 结果")!.kind, "heading", "新标题应识别为标题");
   if (/^P\d+@v\d+$/.test(oldRef)) {
+    assert(d.getBlock(oldRef).text.startsWith("结论段落"), "插入后旧引用应仍指向原来的段落");
+    d.deleteBlocks({ refs: [d.search("结论段落", {})[0].ref] }, O());
     let code = "";
     try { d.getBlock(oldRef); } catch (e: any) { code = e.code; }
-    eq(code, "stale_ref", "旧引用应报过期");
+    eq(code, "stale_ref", "段落删除后旧引用应报过期");
   }
 });
 
@@ -241,6 +243,112 @@ await test("HTML：实体、属性与未修改部分原样保留", async () => {
   assert(out.includes("标题 &amp; 小标题"), "实体被破坏");
   assert(out.includes('<p class="note">这是 <b>加粗</b> 的段落，包含&nbsp;实体。</p>'), "未修改段落发生变化");
   assert(out.includes("<style>p.note { color: #555; }</style>"), "样式表发生变化");
+});
+
+// ---------------------------------------------------------------------------
+console.log("\nPDF → Word");
+// ---------------------------------------------------------------------------
+
+const { pdfToDocx } = await import("../src/services/pdfConvert/index.js");
+const { parseFontName } = await import("../src/services/pdfConvert/extract.js");
+
+await test("字体名解析：子集前缀、粗斜体、替代字体、GBK 编码中文名", () => {
+  const a = parseFontName("ABCDEF+TimesNewRomanPS-BoldItalicMT");
+  eq(a.family, "Times New Roman", "字体族");
+  assert(a.bold && a.italic, "应识别粗斜体");
+  eq(parseFontName("BAAAAA+LiberationSerif").family, "Times New Roman", "度量兼容字体应映射回原字体");
+  eq(parseFontName("CAAAAA+Carlito-Bold").family, "Calibri", "Carlito → Calibri");
+  eq(parseFontName("#CB#CE#CC#E5").family, "宋体", "GBK 编码字体名应解码");
+});
+
+for (const [name, expect] of [["form.pdf", { tables: 1, columns: false }], ["columns.pdf", { tables: 0, columns: true }], ["sample.pdf", { tables: 1, columns: false }]] as const) {
+  for (const mode of ["exact", "flow"] as const) {
+    await test(`${name}（${mode === "exact" ? "保留原排版" : "便于改写"}）：文字 100% 保留，结构还原，可被编辑引擎打开`, async () => {
+      const { data, report } = await pdfToDocx(await fixture(name), { mode });
+      eq(report.textCoverage, 1, `文字完整性，缺失：${report.missing}`);
+      eq(report.tables, expect.tables, "表格数");
+      eq(report.columnPages > 0, expect.columns, "分栏检测");
+      const d = new DocxDocument(data);
+      assert(Buffer.compare(d.serialize(), data) === 0, "生成的 docx 往返不一致");
+      const rep = d.fidelity(data);
+      assert(rep.ok, rep.problems.join("；"));
+      // 能在转换结果上做修订模式的编辑
+      const b = d.listBlocks().find((x) => x.text.replace(/\s/g, "").length > 12 && !x.text.includes("⟨"))!;
+      const word = b.text.split(/\s+/).find((w) => w.length >= 4)!;
+      d.replaceText({ ref: b.ref, oldText: word, newText: word + "X" }, O(true));
+      assert(d.fidelity(data).ok, "编辑后结构校验失败");
+    });
+  }
+}
+
+await test("LaTeX 论文：矢量图与行间公式按原样渲染为图片贴回原位，文字计入替代文字；渲染不可用时退回文字重建", async () => {
+  const pdf = await fixture("math.pdf");
+  const { data, report } = await pdfToDocx(pdf);
+  eq(report.figures, 1, "矢量图数量");
+  eq(report.equations, 1, "行间公式数量");
+  eq(report.textCoverage, 1, `文字完整性，缺失：${report.missing}`);
+  const { ZipPackage } = await import("../src/documents/docx/zip.js");
+  const zp = new ZipPackage(data);
+  const xml = zp.readText("word/document.xml");
+  assert(/descr="[^"]*Encoder[^"]*"/.test(xml), "图片替代文字应包含图中文字");
+  assert(!/>Encoder</.test(xml), "图中文字不应再以正文形式出现");
+  const pngs = zp.names().filter((k) => k.startsWith("word/media/"));
+  assert(pngs.length >= 2, "应生成渲染图片");
+  assert(new DocxDocument(data).fidelity(data).ok, "结构校验失败");
+  // 关闭渲染：按文字重建，文字仍然完整
+  process.env.PDF_RASTER = "0";
+  try {
+    const r2 = await pdfToDocx(pdf);
+    eq(r2.report.figures + r2.report.equations, 0, "关闭渲染后不应有渲染区域");
+    assert(r2.report.textCoverage > 0.99, `回退后文字完整性 ${r2.report.textCoverage}`);
+  } finally {
+    delete process.env.PDF_RASTER;
+  }
+});
+
+await test("公式编号与公式在同一行：右端编号用右对齐制表位，单行段落的起始位置用制表位而非缩进", async () => {
+  const { data, report } = await pdfToDocx(await fixture("equation-number.pdf"));
+  eq(report.textCoverage, 1, `文字完整性，缺失：${report.missing}`);
+  const { ZipPackage } = await import("../src/documents/docx/zip.js");
+  const xml = new ZipPackage(data).readText("word/document.xml");
+  const para = xml.match(/<w:p [^>]*>(?:(?!<\/w:p>).)*mc(?:(?!<\/w:p>).)*<\/w:p>/)?.[0] ?? "";
+  assert(para.includes(">(1)<"), "编号 (1) 应与公式在同一段落");
+  assert(/<w:tab w:val="right" w:pos="\d+"\/>/.test(para), "编号应使用右对齐制表位");
+  assert(!/<w:ind [^>]*w:left="[1-9]/.test(para), "单行公式段落不应使用左缩进（预览器会把制表位算错）");
+});
+
+await test("PDF 直接导出为 Word 文件（两种排版方式），导出命令与 Agent 导出工具在 PDF 会话中可用", async () => {
+  const { exportDocument } = await import("../src/services/convert.js");
+  const pdf = await fixture("form.pdf");
+  for (const pdfMode of ["exact", "flow"] as const) {
+    const out = await exportDocument(pdf, "pdf", "docx", { pdfMode });
+    eq(out.ext, "docx", "扩展名");
+    assert(out.note.includes("100%"), `应报告文字完整性：${out.note}`);
+    assert(new DocxDocument(out.data).listBlocks().some((b) => b.text.includes("PENGGUNAAN")), "内容缺失");
+  }
+  const s = await Session.create(pdf, "声明表.pdf", { mode: "default", trackChanges: false, author: "测试" });
+  const rt = await bootstrap({ permissionMode: "default" });
+  const r = await processUserInput("/export docx", { session: s, runtime: rt, compact: async () => ({ before: 0, after: 0 }) });
+  assert(r.kind === "local" && r.output.includes("声明表") && r.output.includes("100%"), `/export 输出异常：${(r as any).output}`);
+  const { findTool } = await import("../src/tools.js");
+  const tool = findTool("doc_export")!;
+  assert(tool.isEnabled({ session: s } as any), "PDF 会话中应可使用导出工具");
+  const res = await tool.call({ format: "docx", pdf_layout: "exact" } as any, { session: s } as any);
+  const dname = (res.data as any)?.name;
+  assert(dname === "声明表.docx", `导出文件名应为 声明表.docx，实际 ${dname}`);
+});
+
+await test("PDF 会话转换为新的 Word 会话，原 PDF 会话不变", async () => {
+  const { convertPdfSession } = await import("../src/session/convertPdf.js");
+  const src = await Session.create(await fixture("form.pdf"), "表单.pdf", { mode: "default", trackChanges: false, author: "测试" });
+  const { session, report } = await convertPdfSession(src, { mode: "exact", defaults: { mode: "default", trackChanges: true, author: "测试" } });
+  eq(session.meta.format, "docx", "新会话应为 Word");
+  eq(session.meta.filename, "表单.docx", "文件名");
+  eq(session.meta.origin?.fromSession, src.id, "记录来源会话");
+  assert(report.textCoverage === 1, "文字完整");
+  eq(src.meta.format, "pdf", "原会话不变");
+  const again = await Session.load(session.id);
+  assert(again.doc.listBlocks().some((b) => b.text.includes("PENGGUNAAN")), "重新加载后内容完整");
 });
 
 // ---------------------------------------------------------------------------
@@ -492,6 +600,163 @@ await test("本地斜杠命令不调用模型", async () => {
   eq(s.meta.mode, "acceptEdits", "/mode 应切换模式");
   const r = await processUserInput("/proofread 第二节", { session: s, runtime, compact: async () => ({ before: 0, after: 0 }) });
   eq(r.kind, "prompt", "技能命令应转成提示词");
+});
+
+// ---------------------------------------------------------------------------
+console.log("\n编辑 / 排版 / 绘图工具");
+// ---------------------------------------------------------------------------
+
+const allow = () => ({ decision: "allow" as const });
+const lastRefOf = (r: { messages: ApiMessage[] }) => {
+  const tool = [...r.messages].reverse().find((m) => m.role === "tool") as { content: string } | undefined;
+  return [...(tool?.content ?? "").matchAll(/\[((?:#[0-9A-F]{8})|(?:P\d+@v\d+))\]/g)].map((m) => m[1]);
+};
+
+await test("PDF 会话内转换：Agent 调用 doc_convert_to_word 后写工具立即可用，并能接着修改；可回滚到 PDF", async () => {
+  const s = await Session.create(await fixture("form.pdf"), "表单.pdf", { mode: "bypassPermissions", trackChanges: false, author: "测试" });
+  let toolsAfter: string[] = [];
+  const client = new MockClient([
+    (req) => { assert(!req.tools.some((t) => t.function.name === "doc_replace_text"), "PDF 中不应有写工具"); return { toolCalls: [tc("doc_convert_to_word", { layout: "exact" })] }; },
+    (req) => { toolsAfter = req.tools.map((t) => t.function.name); return { toolCalls: [tc("doc_search", { query: "PENGGUNAAN", case_sensitive: true })] }; },
+    (req) => ({ toolCalls: [tc("doc_replace_text", { ref: lastRefOf(req)[0], old_text: "PENGGUNAAN", new_text: "PENGGUNAAN（已修改）" })] }),
+    () => ({ content: "已完成。" }),
+  ]);
+  const { events } = await drive(s, client, "把 PENGGUNAAN 改一下", allow);
+  const errs = events.filter((e) => e.type === "tool_result" && !e.ok).map((e: any) => `${e.name}: ${e.content}`);
+  assert(!errs.length, errs.join("\n"));
+  assert(toolsAfter.includes("doc_replace_text") && toolsAfter.includes("doc_insert_table"), "转换后应出现写工具与编辑工具");
+  eq(s.meta.format, "docx", "会话格式应变为 Word");
+  eq(s.meta.sourceFormat, "pdf", "记录原始格式");
+  assert(s.doc.listBlocks().some((b) => b.text.includes("PENGGUNAAN（已修改）")), "转换后的修改应生效");
+  assert(s.doc.fidelity(await s.original()).ok, "保真校验（以转换结果为基准）");
+  eq((await s.uploaded()).ext, "pdf", "原始文件仍是上传的 PDF");
+  await s.rollback(0);
+  eq(s.meta.format, "pdf", "回滚到 v0 后恢复为 PDF");
+  eq(s.meta.filename, "表单.pdf", "文件名随之恢复");
+});
+
+await test("Word 编辑工具：表格 / 图表 / 流程图 / 绘图 / 公式 / 编号 / 脚注 / 链接 / 目录 / 分节 / 页面设置 / 页眉页脚 / 样式，结构合法", async () => {
+  const s = await newSession();
+  s.meta.mode = "bypassPermissions";
+  const name = await s.saveAsset("测试 图片.png", Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAFklEQVR4nGP4z8DAwMDAxMDAwMDAAAANHQEDasKb6QAAAABJRU5ErkJggg==", "base64"));
+  let refs: string[] = [];
+  const client = new MockClient([
+    () => ({ toolCalls: [tc("doc_read", { limit: 60 })] }),
+    (req) => {
+      refs = lastRefOf(req);
+      const a = refs[3], b = refs[refs.length - 1];
+      return { toolCalls: [
+        tc("doc_insert_table", { anchor: a, position: "after", rows: [["指标", "数值"], ["A", "1"], ["B", "2"]], style: "three_line", caption: "表 1 测试" }),
+        tc("doc_insert_chart", { anchor: b, position: "after", type: "line", title: "趋势", categories: ["1月", "2月", "3月"], series: [{ name: "销量", values: [3, 5, 4] }] }),
+        tc("doc_insert_diagram", { anchor: b, position: "after", nodes: [{ id: "a", text: "开始", shape: "ellipse" }, { id: "b", text: "处理" }, { id: "c", text: "结束", shape: "ellipse" }], edges: [{ from: "a", to: "b" }, { from: "b", to: "c" }], caption: "图 1 流程" }),
+        tc("doc_draw", { anchor: b, position: "after", width_pt: 200, height_pt: 60, shapes: [{ type: "rect", x: 0, y: 0, w: 80, h: 40, text: "A" }, { type: "arrow", x: 80, y: 20, x2: 140, y2: 20 }] }),
+        tc("doc_insert_image", { anchor: b, position: "after", asset: name, width_pt: 60, caption: "图 2 素材" }),
+        tc("doc_insert_equation", { anchor: b, position: "after", latex: "\\frac{a}{b} = \\sqrt{c}", number: "(1)" }),
+        tc("doc_header_footer", { kind: "footer", text: "第 {PAGE} 页" }),
+        tc("doc_page_setup", { orientation: "landscape", paper: "A4" }),
+        tc("doc_modify_style", { style: "Normal", font: "宋体", size_pt: 12, line_spacing: 1.5 }),
+      ] };
+    },
+    () => ({ toolCalls: [tc("doc_read", { limit: 80 })] }),
+    (req) => {
+      const r = lastRefOf(req);
+      return { toolCalls: [
+        tc("doc_set_list", { refs: [r[r.length - 1]], kind: "number" }),
+        tc("doc_insert_toc", { anchor: r[0], position: "after", levels: 2 }),
+        tc("doc_insert_break", { anchor: r[0], position: "after", kind: "section_next_page" }),
+      ] };
+    },
+    () => ({ toolCalls: [tc("doc_search", { query: "quick brown" })] }),
+    (req) => ({ toolCalls: [
+      tc("doc_insert_footnote", { ref: lastRefOf(req)[0], after_text: "pangram", text: "全字母句" }),
+      tc("doc_insert_link", { ref: lastRefOf(req)[0], text: "lazy dog", url: "https://example.com" }),
+    ] }),
+    () => ({ content: "完成。" }),
+  ]);
+  const { events } = await drive(s, client, "排版", allow);
+  const errors = events.filter((e) => e.type === "tool_result" && !e.ok).map((e: any) => `${e.name}: ${e.content}`);
+  assert(!errors.length, errors.join("\n"));
+  const data = s.current();
+  const d = new DocxDocument(data);
+  const rep = d.fidelity(await s.original());
+  assert(rep.ok, rep.problems.join("；"));
+  const { ZipPackage } = await import("../src/documents/docx/zip.js");
+  const z = new ZipPackage(data);
+  const xml = z.readText("word/document.xml");
+  for (const [what, ok] of [
+    ["表格", (xml.match(/<w:tbl>/g) ?? []).length >= 2], ["图表", z.names().some((n) => /charts\/chart\d+\.xml$/.test(n)) && z.names().some((n) => n.endsWith(".xlsx"))],
+    ["形状组合", xml.includes("wordprocessingGroup")], ["图片", z.names().some((n) => n.startsWith("word/media/"))], ["公式", xml.includes("<m:f>") && xml.includes("<m:rad>")],
+    ["页脚页码", z.names().some((n) => /footer\d+\.xml/.test(n))], ["横向", xml.includes('w:orient="landscape"')], ["编号", z.has("word/numbering.xml") || xml.includes("<w:numPr>")],
+    ["目录", xml.includes("TOC \\o")], ["分节", (xml.match(/<w:sectPr/g) ?? []).length >= 2], ["脚注", xml.includes("footnoteReference")], ["链接", xml.includes("<w:hyperlink")],
+  ] as const) assert(ok, `缺少${what}`);
+  // 每次修改都生成了版本
+  assert(s.meta.versions.length >= 14, `版本数 ${s.meta.versions.length}`);
+});
+
+await test("Markdown / HTML：表格、图表（SVG）、流程图、公式、分页符以源码形式插入，其余内容不变", async () => {
+  for (const name of ["sample.md", "sample.html"]) {
+    const s = await newSession(name);
+    s.meta.mode = "bypassPermissions";
+    const before = (await s.original()).toString("utf8");
+    const client = new MockClient([
+      () => ({ toolCalls: [tc("doc_read", {})] }),
+      (req) => {
+        const r = lastRefOf(req).length ? lastRefOf(req) : [...((req.messages.at(-1) as any).content as string).matchAll(/\[(B\d+@v\d+|H\d+@v\d+|[A-Z]\d+@v\d+)\]/g)].map((m) => m[1]);
+        const a = r[r.length - 1];
+        return { toolCalls: [
+          tc("doc_insert_table", { anchor: a, position: "after", rows: [["a", "b"], ["1", "2"]] }),
+        ] };
+      },
+      () => ({ toolCalls: [tc("doc_read", {})] }),
+      (req) => {
+        const r = [...((req.messages.at(-1) as any).content as string).matchAll(/\[([A-Z]\d+@v\d+)\]/g)].map((m) => m[1]);
+        return { toolCalls: [tc("doc_insert_chart", { anchor: r[r.length - 1], position: "after", type: "column", categories: ["x", "y"], series: [{ name: "s", values: [1, 2] }] })] };
+      },
+      () => ({ toolCalls: [tc("doc_read", {})] }),
+      (req) => {
+        const r = [...((req.messages.at(-1) as any).content as string).matchAll(/\[([A-Z]\d+@v\d+)\]/g)].map((m) => m[1]);
+        return { toolCalls: [tc("doc_insert_equation", { anchor: r[r.length - 1], position: "before", latex: "E = mc^2" })] };
+      },
+      () => ({ content: "完成。" }),
+    ]);
+    const { events } = await drive(s, client, "插入", allow);
+    const errors = events.filter((e) => e.type === "tool_result" && !e.ok).map((e: any) => `${e.name}: ${e.content}`);
+    assert(!errors.length, `${name}：${errors.join("\n")}`);
+    const after = s.current().toString("utf8");
+    assert(name.endsWith(".md") ? after.includes("| a | b |") && after.includes("$$") : after.includes("<table") && after.includes("\\["), `${name} 未插入预期标记`);
+    assert(after.includes("<svg") || after.includes("data:image/svg+xml"), `${name} 缺少 SVG 图表`);
+    // 原文的每一行都还在
+    for (const line of before.split(/\r?\n/).filter((l) => l.trim())) assert(after.includes(line), `${name} 原文被改动：${line}`);
+  }
+});
+
+await test("修订模式下插入的表格 / 图片 / 公式可整体拒绝，恢复原文", async () => {
+  const s = await newSession();
+  s.meta.trackChanges = true;
+  const o = { track: true, author: "测试", date: "2026-01-01T00:00:00Z" };
+  const doc = s.doc as import("../src/documents/types.js").DocumentAdapter;
+  const orig = doc.listBlocks().map((b) => b.text).join("|");
+  const a = doc.listBlocks().find((b) => b.text.includes("quick brown"))!.ref;
+  doc.insertTable!({ anchor: a, position: "after", rows: [["x", "y"], ["1", "2"]], caption: "表 X" }, o);
+  doc.insertEquation!({ anchor: doc.listBlocks().find((b) => b.text.includes("quick brown"))!.ref, position: "after", latex: "a^2", number: "(9)" }, o);
+  doc.reviewChanges!({ action: "reject" }, o);
+  eq(doc.listBlocks().map((b) => b.text).join("|"), orig, "拒绝全部修订后应与原文一致");
+});
+
+await test("思考模式开关：会话级设置覆盖全局，关闭后请求不带思考", async () => {
+  const s = await newSession();
+  const seen: Array<boolean | undefined> = [];
+  const client = new MockClient([() => ({ content: "好的。" })]);
+  const orig = client.complete.bind(client);
+  client.complete = async (req: any, opts: any) => { seen.push(req.thinking); return orig(req, opts); };
+  s.meta.thinking = false;
+  await drive(s, client, "你好", allow);
+  eq(seen[0], false, "关闭思考模式后请求应带 thinking=false");
+  s.meta.thinking = true;
+  await drive(s, new (class extends MockClient {})([() => ({ content: "好" })]), "再来", allow);
+  const { buildTranscript } = await import("../src/session/transcript.js");
+  const t = buildTranscript(s.history);
+  assert(t.some((x) => x.kind === "assistant" && (x as any).reasoning), "对话记录应保留思考过程（刷新后可展开）");
 });
 
 // ---------------------------------------------------------------------------

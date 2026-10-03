@@ -19,8 +19,12 @@ import { diffArrays } from "diff";
 import { ZipPackage } from "./zip.js";
 import {
   NS, REL_TYPES, CT_COMMENTS, RPR_ORDER, PPR_ORDER, TRPR_ORDER, StyleSheet, parseRels, relsPathFor,
-  resolveTarget, orderedInsertIndex, ptToTwips,
+  resolveTarget, orderedInsertIndex, ptToTwips, REL_EXTRA, CT, SECTPR_ORDER, TCPR_ORDER, TBLPR_ORDER, STYLE_ORDER,
 } from "./ooxml.js";
+import {
+  runContent, imageInfo, pictureXml, shapesGroupXml, chartXml, chartWorkbook, chartInlineXml, abstractNumXml,
+  equationParagraphXml, emu, twip, alternateContentXml, type ShapeSpec, type ChartSpec,
+} from "./build.js";
 import { findAll, computeHunks, clip, type Hunk } from "../textMatch.js";
 import { symbolChar } from "./symbolFont.js";
 import {
@@ -80,6 +84,7 @@ export class DocxDocument implements DocumentAdapter {
   readonly capabilities: DocumentCapabilities = {
     replaceText: true, formatText: true, paragraphProps: true, insertBlocks: true, deleteBlocks: true,
     tables: true, comments: true, trackChanges: true, styles: true,
+    media: true, layout: true, lists: true, notes: true, links: true, styleEdit: true, revisions: true, tableEdit: true, move: true, equations: true,
   };
   private _structureVersion = 0;
   /** 结构版本号；外部（会话重载 / 干跑副本）设置时需要重建引用表 */
@@ -96,6 +101,7 @@ export class DocxDocument implements DocumentAdapter {
   readonly mainPart: string;
   private contentParts: string[] = [];
   private styles: StyleSheet;
+  private stylesPart: string | null = null;
   private paras: ParaEntry[] = [];
   private byRef = new Map<string, ParaEntry>();
   private nextRevisionId = -1;
@@ -119,6 +125,7 @@ export class DocxDocument implements DocumentAdapter {
       ...pick(REL_TYPES.endnotes),
     ];
     const stylesPart = pick(REL_TYPES.styles)[0];
+    this.stylesPart = stylesPart ?? null;
     this.styles = new StyleSheet(stylesPart ? this.optText(stylesPart) : null);
     this.reindex();
   }
@@ -164,7 +171,16 @@ export class DocxDocument implements DocumentAdapter {
   // 段落索引
   // -------------------------------------------------------------------------
 
+  /** 各结构版本下的段落顺序快照：旧的 P 序号引用只要段落还在，就能映射到它现在的位置 */
+  private snapshots = new Map<number, XElement[]>();
+  private indexVersion = 0;
+
   private reindex(): void {
+    if (this.paras?.length) {
+      this.snapshots.set(this.indexVersion, this.paras.map((p) => p.el));
+      if (this.snapshots.size > 60) this.snapshots.delete(this.snapshots.keys().next().value!);
+    }
+    this.indexVersion = this._structureVersion;
     this.paras = [];
     let tableCounter = 0;
     for (const part of this.contentParts) {
@@ -240,6 +256,16 @@ export class DocxDocument implements DocumentAdapter {
     });
   }
 
+  /** 把旧版本的 P 序号引用换算成当前引用（干跑副本没有历史快照，执行前先统一换算） */
+  translateRef(ref: string): string {
+    if (!/^P\d+@v\d+$/.test(ref.trim())) return ref;
+    try {
+      return this.resolve(ref).ref;
+    } catch {
+      return ref;
+    }
+  }
+
   private resolve(ref: string): ParaEntry {
     const r = ref.trim();
     const direct = this.byRef.get(r) ?? this.byRef.get(`#${r}`);
@@ -247,6 +273,13 @@ export class DocxDocument implements DocumentAdapter {
     const m = /^P(\d+)(?:@v(\d+))?$/.exec(r);
     if (m) {
       if (m[2] !== undefined && Number(m[2]) !== this.structureVersion) {
+        const snap = this.snapshots.get(Number(m[2]));
+        const el = snap?.[Number(m[1]) - 1];
+        if (el) {
+          const now = this.paras.find((x) => x.el === el);
+          if (now) return now;
+          throw new DocError(`段落 ${r} 已被删除（文档结构在之后发生了变化）。请重新调用 doc_read 获取最新引用。`, "stale_ref");
+        }
         throw new DocError(
           `段落引用 ${r} 已过期：之后文档插入/删除过段落（当前结构版本 v${this.structureVersion}）。请重新调用 doc_read 或 doc_search 获取最新引用。`,
           "stale_ref"
@@ -1315,6 +1348,1170 @@ export class DocxDocument implements DocumentAdapter {
       preview: [{ ref: pe.ref, before: clip(target, 80), after: `💬 ${p.comment}` }],
       structural: false,
     };
+  }
+
+  // =========================================================================
+  // 扩展编辑能力：表格 / 图片 / 图形 / 图表 / 公式 / 分隔符 / 页面设置 / 页眉页脚 /
+  //               列表 / 脚注 / 超链接 / 目录 / 样式 / 修订审阅 / 批注管理 / 移动段落
+  // =========================================================================
+
+  private docPrCounter = -1;
+
+  private nextDocPrId(): number {
+    if (this.docPrCounter < 0) {
+      let max = 0;
+      for (const part of this.contentParts) {
+        for (const d of this.part(part).root.descendants()) {
+          if (d.local === "docPr" || d.local === "cNvPr") {
+            const id = Number(d.getAttr("id"));
+            if (Number.isFinite(id) && id > max) max = id;
+          }
+        }
+      }
+      this.docPrCounter = max + 1;
+    }
+    return this.docPrCounter++;
+  }
+
+  private relsDoc(owner = this.mainPart): XDocument {
+    const name = relsPathFor(owner);
+    if (!this.pkg.has(name)) {
+      this.pkg.write(name, Buffer.from(`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\r\n<Relationships xmlns="${NS.rels}"></Relationships>`, "utf8"));
+      this.parts.delete(name);
+    }
+    return this.part(name);
+  }
+
+  private addRel(type: string, target: string, opts: { owner?: string; external?: boolean } = {}): string {
+    const doc = this.relsDoc(opts.owner);
+    const ids = new Set(doc.root.elements().map((e) => e.getAttr("Id")));
+    let n = ids.size + 1;
+    while (ids.has(`rId${n}`)) n++;
+    appendChild(doc.root, parseFragment(`<Relationship Id="rId${n}" Type="${type}" Target="${encodeAttr(target)}"${opts.external ? ' TargetMode="External"' : ""}/>`));
+    return `rId${n}`;
+  }
+
+  private ensureDefaultCT(ext: string, ct: string): void {
+    const doc = this.part("[Content_Types].xml");
+    if (doc.root.elements().some((e) => e.local === "Default" && e.getAttr("Extension")?.toLowerCase() === ext.toLowerCase())) return;
+    const first = doc.root.elements()[0];
+    const node = parseFragment(`<Default Extension="${ext}" ContentType="${ct}"/>`);
+    if (first) insertBefore(first, node);
+    else appendChild(doc.root, node);
+  }
+
+  private ensureOverrideCT(partName: string, ct: string): void {
+    const doc = this.part("[Content_Types].xml");
+    if (doc.root.elements().some((e) => e.local === "Override" && e.getAttr("PartName") === `/${partName}`)) return;
+    appendChild(doc.root, parseFragment(`<Override PartName="/${partName}" ContentType="${ct}"/>`));
+  }
+
+  /** 新部件的唯一名称，如 word/media/image3.png */
+  private uniquePartName(dir: string, base: string, ext: string): string {
+    for (let n = 1; ; n++) {
+      const name = `${dir}/${base}${n}.${ext}`;
+      if (!this.pkg.has(name)) return name;
+    }
+  }
+
+  /** 部件相对主文档的路径（关系 Target 用） */
+  private relTarget(partName: string, owner = this.mainPart): string {
+    const dir = owner.includes("/") ? owner.slice(0, owner.lastIndexOf("/") + 1) : "";
+    return partName.startsWith(dir) ? partName.slice(dir.length) : `/${partName}`;
+  }
+
+  private addPart(name: string, data: Buffer | string): void {
+    this.pkg.write(name, typeof data === "string" ? Buffer.from(data, "utf8") : data);
+    this.parts.delete(name);
+    this.prefixes.delete(name);
+  }
+
+  private body(): XElement {
+    const w = this.w(this.mainPart);
+    const b = this.part(this.mainPart).root.child(`${w}:body`);
+    if (!b) throw new DocError("文档缺少正文（w:body）", "invalid");
+    return b;
+  }
+
+  /** 段落所属的分节属性（之后第一个带 sectPr 的正文段落，或文末的 sectPr） */
+  private sectPrFor(pe?: ParaEntry): XElement | undefined {
+    const w = this.w(this.mainPart);
+    const body = this.body();
+    if (pe && pe.part === this.mainPart) {
+      let top: XElement = pe.el;
+      while (top.parent && top.parent !== body && top.parent.type === "el") top = top.parent as XElement;
+      const kids = body.elements();
+      for (let k = Math.max(0, kids.indexOf(top)); k < kids.length; k++) {
+        const sp = kids[k].local === "p" ? kids[k].child(`${w}:pPr`)?.child(`${w}:sectPr`) : undefined;
+        if (sp) return sp;
+      }
+    }
+    return body.child(`${w}:sectPr`);
+  }
+
+  private allSectPrs(): XElement[] {
+    const w = this.w(this.mainPart);
+    const out: XElement[] = [];
+    for (const d of this.body().descendants()) if (d.prefix === w && d.local === "sectPr" && !d.closest(`${w}:sectPrChange`)) out.push(d);
+    return out;
+  }
+
+  /** 可用文字宽度（twips）：页宽 − 左右边距；多栏时为单栏宽度；表格内为单元格宽度 */
+  private textWidthTwips(pe?: ParaEntry): number {
+    const w = this.w(this.mainPart);
+    const sp = this.sectPrFor(pe);
+    const pgW = Number(sp?.child(`${w}:pgSz`)?.getAttr(`${w}:w`) ?? 11906);
+    const mar = sp?.child(`${w}:pgMar`);
+    const num = (k: string, d: number) => { const v = Number(mar?.getAttr(`${w}:${k}`)); return Number.isFinite(v) ? v : d; };
+    let width = pgW - num("left", 1800) - num("right", 1800) - num("gutter", 0);
+    const cols = sp?.child(`${w}:cols`);
+    const n = Number(cols?.getAttr(`${w}:num`) ?? 1);
+    if (n > 1) width = (width - Number(cols?.getAttr(`${w}:space`) ?? 425) * (n - 1)) / n;
+    if (pe?.container === "table") {
+      const tcW = pe.el.closest(`${w}:tc`)?.child(`${w}:tcPr`)?.child(`${w}:tcW`);
+      const v = Number(tcW?.getAttr(`${w}:w`));
+      if (tcW?.getAttr(`${w}:type`) === "dxa" && v > 0) width = v - 216;
+    }
+    return Math.max(1440, Math.round(width));
+  }
+
+  private insMark(w: string, o: EditOptions): string {
+    return o.track ? `<${w}:ins ${this.revAttrs(w, o)}/>` : "";
+  }
+
+  private trackRun(w: string, runXml: string, o: EditOptions): string {
+    return o.track && runXml ? `<${w}:ins ${this.revAttrs(w, o)}>${runXml}</${w}:ins>` : runXml;
+  }
+
+  /** 生成一个新段落：pPr 内容（按 schema 顺序给出）+ 段内内容；修订模式下标记为插入 */
+  private paraXml(part: string, pPrInner: string, content: string, o: EditOptions): string {
+    const w = this.w(part);
+    const id = this.supportsW14(part) ? ` w14:paraId="${this.newParaId()}" w14:textId="77777777"` : "";
+    const mark = this.insMark(w, o);
+    const pPr = pPrInner || mark ? `<${w}:pPr>${pPrInner}${mark ? `<${w}:rPr>${mark}</${w}:rPr>` : ""}</${w}:pPr>` : "";
+    return `<${w}:p${id}>${pPr}${content}</${w}:p>`;
+  }
+
+  /** 锚点段落的字体与字号（新表格、题注沿用正文字体） */
+  private baseFontRPr(pe: ParaEntry, sizePt?: number, extra = ""): string {
+    const w = this.w(pe.part);
+    const dom = this.dominantRPrXml(pe);
+    const fonts = new RegExp(`<${w}:rFonts[^>]*/>`).exec(dom)?.[0] ?? "";
+    const sz = sizePt ? `<${w}:sz ${w}:val="${Math.round(sizePt * 2)}"/><${w}:szCs ${w}:val="${Math.round(sizePt * 2)}"/>` : (new RegExp(`<${w}:sz [^>]*/>`).exec(dom)?.[0] ?? "") + (new RegExp(`<${w}:szCs [^>]*/>`).exec(dom)?.[0] ?? "");
+    const inner = fonts + extra + sz;
+    return inner ? `<${w}:rPr>${inner}</${w}:rPr>` : "";
+  }
+
+  /** 题注段落：优先使用文档的"题注 / Caption"样式 */
+  private captionXml(anchor: ParaEntry, text: string, o: EditOptions): string {
+    const w = this.w(anchor.part);
+    const st = this.styles.resolve("caption", "paragraph") ?? this.styles.resolve("题注", "paragraph");
+    const pPr = st ? `<${w}:pStyle ${w}:val="${st.id}"/><${w}:jc ${w}:val="center"/>` : `<${w}:spacing ${w}:before="60" ${w}:after="120"/><${w}:jc ${w}:val="center"/>`;
+    const rPr = st ? "" : this.baseFontRPr(anchor, 9);
+    return this.paraXml(anchor.part, pPr, this.trackRun(w, `<${w}:r>${rPr}${runContent(w, text)}</${w}:r>`, o), o);
+  }
+
+  /** 把块级 XML 插到锚点段落前/后，重建索引，返回新插入的顶层元素 */
+  private insertBlockXml(anchor: ParaEntry, position: "before" | "after", xml: string): XElement[] {
+    this.isEditable(anchor);
+    const w = this.w(anchor.part);
+    const nodes = parseFragment(xml).filter((n): n is XElement => n.type === "el");
+    if (position === "before") insertBefore(anchor.el, nodes);
+    else insertAfter(anchor.el, nodes);
+    const parent = anchor.el.parent as XElement;
+    if (parent?.local === "tc") {
+      const last = parent.elements().filter((e) => e.local !== "tcPr").pop();
+      if (last?.local === "tbl") appendChild(parent, parseFragment(this.paraXml(anchor.part, "", "", { track: false, author: "", date: "" })));
+    }
+    void w;
+    this._structureVersion++;
+    this.reindex();
+    return nodes;
+  }
+
+  private refsOf(nodes: XElement[]): string[] {
+    const set = new Set<XElement>();
+    for (const n of nodes) {
+      if (n.local === "p") set.add(n);
+      for (const d of n.descendants()) if (d.local === "p") set.add(d);
+    }
+    return this.paras.filter((p) => set.has(p.el)).map((p) => p.ref);
+  }
+
+  private objectParaXml(anchor: ParaEntry, runXml: string, align: "left" | "center" | "right", o: EditOptions, keepNext: boolean): string {
+    const w = this.w(anchor.part);
+    const pPr = `${keepNext ? `<${w}:keepNext/>` : ""}<${w}:spacing ${w}:before="120" ${w}:after="${keepNext ? 60 : 120}" ${w}:line="240" ${w}:lineRule="auto"/><${w}:ind ${w}:firstLine="0" ${w}:left="0" ${w}:right="0"/><${w}:jc ${w}:val="${align}"/>`;
+    return this.paraXml(anchor.part, pPr, this.trackRun(w, runXml, o), o);
+  }
+
+  // ------------------------------- 表格 -------------------------------
+
+  insertTable(p: {
+    anchor: string; position: "before" | "after"; rows: string[][]; header?: boolean;
+    style?: "grid" | "three_line" | "plain" | "banded"; align?: "left" | "center" | "right"; widths?: number[];
+    width_pct?: number; font_size_pt?: number; caption?: string; caption_position?: "above" | "below";
+  }, o: EditOptions): EditResult {
+    const anchor = this.resolve(p.anchor);
+    const w = this.w(anchor.part);
+    const rows = p.rows.filter((r) => Array.isArray(r));
+    if (!rows.length) throw new DocError("rows 不能为空", "invalid");
+    const nCols = Math.max(...rows.map((r) => r.length));
+    if (nCols < 1 || nCols > 63) throw new DocError("表格列数需在 1–63 之间", "invalid");
+    const header = p.header ?? true;
+    const style = p.style ?? "grid";
+    const total = Math.round(this.textWidthTwips(anchor) * Math.min(1, Math.max(0.1, (p.width_pct ?? 100) / 100)));
+    const rel = p.widths?.length === nCols && p.widths.every((x) => x > 0) ? p.widths : Array.from({ length: nCols }, () => 1);
+    const sum = rel.reduce((a, b) => a + b, 0);
+    const widths = rel.map((x) => Math.max(200, Math.round((total * x) / sum)));
+    const B = (sz: number) => `${w}:val="single" ${w}:sz="${sz}" ${w}:space="0" ${w}:color="000000"`;
+    const tblBorders = style === "grid" || style === "banded"
+      ? `<${w}:tblBorders><${w}:top ${B(4)}/><${w}:left ${B(4)}/><${w}:bottom ${B(4)}/><${w}:right ${B(4)}/><${w}:insideH ${B(4)}/><${w}:insideV ${B(4)}/></${w}:tblBorders>`
+      : style === "three_line"
+        ? `<${w}:tblBorders><${w}:top ${B(12)}/><${w}:bottom ${B(12)}/></${w}:tblBorders>`
+        : `<${w}:tblBorders><${w}:top ${w}:val="nil"/><${w}:left ${w}:val="nil"/><${w}:bottom ${w}:val="nil"/><${w}:right ${w}:val="nil"/><${w}:insideH ${w}:val="nil"/><${w}:insideV ${w}:val="nil"/></${w}:tblBorders>`;
+    const jc = p.align ?? "center";
+    const tblPr = `<${w}:tblPr><${w}:tblW ${w}:w="${total}" ${w}:type="dxa"/><${w}:jc ${w}:val="${jc}"/>${tblBorders}<${w}:tblLayout ${w}:type="fixed"/><${w}:tblCellMar><${w}:left ${w}:w="108" ${w}:type="dxa"/><${w}:right ${w}:w="108" ${w}:type="dxa"/></${w}:tblCellMar><${w}:tblLook ${w}:val="04A0" ${w}:firstRow="1" ${w}:lastRow="0" ${w}:firstColumn="1" ${w}:lastColumn="0" ${w}:noHBand="0" ${w}:noVBand="1"/></${w}:tblPr>`;
+    const grid = `<${w}:tblGrid>${widths.map((x) => `<${w}:gridCol ${w}:w="${x}"/>`).join("")}</${w}:tblGrid>`;
+    const rowXml = rows.map((r, ri) => {
+      const isHead = header && ri === 0;
+      const trPr = `<${w}:trPr><${w}:cantSplit/>${isHead ? `<${w}:tblHeader/>` : ""}${o.track ? `<${w}:ins ${this.revAttrs(w, o)}/>` : ""}</${w}:trPr>`;
+      const cells = Array.from({ length: nCols }, (_, ci) => {
+        const text = String(r[ci] ?? "");
+        const shade = (style === "banded" && isHead) ? "D9E2F3" : (style === "grid" && isHead) ? "F2F2F2" : (style === "banded" && ri % 2 === 0 && !isHead) ? "F2F2F2" : "";
+        const tcBorders = style === "three_line" && isHead ? `<${w}:tcBorders><${w}:bottom ${B(6)}/></${w}:tcBorders>` : "";
+        const tcPr = `<${w}:tcPr><${w}:tcW ${w}:w="${widths[ci]}" ${w}:type="dxa"/>${tcBorders}${shade ? `<${w}:shd ${w}:val="clear" ${w}:color="auto" ${w}:fill="${shade}"/>` : ""}<${w}:vAlign ${w}:val="center"/></${w}:tcPr>`;
+        const num = /^[\s\-+−]?[\d.,%]+\s*$/.test(text);
+        const cellJc = isHead || num ? "center" : "left";
+        const pPr = `<${w}:spacing ${w}:before="40" ${w}:after="40" ${w}:line="240" ${w}:lineRule="auto"/><${w}:ind ${w}:left="0" ${w}:right="0" ${w}:firstLine="0"/><${w}:jc ${w}:val="${cellJc}"/>`;
+        const rPr = this.baseFontRPr(anchor, p.font_size_pt, isHead ? `<${w}:b/><${w}:bCs/>` : "");
+        const content = text ? this.trackRun(w, `<${w}:r>${rPr}${runContent(w, text)}</${w}:r>`, o) : "";
+        return `<${w}:tc>${tcPr}${this.paraXml(anchor.part, pPr, content, o)}</${w}:tc>`;
+      }).join("");
+      return `<${w}:tr>${trPr}${cells}</${w}:tr>`;
+    }).join("");
+    let xml = `<${w}:tbl>${tblPr}${grid}${rowXml}</${w}:tbl>`;
+    if (p.caption) {
+      const cap = this.captionXml(anchor, p.caption, o);
+      xml = (p.caption_position ?? "above") === "above" ? cap + xml : xml + cap;
+    }
+    // 表格后面紧跟一个表格时 Word 会把两者合并：插在锚点之前时补一个空段落隔开
+    const nodes = this.insertBlockXml(anchor, p.position, xml);
+    const refs = this.refsOf(nodes);
+    return {
+      changedRefs: refs,
+      summary: `已插入 ${rows.length} 行 × ${nCols} 列的表格（${{ grid: "网格线", three_line: "三线表", plain: "无边框", banded: "表头底色+隔行底纹" }[style]}）${p.caption ? "，含题注" : ""}${o.track ? "（记录为插入修订）" : ""}。单元格引用：${refs.slice(0, 12).join("、")}${refs.length > 12 ? "…" : ""}`,
+      preview: [{ ref: refs[0] ?? "", before: "", after: rows.map((r) => r.join(" | ")).join("\n") }],
+      structural: true,
+    };
+  }
+
+  /** 表格结构编辑：删除行/列、插入列、合并单元格、底纹、对齐、边框、删除表格 */
+  editTable(p: {
+    ref: string; action: "delete_row" | "delete_column" | "insert_column" | "merge" | "shade" | "align" | "borders" | "delete_table" | "set_width" | "repeat_header";
+    to_ref?: string; position?: "before" | "after"; cells?: string[]; color?: string;
+    horizontal?: "left" | "center" | "right"; vertical?: "top" | "center" | "bottom"; style?: "grid" | "three_line" | "plain" | "outer";
+    width_pct?: number; scope?: "cell" | "row" | "column" | "table";
+  }, o: EditOptions): EditResult {
+    const pe = this.resolve(p.ref);
+    const w = this.w(pe.part);
+    const tc = pe.el.closest(`${w}:tc`);
+    const tr = pe.el.closest(`${w}:tr`);
+    const tbl = pe.el.closest(`${w}:tbl`);
+    if (!tc || !tr || !tbl) throw new DocError(`段落 ${pe.ref} 不在表格中。请传入表格某个单元格里的段落引用（doc_read part="表格1"）。`, "invalid");
+    if (o.track && ["delete_column", "insert_column", "merge", "delete_table"].includes(p.action)) {
+      throw new DocError("修订模式下暂不支持这类表格结构修改（Word 的列/合并修订记录不完整）。请先关闭修订模式，或改用逐行操作。", "unsupported");
+    }
+    const rows = tbl.childrenNamed(`${w}:tr`);
+    const cellsOf = (row: XElement) => row.childrenNamed(`${w}:tc`);
+    const span = (c: XElement) => Number(c.child(`${w}:tcPr`)?.child(`${w}:gridSpan`)?.getAttr(`${w}:val`) ?? 1);
+    /** 单元格在网格中的起始列 */
+    const gridCol = (row: XElement, c: XElement) => {
+      const gb = Number(row.child(`${w}:trPr`)?.child(`${w}:gridBefore`)?.getAttr(`${w}:val`) ?? 0);
+      let col = gb;
+      for (const x of cellsOf(row)) { if (x === c) return col; col += span(x); }
+      return col;
+    };
+    const cellAt = (row: XElement, col: number) => {
+      let c0 = Number(row.child(`${w}:trPr`)?.child(`${w}:gridBefore`)?.getAttr(`${w}:val`) ?? 0);
+      for (const x of cellsOf(row)) { const s = span(x); if (col >= c0 && col < c0 + s) return x; c0 += s; }
+      return undefined;
+    };
+    const tcPrOf = (c: XElement) => this.ensureChild(c, "tcPr", [], w, true);
+    const col = gridCol(tr, tc);
+    let summary = "";
+    const before = this.textOf(pe);
+    const scopeCells = (): XElement[] => {
+      switch (p.scope ?? "cell") {
+        case "row": return cellsOf(tr);
+        case "column": return rows.map((r) => cellAt(r, col)).filter((x): x is XElement => !!x);
+        case "table": return rows.flatMap(cellsOf);
+        default: return [tc];
+      }
+    };
+    switch (p.action) {
+      case "delete_row": {
+        if (rows.length <= 1) throw new DocError("这是表格唯一的一行；要删除整个表格请用 action=delete_table。", "invalid");
+        if (o.track) {
+          const trPr = tr.child(`${w}:trPr`) ?? (() => { const [x] = parseFragment(`<${w}:trPr/>`) as XElement[]; tr.children.unshift(x); x.parent = tr; markDirty(tr); return x; })();
+          const [del] = parseFragment(`<${w}:del ${this.revAttrs(w, o)}/>`);
+          trPr.children.splice(orderedInsertIndex(trPr, "del", TRPR_ORDER, w), 0, del);
+          del.parent = trPr; trPr.attrsDirty = true; markDirty(trPr);
+          for (const r of [...tr.descendants()].filter((d) => d.local === "r" && d.prefix === w && !d.closest(`${w}:del`))) this.trackDeleteRun(r, pe, o);
+          summary = "已删除该行（记录为删除修订）";
+        } else {
+          removeNode(tr);
+          summary = "已删除该行";
+        }
+        break;
+      }
+      case "delete_column": {
+        const grid = tbl.child(`${w}:tblGrid`);
+        const gcols = grid?.childrenNamed(`${w}:gridCol`) ?? [];
+        if (gcols.length <= 1) throw new DocError("表格只有一列；要删除整个表格请用 action=delete_table。", "invalid");
+        for (const r of rows) {
+          const c = cellAt(r, col);
+          if (!c) continue;
+          if (span(c) > 1) {
+            const gs = c.child(`${w}:tcPr`)!.child(`${w}:gridSpan`)!;
+            gs.setAttr(`${w}:val`, String(span(c) - 1));
+          } else removeNode(c);
+          if (!cellsOf(r).length) removeNode(r);
+        }
+        if (gcols[col]) removeNode(gcols[col]);
+        summary = `已删除第 ${col + 1} 列`;
+        break;
+      }
+      case "insert_column": {
+        const grid = tbl.child(`${w}:tblGrid`);
+        const gcols = grid?.childrenNamed(`${w}:gridCol`) ?? [];
+        const at = (p.position ?? "after") === "after" ? col + span(tc) - 1 : col;
+        const width = Number(gcols[at]?.getAttr(`${w}:w`) ?? 1200);
+        rows.forEach((r, ri) => {
+          const ref = cellAt(r, at);
+          if (!ref) return;
+          const [clone] = parseFragment(serializeNode(ref, this.src(pe.part))) as XElement[];
+          for (const d of [...clone.descendants()]) if (d.local === "vMerge" || d.local === "gridSpan") removeNode(d);
+          const paras = clone.childrenNamed(`${w}:p`);
+          paras.slice(1).forEach((x) => removeNode(x));
+          const firstP = paras[0];
+          const tplRun = [...firstP.descendants()].find((d) => d.local === "r" && d.child(`${w}:t`));
+          const rPr = tplRun?.child(`${w}:rPr`);
+          for (const c of [...firstP.children]) if (!(c.type === "el" && c.local === "pPr")) removeNode(c);
+          if (this.supportsW14(pe.part)) { firstP.setAttr("w14:paraId", this.newParaId()); firstP.setAttr("w14:textId", "77777777"); }
+          const text = p.cells?.[ri] ?? "";
+          if (text) appendChild(firstP, parseFragment(`<${w}:r>${rPr ? serializeNode(rPr, "") : ""}${runContent(w, text)}</${w}:r>`));
+          const tcW = clone.child(`${w}:tcPr`)?.child(`${w}:tcW`);
+          if (tcW) { tcW.setAttr(`${w}:w`, String(width)); tcW.setAttr(`${w}:type`, "dxa"); }
+          if ((p.position ?? "after") === "after" && span(ref) === 1) insertAfter(ref, [clone]);
+          else insertBefore(ref, [clone]);
+        });
+        if (grid && gcols[at]) {
+          const [g] = parseFragment(`<${w}:gridCol ${w}:w="${width}"/>`);
+          if ((p.position ?? "after") === "after") insertAfter(gcols[at], [g]); else insertBefore(gcols[at], [g]);
+        }
+        const tblW = tbl.child(`${w}:tblPr`)?.child(`${w}:tblW`);
+        if (tblW?.getAttr(`${w}:type`) === "dxa") tblW.setAttr(`${w}:w`, String(Number(tblW.getAttr(`${w}:w`)) + width));
+        summary = `已在第 ${col + 1} 列${(p.position ?? "after") === "after" ? "之后" : "之前"}插入一列`;
+        break;
+      }
+      case "merge": {
+        if (!p.to_ref) throw new DocError("合并单元格需要 to_ref：矩形区域另一个角的单元格段落引用。", "invalid");
+        const other = this.resolve(p.to_ref);
+        const tc2 = other.el.closest(`${w}:tc`), tr2 = other.el.closest(`${w}:tr`);
+        if (!tc2 || !tr2 || other.el.closest(`${w}:tbl`) !== tbl) throw new DocError("to_ref 必须是同一个表格中的单元格。", "invalid");
+        const r1 = Math.min(rows.indexOf(tr), rows.indexOf(tr2)), r2 = Math.max(rows.indexOf(tr), rows.indexOf(tr2));
+        const c1 = Math.min(col, gridCol(tr2, tc2)), c2 = Math.max(col + span(tc) - 1, gridCol(tr2, tc2) + span(tc2) - 1);
+        for (let ri = r1; ri <= r2; ri++) {
+          const row = rows[ri];
+          const first = cellAt(row, c1);
+          if (!first || gridCol(row, first) !== c1) throw new DocError("合并区域的边界穿过了已合并的单元格，请调整范围。", "invalid");
+          // 横向：把 c1..c2 合成一个 gridSpan 单元格，文字并入第一个
+          let k = gridCol(row, first) + span(first);
+          while (k <= c2) {
+            const next = cellAt(row, k);
+            if (!next) break;
+            const ns = span(next);
+            for (const para of next.childrenNamed(`${w}:p`)) if (this.textOfEl(para, pe.part).trim()) { removeNode(para); appendChild(first, [para]); }
+            removeNode(next);
+            k += ns;
+          }
+          const pr = tcPrOf(first);
+          this.setProp(pr, "gridSpan", c2 - c1 + 1 > 1 ? { val: String(c2 - c1 + 1) } : null, TCPR_ORDER, w);
+          const tcW = pr.child(`${w}:tcW`);
+          const gcols = tbl.child(`${w}:tblGrid`)?.childrenNamed(`${w}:gridCol`) ?? [];
+          const sumW = gcols.slice(c1, c2 + 1).reduce((a, g) => a + Number(g.getAttr(`${w}:w`) ?? 0), 0);
+          if (tcW && sumW) { tcW.setAttr(`${w}:w`, String(sumW)); tcW.setAttr(`${w}:type`, "dxa"); }
+          // 纵向
+          if (r2 > r1) this.setProp(pr, "vMerge", ri === r1 ? { val: "restart" } : {}, TCPR_ORDER, w);
+          if (ri > r1) {
+            const top = cellAt(rows[r1], c1)!;
+            for (const para of first.childrenNamed(`${w}:p`)) if (this.textOfEl(para, pe.part).trim()) { removeNode(para); appendChild(top, [para]); }
+            if (!first.childrenNamed(`${w}:p`).length) appendChild(first, parseFragment(this.paraXml(pe.part, "", "", o)));
+          }
+          // 合并后第一个单元格里去掉多余的空段落
+          const ps = first.childrenNamed(`${w}:p`);
+          if (ps.length > 1) for (const x of ps) if (!this.textOfEl(x, pe.part).trim() && first.childrenNamed(`${w}:p`).length > 1) removeNode(x);
+        }
+        summary = `已合并第 ${r1 + 1}–${r2 + 1} 行、第 ${c1 + 1}–${c2 + 1} 列的单元格`;
+        break;
+      }
+      case "shade": {
+        const color = (p.color ?? "").replace(/^#/, "").toUpperCase();
+        if (color && !/^[0-9A-F]{6}$/.test(color) && color !== "NONE") throw new DocError("color 需为 6 位十六进制颜色（如 D9E2F3）或 none", "invalid");
+        for (const c of scopeCells()) this.setProp(tcPrOf(c), "shd", color && color !== "NONE" ? { val: "clear", color: "auto", fill: color } : null, TCPR_ORDER, w);
+        summary = `已设置${{ cell: "单元格", row: "整行", column: "整列", table: "整个表格" }[p.scope ?? "cell"]}底纹 ${color || "（清除）"}`;
+        break;
+      }
+      case "align": {
+        for (const c of scopeCells()) {
+          if (p.vertical) this.setProp(tcPrOf(c), "vAlign", { val: p.vertical }, TCPR_ORDER, w);
+          if (p.horizontal) for (const para of c.childrenNamed(`${w}:p`)) this.setProp(this.ensurePPr(para, w), "jc", { val: p.horizontal === "left" ? "left" : p.horizontal }, PPR_ORDER, w);
+        }
+        summary = `已设置对齐（${[p.horizontal && `水平 ${p.horizontal}`, p.vertical && `垂直 ${p.vertical}`].filter(Boolean).join("，")}）`;
+        break;
+      }
+      case "borders": {
+        const tblPr = this.ensureChild(tbl, "tblPr", [], w, true);
+        const B = (sz: number) => ({ val: "single", sz: String(sz), space: "0", color: "000000" });
+        const old = tblPr.child(`${w}:tblBorders`);
+        if (old) removeNode(old);
+        const st = p.style ?? "grid";
+        const spec: Record<string, Record<string, string> | null> = st === "grid"
+          ? { top: B(4), left: B(4), bottom: B(4), right: B(4), insideH: B(4), insideV: B(4) }
+          : st === "three_line" ? { top: B(12), left: { val: "nil" }, bottom: B(12), right: { val: "nil" }, insideH: { val: "nil" }, insideV: { val: "nil" } }
+          : st === "outer" ? { top: B(8), left: B(8), bottom: B(8), right: B(8), insideH: { val: "nil" }, insideV: { val: "nil" } }
+          : { top: { val: "nil" }, left: { val: "nil" }, bottom: { val: "nil" }, right: { val: "nil" }, insideH: { val: "nil" }, insideV: { val: "nil" } };
+        const inner = Object.entries(spec).map(([k, a]) => `<${w}:${k}${Object.entries(a!).map(([x, v]) => ` ${w}:${x}="${v}"`).join("")}/>`).join("");
+        const [bEl] = parseFragment(`<${w}:tblBorders>${inner}</${w}:tblBorders>`);
+        tblPr.children.splice(orderedInsertIndex(tblPr, "tblBorders", TBLPR_ORDER, w), 0, bEl);
+        bEl.parent = tblPr; markDirty(tblPr);
+        // 单元格自带的边框会覆盖表格边框：清除
+        for (const c of rows.flatMap(cellsOf)) { const b = c.child(`${w}:tcPr`)?.child(`${w}:tcBorders`); if (b) removeNode(b); }
+        if (st === "three_line") {
+          for (const c of cellsOf(rows[0])) this.setProp(tcPrOf(c), "tcBorders", null, TCPR_ORDER, w);
+          for (const c of cellsOf(rows[0])) {
+            const [bb] = parseFragment(`<${w}:tcBorders><${w}:bottom ${w}:val="single" ${w}:sz="6" ${w}:space="0" ${w}:color="000000"/></${w}:tcBorders>`);
+            const pr = tcPrOf(c);
+            pr.children.splice(orderedInsertIndex(pr, "tcBorders", TCPR_ORDER, w), 0, bb); bb.parent = pr; markDirty(pr);
+          }
+        }
+        summary = `已把表格边框设为${{ grid: "网格线", three_line: "三线表", plain: "无边框", outer: "仅外框" }[st]}`;
+        break;
+      }
+      case "set_width": {
+        const pct = Math.min(100, Math.max(10, p.width_pct ?? 100));
+        const total = Math.round(this.textWidthTwips(pe) * pct / 100);
+        const tblPr = this.ensureChild(tbl, "tblPr", [], w, true);
+        this.setProp(tblPr, "tblW", { w: String(total), type: "dxa" }, TBLPR_ORDER, w);
+        const gcols = tbl.child(`${w}:tblGrid`)?.childrenNamed(`${w}:gridCol`) ?? [];
+        const old = gcols.reduce((a, g) => a + Number(g.getAttr(`${w}:w`) ?? 0), 0) || 1;
+        const ratio = total / old;
+        gcols.forEach((g) => g.setAttr(`${w}:w`, String(Math.round(Number(g.getAttr(`${w}:w`) ?? 0) * ratio))));
+        for (const c of rows.flatMap(cellsOf)) {
+          const tcW = c.child(`${w}:tcPr`)?.child(`${w}:tcW`);
+          if (tcW?.getAttr(`${w}:type`) === "dxa") tcW.setAttr(`${w}:w`, String(Math.round(Number(tcW.getAttr(`${w}:w`)) * ratio)));
+        }
+        summary = `已把表格宽度设为版心的 ${pct}%`;
+        break;
+      }
+      case "repeat_header": {
+        const first = rows[0];
+        const trPr = first.child(`${w}:trPr`) ?? (() => { const [x] = parseFragment(`<${w}:trPr/>`) as XElement[]; const ex = first.child(`${w}:tblPrEx`); if (ex) insertAfter(ex, [x]); else { first.children.unshift(x); x.parent = first; markDirty(first); } return x; })();
+        this.setProp(trPr, "tblHeader", {}, TRPR_ORDER, w);
+        summary = "已设置表头行在每页重复";
+        break;
+      }
+      case "delete_table": {
+        if (o.track) throw new DocError("修订模式下请逐行删除。", "unsupported");
+        const parent = tbl.parent as XElement;
+        removeNode(tbl);
+        if (parent.local === "tc" && !parent.childrenNamed(`${w}:p`).length) appendChild(parent, parseFragment(this.paraXml(pe.part, "", "", o)));
+        summary = "已删除整个表格";
+        break;
+      }
+    }
+    const structural = ["delete_row", "delete_column", "insert_column", "merge", "delete_table"].includes(p.action);
+    if (structural) this._structureVersion++;
+    this.reindex();
+    return { changedRefs: structural ? [] : [pe.ref], summary: `${summary}${structural ? "。表格结构已变化，请重新读取以获得最新引用。" : "。"}`, preview: [{ ref: pe.ref, before: `（表格）${clip(before, 60)}`, after: summary }], structural };
+  }
+
+  private textOfEl(pEl: XElement, part: string): string {
+    const pe = this.paras.find((x) => x.el === pEl);
+    if (pe) return this.textOf(pe);
+    void part;
+    return [...pEl.descendants()].filter((d) => d.local === "t").map((d) => innerText(d)).join("");
+  }
+
+  // ------------------------------- 图片 / 图形 / 图表 -------------------------------
+
+  /** 写入图片部件并登记关系，返回关系 ID */
+  private addImagePart(data: Buffer, owner: string): { rId: string; info: NonNullable<ReturnType<typeof imageInfo>> } {
+    const info = imageInfo(data);
+    if (!info) throw new DocError("无法识别的图片格式（支持 PNG / JPEG / GIF / BMP）。", "invalid");
+    const ext = info.ext === "jpeg" ? "jpeg" : info.ext;
+    const name = this.uniquePartName(this.mainPart.replace(/[^/]+$/, "media").replace(/^\/?/, ""), "image", ext);
+    this.addPart(name, data);
+    this.ensureDefaultCT(ext, info.mime);
+    return { rId: this.addRel(REL_EXTRA.image, this.relTarget(name), { owner }), info };
+  }
+
+  /** 新式对象外面包一层图片后备（浏览器预览等不认识形状/图表的阅读器显示图片） */
+  private withFallback(w: string, owner: string, drawing: string, fallbackPng: Buffer | undefined, cx: number, cy: number, descr?: string): string {
+    if (!fallbackPng) return drawing;
+    try {
+      const { rId } = this.addImagePart(fallbackPng, owner);
+      const id = this.nextDocPrId();
+      return alternateContentXml(drawing, pictureXml({ w, rId, cx, cy, id, name: `后备图片 ${id}`, descr }));
+    } catch {
+      return drawing;
+    }
+  }
+
+  insertImage(p: { anchor: string; position: "before" | "after"; data: Buffer; width_pt?: number; height_pt?: number; align?: "left" | "center" | "right"; caption?: string; alt?: string; name?: string }, o: EditOptions): EditResult {
+    const anchor = this.resolve(p.anchor);
+    const w = this.w(anchor.part);
+    const { rId, info } = this.addImagePart(p.data, anchor.part);
+    const maxW = this.textWidthTwips(anchor) / 20;
+    let wpt = p.width_pt ?? info.width * 0.75;
+    let hpt = p.height_pt ?? (wpt * info.height) / Math.max(1, info.width);
+    if (p.width_pt && !p.height_pt) hpt = (p.width_pt * info.height) / Math.max(1, info.width);
+    if (!p.width_pt && p.height_pt) wpt = (p.height_pt * info.width) / Math.max(1, info.height);
+    if (wpt > maxW) { hpt = (hpt * maxW) / wpt; wpt = maxW; }
+    const id = this.nextDocPrId();
+    const drawing = pictureXml({ w, rId, cx: emu(wpt), cy: emu(hpt), id, name: p.name ?? `图片 ${id}`, descr: p.alt ?? p.caption });
+    let xml = this.objectParaXml(anchor, `<${w}:r>${drawing}</${w}:r>`, p.align ?? "center", o, !!p.caption);
+    if (p.caption) xml += this.captionXml(anchor, p.caption, o);
+    const nodes = this.insertBlockXml(anchor, p.position, xml);
+    const refs = this.refsOf(nodes);
+    return {
+      changedRefs: refs,
+      summary: `已插入图片（${Math.round(wpt)}×${Math.round(hpt)} pt，原图 ${info.width}×${info.height} 像素）${p.caption ? "及题注" : ""}，段落引用：${refs.join("、")}。`,
+      preview: [{ ref: refs[0], before: "", after: `⟨图片⟩${p.caption ? `\n${p.caption}` : ""}` }],
+      structural: true,
+    };
+  }
+
+  insertShapes(p: { anchor: string; position: "before" | "after"; width_pt: number; height_pt: number; shapes: ShapeSpec[]; caption?: string; alt?: string; align?: "left" | "center" | "right"; fallbackPng?: Buffer }, o: EditOptions): EditResult {
+    const anchor = this.resolve(p.anchor);
+    const w = this.w(anchor.part);
+    if (!p.shapes.length) throw new DocError("shapes 不能为空", "invalid");
+    const maxW = this.textWidthTwips(anchor) / 20;
+    let shapes = p.shapes;
+    let W = p.width_pt, H = p.height_pt;
+    if (W > maxW) {
+      const k = maxW / W;
+      shapes = shapes.map((s) => ({ ...s, x: s.x * k, y: s.y * k, w: s.w !== undefined ? s.w * k : undefined, h: s.h !== undefined ? s.h * k : undefined, x2: s.x2 !== undefined ? s.x2 * k : undefined, y2: s.y2 !== undefined ? s.y2 * k : undefined, font_size: s.font_size ? Math.max(6, s.font_size * Math.max(k, 0.8)) : s.font_size }));
+      W = maxW; H = H * k;
+    }
+    const font = /<[^>]*rFonts[^>]*eastAsia="([^"]+)"/.exec(this.dominantRPrXml(anchor))?.[1];
+    const id = this.nextDocPrId();
+    const alt = p.alt ?? shapes.map((s) => s.text).filter(Boolean).join(" / ");
+    const drawing = this.withFallback(w, anchor.part, shapesGroupXml({ w, id, name: `图形 ${id}`, descr: alt, width: W, height: H, shapes, font }), p.fallbackPng, emu(W), emu(H), alt);
+    let xml = this.objectParaXml(anchor, `<${w}:r>${drawing}</${w}:r>`, p.align ?? "center", o, !!p.caption);
+    if (p.caption) xml += this.captionXml(anchor, p.caption, o);
+    const nodes = this.insertBlockXml(anchor, p.position, xml);
+    const refs = this.refsOf(nodes);
+    return {
+      changedRefs: refs,
+      summary: `已插入由 ${shapes.length} 个形状组成的矢量图（${Math.round(W)}×${Math.round(H)} pt，可在 Word 中逐个选中修改）${p.caption ? "及题注" : ""}。`,
+      preview: [{ ref: refs[0], before: "", after: `⟨图形⟩ ${clip(alt, 120)}${p.caption ? `\n${p.caption}` : ""}` }],
+      structural: true,
+    };
+  }
+
+  insertChart(p: { anchor: string; position: "before" | "after"; chart: ChartSpec; width_pt?: number; height_pt?: number; caption?: string; fallbackPng?: Buffer }, o: EditOptions): EditResult {
+    const anchor = this.resolve(p.anchor);
+    const w = this.w(anchor.part);
+    const c = p.chart;
+    if (!c.categories.length || !c.series.length) throw new DocError("图表需要至少一个分类和一个数据系列", "invalid");
+    for (const s of c.series) if (s.values.length !== c.categories.length) throw new DocError(`系列"${s.name}"有 ${s.values.length} 个值，但分类有 ${c.categories.length} 个，需一一对应。`, "invalid");
+    if (c.series.length > 20 || c.categories.length > 200) throw new DocError("系列最多 20 个、分类最多 200 个", "invalid");
+    const dir = this.mainPart.replace(/[^/]+$/, "");
+    const chartName = this.uniquePartName(`${dir}charts`, "chart", "xml");
+    const n = /chart(\d+)\.xml$/.exec(chartName)![1];
+    const wbName = this.uniquePartName(`${dir}embeddings`, `Microsoft_Excel_Worksheet`, "xlsx");
+    this.addPart(chartName, chartXml(c));
+    this.addPart(wbName, chartWorkbook(c));
+    this.ensureOverrideCT(chartName, CT.chart);
+    this.ensureDefaultCT("xlsx", CT.xlsx);
+    this.addPart(`${dir}charts/_rels/chart${n}.xml.rels`, `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\r\n<Relationships xmlns="${NS.rels}"><Relationship Id="rId1" Type="${REL_EXTRA.package}" Target="../embeddings/${wbName.split("/").pop()}"/></Relationships>`);
+    const rId = this.addRel(REL_EXTRA.chart, this.relTarget(chartName), { owner: anchor.part });
+    const maxW = this.textWidthTwips(anchor) / 20;
+    const wpt = Math.min(maxW, p.width_pt ?? Math.min(maxW, 430));
+    const hpt = p.height_pt ?? wpt * 0.6;
+    const id = this.nextDocPrId();
+    const alt = `${c.title ?? "图表"}：${c.series.map((s) => `${s.name}（${s.values.join("、")}）`).join("；")}`;
+    const chartDrawing = this.withFallback(w, anchor.part, chartInlineXml({ w, rId, cx: emu(wpt), cy: emu(hpt), id, name: `图表 ${id}`, descr: alt }), p.fallbackPng, emu(wpt), emu(hpt), alt);
+    let xml = this.objectParaXml(anchor, `<${w}:r>${chartDrawing}</${w}:r>`, "center", o, !!p.caption);
+    if (p.caption) xml += this.captionXml(anchor, p.caption, o);
+    const nodes = this.insertBlockXml(anchor, p.position, xml);
+    const refs = this.refsOf(nodes);
+    return {
+      changedRefs: refs,
+      summary: `已插入原生 Word 图表（${c.type}，${c.series.length} 个系列 × ${c.categories.length} 个分类），数据内嵌为 Excel 工作簿，可在 Word 中右键"编辑数据"。`,
+      preview: [{ ref: refs[0], before: "", after: `⟨图表⟩ ${clip(alt, 160)}${p.caption ? `\n${p.caption}` : ""}` }],
+      structural: true,
+    };
+  }
+
+  // ------------------------------- 公式 -------------------------------
+
+  insertEquation(p: { anchor?: string; position?: "before" | "after"; ref?: string; after_text?: string; latex: string; display?: boolean; number?: string }, o: EditOptions): EditResult {
+    const display = p.display ?? !p.ref;
+    if (display) {
+      if (!p.anchor) throw new DocError("行间公式需要 anchor（插在哪个段落前后）", "invalid");
+      const anchor = this.resolve(p.anchor);
+      const w = this.w(anchor.part);
+      let xml = equationParagraphXml({ w, latex: p.latex, display: true, number: p.number, textWidthTwips: this.textWidthTwips(anchor), rPr: this.baseFontRPr(anchor) });
+      // 补上段落 ID 与修订标记
+      xml = xml.replace(`<${w}:p>`, `<${w}:p${this.supportsW14(anchor.part) ? ` w14:paraId="${this.newParaId()}" w14:textId="77777777"` : ""}>`);
+      if (o.track) {
+        xml = xml.replace(`</${w}:pPr>`, `<${w}:rPr>${this.insMark(w, o)}</${w}:rPr></${w}:pPr>`);
+        xml = xml.replace(new RegExp(`<${w}:r>[\\s\\S]*?</${w}:r>`, "g"), (r) => this.trackRun(w, r, o));
+      }
+      const nodes = this.insertBlockXml(anchor, p.position ?? "after", xml);
+      const refs = this.refsOf(nodes);
+      return { changedRefs: refs, summary: `已插入行间公式${p.number ? `（编号 ${p.number}，与公式在同一行右端）` : ""}，可在 Word 中直接编辑。`, preview: [{ ref: refs[0], before: "", after: `⟨公式⟩ ${p.latex}${p.number ? `   ${p.number}` : ""}` }], structural: true };
+    }
+    // 行内公式：插在段落中某段文字之后（或段尾）
+    const pe = this.resolve(p.ref!);
+    this.isEditable(pe);
+    const w = this.w(pe.part);
+    const full = this.textOf(pe);
+    const pos = p.after_text ? this.findRange(pe, p.after_text).end : full.length;
+    if (pos > 0 && pos < full.length) this.splitAt(pe, pos);
+    const omml = parseFragment(equationParagraphXml({ w, latex: p.latex, display: false, textWidthTwips: 0 }));
+    const { segs } = this.segments(pe);
+    const before = [...segs].reverse().find((s) => s.run && s.end <= pos && s.end > s.start);
+    if (before?.run && pos > 0) insertAfter(this.anchorOf(before.run, pe.el), omml);
+    else {
+      const pPr = pe.el.child(`${w}:pPr`);
+      if (pPr) insertAfter(pPr, omml);
+      else { pe.el.children.unshift(...omml); omml.forEach((x) => (x.parent = pe.el)); markDirty(pe.el); }
+    }
+    return { changedRefs: [pe.ref], summary: `已在段落 ${pe.ref} 中插入行内公式。`, preview: [{ ref: pe.ref, before: full, after: this.textOf(pe) }], structural: false };
+  }
+
+  // ------------------------------- 分隔符 / 页面设置 -------------------------------
+
+  insertBreak(p: { anchor: string; position: "before" | "after"; kind: "page" | "column" | "section_next_page" | "section_continuous" | "section_odd_page" | "section_even_page" }, o: EditOptions): EditResult {
+    const anchor = this.resolve(p.anchor);
+    if (anchor.part !== this.mainPart || anchor.container !== "body") throw new DocError("分隔符只能插在正文段落（不在表格、页眉页脚中）前后。", "invalid");
+    const w = this.w(anchor.part);
+    if (p.kind === "page" || p.kind === "column") {
+      const xml = this.paraXml(anchor.part, "", this.trackRun(w, `<${w}:r><${w}:br ${w}:type="${p.kind}"/></${w}:r>`, o), o);
+      const nodes = this.insertBlockXml(anchor, p.position, xml);
+      return { changedRefs: this.refsOf(nodes), summary: `已插入${p.kind === "page" ? "分页符" : "分栏符"}。`, preview: [{ ref: "", before: "", after: p.kind === "page" ? "⟨分页符⟩" : "⟨分栏符⟩" }], structural: true };
+    }
+    // 分节符：新段落带上当前节的属性（结束前半部分），原来的节属性改为新的起始方式
+    const cur = this.sectPrFor(anchor);
+    if (!cur) throw new DocError("文档缺少分节属性（sectPr），无法插入分节符。", "invalid");
+    const clone = serializeNode(cur, this.src(anchor.part)).replace(new RegExp(`<${w}:sectPrChange[\\s\\S]*?</${w}:sectPrChange>`), "");
+    const xml = this.paraXml(anchor.part, clone, "", o);
+    const nodes = this.insertBlockXml(anchor, p.position, xml);
+    const type = { section_next_page: "nextPage", section_continuous: "continuous", section_odd_page: "oddPage", section_even_page: "evenPage" }[p.kind];
+    this.setProp(cur, "type", { val: type }, SECTPR_ORDER, w);
+    return { changedRefs: this.refsOf(nodes), summary: `已插入分节符（${{ nextPage: "下一页", continuous: "连续", oddPage: "奇数页", evenPage: "偶数页" }[type]}）。之后可以用 doc_page_setup 单独设置新节的纸张方向、边距、分栏。`, preview: [{ ref: "", before: "", after: "⟨分节符⟩" }], structural: true };
+  }
+
+  pageSetup(p: { ref?: string; orientation?: "portrait" | "landscape"; paper?: "A4" | "A3" | "A5" | "B5" | "Letter" | "Legal"; margins_pt?: { top?: number; bottom?: number; left?: number; right?: number; header?: number; footer?: number }; columns?: number; column_gap_pt?: number; line_numbers?: boolean; v_align?: "top" | "center" | "bottom" }, _o: EditOptions): EditResult {
+    const w = this.w(this.mainPart);
+    const targets = p.ref ? [this.sectPrFor(this.resolve(p.ref))].filter((x): x is XElement => !!x) : this.allSectPrs();
+    if (!targets.length) throw new DocError("文档缺少分节属性（sectPr）。", "invalid");
+    const PAPER: Record<string, [number, number]> = { A4: [11906, 16838], A3: [16838, 23811], A5: [8391, 11906], B5: [10319, 14571], Letter: [12240, 15840], Legal: [12240, 20160] };
+    const changes: string[] = [];
+    for (const sp of targets) {
+      const pgSz = this.ensureChild(sp, "pgSz", SECTPR_ORDER, w);
+      let W = Number(pgSz.getAttr(`${w}:w`) ?? 11906), H = Number(pgSz.getAttr(`${w}:h`) ?? 16838);
+      if (p.paper) { [W, H] = PAPER[p.paper]; if ((pgSz.getAttr(`${w}:orient`) === "landscape" && p.orientation !== "portrait") || p.orientation === "landscape") [W, H] = [H, W]; }
+      if (p.orientation) {
+        const land = p.orientation === "landscape";
+        if (land !== W > H) [W, H] = [H, W];
+        if (land) pgSz.setAttr(`${w}:orient`, "landscape"); else pgSz.removeAttr(`${w}:orient`);
+        // 横向时左右与上下边距互换，保持版心比例
+        const mar = sp.child(`${w}:pgMar`);
+        if (mar && !p.margins_pt) {
+          const [t, b, l, r] = ["top", "bottom", "left", "right"].map((k) => mar.getAttr(`${w}:${k}`));
+          if (t && b && l && r && land !== (Number(l) > Number(t))) { mar.setAttr(`${w}:top`, l); mar.setAttr(`${w}:bottom`, r); mar.setAttr(`${w}:left`, t); mar.setAttr(`${w}:right`, b); }
+        }
+      }
+      pgSz.setAttr(`${w}:w`, String(W));
+      pgSz.setAttr(`${w}:h`, String(H));
+      if (p.margins_pt) {
+        const mar = this.ensureChild(sp, "pgMar", SECTPR_ORDER, w);
+        for (const [k, v] of Object.entries(p.margins_pt)) if (typeof v === "number") mar.setAttr(`${w}:${k}`, String(twip(v)));
+        for (const k of ["top", "bottom", "left", "right", "header", "footer", "gutter"]) if (!mar.getAttr(`${w}:${k}`)) mar.setAttr(`${w}:${k}`, k === "gutter" ? "0" : k === "header" || k === "footer" ? "851" : "1440");
+      }
+      if (p.columns) {
+        const cols = this.ensureChild(sp, "cols", SECTPR_ORDER, w);
+        for (const c of [...cols.children]) removeNode(c);
+        cols.setAttr(`${w}:num`, String(p.columns));
+        cols.setAttr(`${w}:space`, String(twip(p.column_gap_pt ?? 21)));
+        cols.removeAttr(`${w}:equalWidth`);
+      }
+      if (p.line_numbers !== undefined) this.setProp(sp, "lnNumType", p.line_numbers ? { countBy: "1", restart: "newPage" } : null, SECTPR_ORDER, w);
+      if (p.v_align) this.setProp(sp, "vAlign", { val: p.v_align === "center" ? "center" : p.v_align }, SECTPR_ORDER, w);
+      markDirty(sp);
+    }
+    if (p.paper) changes.push(`纸张 ${p.paper}`);
+    if (p.orientation) changes.push(p.orientation === "landscape" ? "横向" : "纵向");
+    if (p.margins_pt) changes.push(`边距 ${Object.entries(p.margins_pt).map(([k, v]) => `${k}=${v}pt`).join(" ")}`);
+    if (p.columns) changes.push(`${p.columns} 栏`);
+    if (p.line_numbers !== undefined) changes.push(p.line_numbers ? "显示行号" : "取消行号");
+    if (p.v_align) changes.push(`页面垂直对齐 ${p.v_align}`);
+    return { changedRefs: [], summary: `已修改${p.ref ? "所在节" : `全部 ${targets.length} 节`}的页面设置：${changes.join("，") || "（无变化）"}。`, preview: [{ ref: "", before: "页面设置", after: changes.join("，") }], structural: false };
+  }
+
+  // ------------------------------- 页眉页脚 -------------------------------
+
+  setHeaderFooter(p: { kind: "header" | "footer"; text: string; align?: "left" | "center" | "right"; ref?: string; first_page?: boolean }, o: EditOptions): EditResult {
+    const w = this.w(this.mainPart);
+    const targets = p.ref ? [this.sectPrFor(this.resolve(p.ref))].filter((x): x is XElement => !!x) : this.allSectPrs();
+    if (!targets.length) throw new DocError("文档缺少分节属性（sectPr）。", "invalid");
+    const dir = this.mainPart.replace(/[^/]+$/, "");
+    const name = this.uniquePartName(dir.replace(/\/$/, ""), p.kind, "xml");
+    const styleName = p.kind === "header" ? "header" : "footer";
+    const st = this.styles.resolve(styleName, "paragraph") ?? this.styles.resolve(p.kind === "header" ? "页眉" : "页脚", "paragraph");
+    // {PAGE} {NUMPAGES} {SECTIONPAGES} → 域
+    const fld = (instr: string) => `<w:fldSimple w:instr=" ${instr} "><w:r><w:t>1</w:t></w:r></w:fldSimple>`;
+    const paras = p.text.split("\n").map((line) => {
+      const pieces = line.split(/(\{PAGE\}|\{NUMPAGES\}|\{SECTIONPAGES\}|\{DATE\})/);
+      const content = pieces.filter(Boolean).map((x) => x === "{PAGE}" ? fld("PAGE") : x === "{NUMPAGES}" ? fld("NUMPAGES") : x === "{SECTIONPAGES}" ? fld("SECTIONPAGES") : x === "{DATE}" ? fld('DATE \\@ "yyyy-MM-dd"') : `<w:r>${runContent("w", x)}</w:r>`).join("");
+      return `<w:p><w:pPr>${st ? `<w:pStyle w:val="${st.id}"/>` : ""}<w:jc w:val="${p.align ?? "center"}"/></w:pPr>${content}</w:p>`;
+    }).join("");
+    const root = p.kind === "header" ? "hdr" : "ftr";
+    this.addPart(name, `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\r\n<w:${root} xmlns:w="${NS.w}" xmlns:r="${NS.r}">${paras || "<w:p/>"}</w:${root}>`);
+    this.ensureOverrideCT(name, p.kind === "header" ? CT.header : CT.footer);
+    const rId = this.addRel(p.kind === "header" ? REL_TYPES.header : REL_TYPES.footer, this.relTarget(name));
+    const refName = p.kind === "header" ? "headerReference" : "footerReference";
+    const type = p.first_page ? "first" : "default";
+    for (const sp of targets) {
+      for (const old of sp.childrenNamed(`${w}:${refName}`)) if ((old.getAttr(`${w}:type`) ?? "default") === type) removeNode(old);
+      const [node] = parseFragment(`<${w}:${refName} ${w}:type="${type}" r:id="${rId}" xmlns:r="${NS.r}"/>`);
+      // 页眉引用在前、页脚引用在后
+      const kids = sp.children;
+      let idx = 0;
+      for (let k = 0; k < kids.length; k++) {
+        const c = kids[k];
+        if (c.type !== "el") continue;
+        if (c.local === "headerReference" || (p.kind === "footer" && c.local === "footerReference")) idx = k + 1;
+      }
+      kids.splice(idx, 0, node);
+      node.parent = sp;
+      markDirty(sp);
+      if (p.first_page) this.setProp(sp, "titlePg", {}, SECTPR_ORDER, w);
+    }
+    // 新部件加入可编辑范围（排在最后，已有段落的序号引用不受影响）
+    this.contentParts.push(name);
+    this.reindex();
+    void o;
+    return { changedRefs: [], summary: `已为${p.ref ? "所在节" : `全部 ${targets.length} 节`}设置${p.first_page ? "首页" : ""}${p.kind === "header" ? "页眉" : "页脚"}：${p.text.replace(/\n/g, " ⏎ ")}（{PAGE} 等已转换为自动更新的页码域）。`, preview: [{ ref: "", before: "", after: `${p.kind === "header" ? "页眉" : "页脚"}：${p.text}` }], structural: false };
+  }
+
+  // ------------------------------- 列表 -------------------------------
+
+  private numberingPartName(create: boolean): string | null {
+    const rels = parseRels(this.optText(relsPathFor(this.mainPart)) ?? null);
+    const r = rels.find((x) => x.type === REL_TYPES.numbering);
+    if (r) {
+      const name = resolveTarget(this.mainPart, r.target);
+      if (this.pkg.has(name)) return name;
+    }
+    if (!create) return null;
+    const name = this.mainPart.replace(/[^/]+$/, "numbering.xml");
+    this.addPart(name, `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\r\n<w:numbering xmlns:w="${NS.w}"></w:numbering>`);
+    this.ensureOverrideCT(name, CT.numbering);
+    this.addRel(REL_TYPES.numbering, this.relTarget(name));
+    return name;
+  }
+
+  setList(p: { refs: string[]; kind: "bullet" | "number" | "chinese" | "outline" | "none"; level?: number; restart?: boolean }, o: EditOptions): EditResult {
+    const entries = p.refs.map((r) => this.resolve(r));
+    const level = Math.max(0, Math.min(8, (p.level ?? 1) - 1));
+    let numId: string | null = null;
+    if (p.kind !== "none") {
+      const part = this.numberingPartName(true)!;
+      const doc = this.part(part);
+      const nw = this.w(part);
+      const abs = doc.root.elements().filter((e) => e.local === "abstractNum");
+      const nums = doc.root.elements().filter((e) => e.local === "num");
+      // 复用本工具之前创建的同类定义（连续编号）
+      const tag = `docagent-${p.kind}`;
+      let absId: string | undefined = abs.find((a) => a.child(`${nw}:name`)?.getAttr(`${nw}:val`) === tag)?.getAttr(`${nw}:abstractNumId`);
+      if (!absId) {
+        const id = Math.max(-1, ...abs.map((a) => Number(a.getAttr(`${nw}:abstractNumId`)))) + 1;
+        absId = String(id);
+        const xml = abstractNumXml(nw, id, p.kind).replace(`<${nw}:multiLevelType`, `<${nw}:name ${nw}:val="${tag}"/><${nw}:multiLevelType`)
+          // name 必须在 multiLevelType 之后：按 schema 调整顺序
+          .replace(new RegExp(`(<${nw}:name [^>]*/>)(<${nw}:multiLevelType [^>]*/>)`), "$2$1");
+        const node = parseFragment(xml);
+        const lastAbs = abs[abs.length - 1];
+        if (lastAbs) insertAfter(lastAbs, node);
+        else if (nums[0]) insertBefore(nums[0], node);
+        else appendChild(doc.root, node);
+      }
+      const existingNum = nums.find((n) => n.child(`${nw}:abstractNumId`)?.getAttr(`${nw}:val`) === absId && !n.child(`${nw}:lvlOverride`));
+      if (existingNum && !p.restart) numId = existingNum.getAttr(`${nw}:numId`)!;
+      else {
+        const id = Math.max(0, ...nums.map((n) => Number(n.getAttr(`${nw}:numId`)))) + 1;
+        numId = String(id);
+        const override = p.restart ? `<${nw}:lvlOverride ${nw}:ilvl="${level}"><${nw}:startOverride ${nw}:val="1"/></${nw}:lvlOverride>` : "";
+        appendChild(doc.root, parseFragment(`<${nw}:num ${nw}:numId="${id}"><${nw}:abstractNumId ${nw}:val="${absId}"/>${override}</${nw}:num>`));
+      }
+    }
+    const preview: EditResult["preview"] = [];
+    for (const pe of entries) {
+      this.isEditable(pe);
+      const w = this.w(pe.part);
+      const pPr = this.ensurePPr(pe.el, w);
+      if (o.track && !pPr.child(`${w}:pPrChange`)) {
+        const old = pPr.children.filter((c) => !(c.type === "el" && ["rPr", "sectPr", "pPrChange"].includes(c.local))).map((c) => serializeNode(c, this.src(pe.part))).join("");
+        const [chg] = parseFragment(`<${w}:pPrChange ${this.revAttrs(w, o)}><${w}:pPr>${old}</${w}:pPr></${w}:pPrChange>`);
+        pPr.children.push(chg); chg.parent = pPr; markDirty(pPr);
+      }
+      const old = pPr.child(`${w}:numPr`);
+      if (old) removeNode(old);
+      const styleHasNum = this.styles.get(this.styleIdOf(pe))?.hasNumbering;
+      if (p.kind === "none") {
+        if (styleHasNum) {
+          this.setProp(pPr, "numPr", {}, PPR_ORDER, w);
+          this.fillNumPr(pPr, w, "0", "0");
+        }
+      } else {
+        const [np] = parseFragment(`<${w}:numPr><${w}:ilvl ${w}:val="${level}"/><${w}:numId ${w}:val="${numId}"/></${w}:numPr>`);
+        pPr.children.splice(orderedInsertIndex(pPr, "numPr", PPR_ORDER, w), 0, np);
+        np.parent = pPr; markDirty(pPr);
+        // 列表段落去掉首行缩进，由编号定义的悬挂缩进决定
+        const ind = pPr.child(`${w}:ind`);
+        if (ind) removeNode(ind);
+      }
+      preview.push({ ref: pe.ref, before: this.textOf(pe), after: `${p.kind === "none" ? "（取消编号）" : p.kind === "bullet" ? "• " : "1. "}${this.textOf(pe)}` });
+    }
+    const label = { bullet: "项目符号", number: "数字编号", chinese: "中文编号（一、（一）1.）", outline: "多级编号（1. 1.1 1.1.1）", none: "取消编号" }[p.kind];
+    return { changedRefs: entries.map((e) => e.ref), summary: `已为 ${entries.length} 个段落设置${label}${p.kind !== "none" ? `（第 ${level + 1} 级${p.restart ? "，从 1 重新开始" : ""}）` : ""}。`, preview, structural: false };
+  }
+
+  private fillNumPr(pPr: XElement, w: string, ilvl: string, numId: string): void {
+    const np = pPr.child(`${w}:numPr`);
+    if (!np) return;
+    appendChild(np, parseFragment(`<${w}:ilvl ${w}:val="${ilvl}"/><${w}:numId ${w}:val="${numId}"/>`));
+  }
+
+  // ------------------------------- 脚注 / 尾注 -------------------------------
+
+  insertNote(p: { ref: string; after_text?: string; text: string; kind?: "footnote" | "endnote" }, o: EditOptions): EditResult {
+    const pe = this.resolve(p.ref);
+    if (pe.part !== this.mainPart) throw new DocError("脚注只能加在正文段落上", "unsupported");
+    this.isEditable(pe);
+    const kind = p.kind ?? "footnote";
+    const w = this.w(pe.part);
+    // 1) 找到 / 创建脚注部件
+    const relType = kind === "footnote" ? REL_TYPES.footnotes : REL_TYPES.endnotes;
+    const rels = parseRels(this.optText(relsPathFor(this.mainPart)));
+    let part = rels.filter((r) => r.type === relType).map((r) => resolveTarget(this.mainPart, r.target)).find((x) => this.pkg.has(x));
+    const tag = kind;
+    if (!part) {
+      part = this.mainPart.replace(/[^/]+$/, `${kind}s.xml`);
+      const sep = `<w:${tag} w:type="separator" w:id="-1"><w:p><w:pPr><w:spacing w:after="0" w:line="240" w:lineRule="auto"/></w:pPr><w:r><w:separator/></w:r></w:p></w:${tag}><w:${tag} w:type="continuationSeparator" w:id="0"><w:p><w:pPr><w:spacing w:after="0" w:line="240" w:lineRule="auto"/></w:pPr><w:r><w:continuationSeparator/></w:r></w:p></w:${tag}>`;
+      this.addPart(part, `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\r\n<w:${tag}s xmlns:w="${NS.w}" xmlns:r="${NS.r}">${sep}</w:${tag}s>`);
+      this.ensureOverrideCT(part, kind === "footnote" ? CT.footnotes : CT.endnotes);
+      this.addRel(relType, this.relTarget(part));
+      this.contentParts.push(part);
+    }
+    const nd = this.part(part);
+    const nw = this.w(part);
+    const id = Math.max(0, ...nd.root.elements().map((e) => Number(e.getAttr(`${nw}:id`)) || 0)) + 1;
+    const textSt = this.styles.resolve(kind === "footnote" ? "footnote text" : "endnote text", "paragraph");
+    const refSt = this.styles.resolve(kind === "footnote" ? "footnote reference" : "endnote reference", "character");
+    const refRPr = refSt ? `<${nw}:rPr><${nw}:rStyle ${nw}:val="${refSt.id}"/></${nw}:rPr>` : `<${nw}:rPr><${nw}:vertAlign ${nw}:val="superscript"/></${nw}:rPr>`;
+    const noteXml = `<${nw}:${tag} ${nw}:id="${id}"><${nw}:p><${nw}:pPr>${textSt ? `<${nw}:pStyle ${nw}:val="${textSt.id}"/>` : `<${nw}:spacing ${nw}:after="0"/>`}</${nw}:pPr><${nw}:r>${refRPr}<${nw}:${tag}Ref/></${nw}:r><${nw}:r>${textSt ? "" : `<${nw}:rPr><${nw}:sz ${nw}:val="18"/></${nw}:rPr>`}${runContent(nw, " " + p.text)}</${nw}:r></${nw}:p></${nw}:${tag}>`;
+    appendChild(nd.root, parseFragment(noteXml));
+    // 2) 在正文中插入引用标记
+    const full = this.textOf(pe);
+    const pos = p.after_text ? this.findRange(pe, p.after_text).end : full.replace(/[。．.!！?？;；,，]+$/, "").length;
+    if (pos > 0 && pos < full.length) this.splitAt(pe, pos);
+    const wRefRPr = refSt ? `<${w}:rPr><${w}:rStyle ${w}:val="${refSt.id}"/></${w}:rPr>` : `<${w}:rPr><${w}:vertAlign ${w}:val="superscript"/></${w}:rPr>`;
+    const refRun = parseFragment(this.trackRun(w, `<${w}:r>${wRefRPr}<${w}:${tag}Reference ${w}:id="${id}"/></${w}:r>`, o));
+    const { segs } = this.segments(pe);
+    const prev = [...segs].reverse().find((s) => s.run && s.end <= pos && s.end > s.start);
+    if (prev?.run) insertAfter(this.anchorOf(prev.run, pe.el), refRun);
+    else appendChild(pe.el, refRun);
+    // 新的注释段落追加在脚注/尾注部件末尾：只有排在它后面的部件（尾注）的序号引用会变化
+    if (kind === "footnote" && this.contentParts.some((x) => /endnotes\.xml$/.test(x))) this._structureVersion++;
+    this.reindex();
+    return { changedRefs: [pe.ref], summary: `已在段落 ${pe.ref}${p.after_text ? `"${clip(p.after_text, 30)}"之后` : "句末"}插入${kind === "footnote" ? "脚注" : "尾注"} ${id}：${clip(p.text, 80)}`, preview: [{ ref: pe.ref, before: full, after: this.textOf(pe) + `\n［${kind === "footnote" ? "脚注" : "尾注"}${id}］${p.text}` }], structural: false };
+  }
+
+  // ------------------------------- 超链接 -------------------------------
+
+  insertLink(p: { ref: string; text: string; url: string }, o: EditOptions): EditResult {
+    const pe = this.resolve(p.ref);
+    this.isEditable(pe);
+    if (!/^(https?:\/\/|mailto:)/i.test(p.url)) throw new DocError("链接地址需以 http://、https:// 或 mailto: 开头", "invalid");
+    const w = this.w(pe.part);
+    const { start, end } = this.findRange(pe, p.text);
+    this.splitAt(pe, start);
+    this.splitAt(pe, end);
+    const runs = this.coveredRuns(pe, start, end);
+    if (!runs.length) throw new DocError("找不到可以加链接的文字", "not_found");
+    if (runs.some((r) => r.closest(`${w}:hyperlink`))) throw new DocError("这段文字已经是超链接", "invalid");
+    const top = runs.map((r) => this.anchorOf(r, pe.el) as XElement);
+    if (new Set(top.map((t) => t.parent)).size > 1) throw new DocError("文字跨越了不同的结构（修订/域），请缩小范围", "protected");
+    const rId = this.addRel(REL_EXTRA.hyperlink, p.url, { owner: pe.part, external: true });
+    const linkSt = this.styles.resolve("hyperlink", "character");
+    for (const r of runs) {
+      const rPr = this.ensureChild(r, "rPr", [], w, true);
+      if (linkSt) this.setProp(rPr, "rStyle", { val: linkSt.id }, RPR_ORDER, w);
+      else {
+        this.setProp(rPr, "color", { val: "0563C1" }, RPR_ORDER, w);
+        this.setProp(rPr, "u", { val: "single" }, RPR_ORDER, w);
+      }
+    }
+    const xml = `<${w}:hyperlink r:id="${rId}" xmlns:r="${NS.r}" ${w}:history="1">${top.map((t) => serializeNode(t, this.src(pe.part))).join("")}</${w}:hyperlink>`;
+    const [link] = parseFragment(xml);
+    insertBefore(top[0], [link]);
+    for (const t of top) removeNode(t);
+    void o;
+    this.reindex();
+    return { changedRefs: [pe.ref], summary: `已为"${clip(p.text, 40)}"添加超链接 ${p.url}。`, preview: [{ ref: pe.ref, before: p.text, after: `${p.text} → ${p.url}` }], structural: false };
+  }
+
+  // ------------------------------- 目录 -------------------------------
+
+  insertToc(p: { anchor: string; position: "before" | "after"; levels?: number; title?: string }, o: EditOptions): EditResult {
+    const anchor = this.resolve(p.anchor);
+    if (anchor.part !== this.mainPart) throw new DocError("目录只能插在正文中", "invalid");
+    const w = this.w(anchor.part);
+    const levels = Math.max(1, Math.min(9, p.levels ?? 3));
+    const heads = this.summary().headings.filter((h) => h.level >= 1 && h.level <= levels && h.location === "正文");
+    const tocSt = (lv: number) => this.styles.resolve(`toc ${lv}`, "paragraph") ?? this.styles.resolve(`目录 ${lv}`, "paragraph");
+    const width = this.textWidthTwips(anchor);
+    const rPr = this.baseFontRPr(anchor);
+    let xml = "";
+    if (p.title !== "") {
+      const st = this.styles.resolve("TOC Heading", "paragraph") ?? this.styles.resolve("目录标题", "paragraph");
+      xml += this.paraXml(anchor.part, st ? `<${w}:pStyle ${w}:val="${st.id}"/>` : `<${w}:spacing ${w}:before="240" ${w}:after="120"/><${w}:jc ${w}:val="center"/>`, this.trackRun(w, `<${w}:r>${st ? "" : this.baseFontRPr(anchor, 16, `<${w}:b/><${w}:bCs/>`)}${runContent(w, p.title ?? "目  录")}</${w}:r>`, o), o);
+    }
+    const begin = `<${w}:r><${w}:fldChar ${w}:fldCharType="begin" ${w}:dirty="true"/></${w}:r><${w}:r><${w}:instrText xml:space="preserve"> TOC \\o "1-${levels}" \\h \\z \\u </${w}:instrText></${w}:r><${w}:r><${w}:fldChar ${w}:fldCharType="separate"/></${w}:r>`;
+    const end = `<${w}:r><${w}:fldChar ${w}:fldCharType="end"/></${w}:r>`;
+    const entries = heads.length ? heads : [{ level: 1, text: "（打开文档后右键目录 → 更新域，生成目录）" }];
+    entries.forEach((h, k) => {
+      const st = tocSt(h.level);
+      const pPr = `${st ? `<${w}:pStyle ${w}:val="${st.id}"/>` : ""}<${w}:tabs><${w}:tab ${w}:val="right" ${w}:leader="dot" ${w}:pos="${width}"/></${w}:tabs>${st ? "" : `<${w}:spacing ${w}:after="60"/><${w}:ind ${w}:left="${(h.level - 1) * 420}"/>`}`;
+      const text = h.text.replace(/⟨[^⟩]*⟩/g, "").trim();
+      const body = `<${w}:r>${rPr}${runContent(w, text)}</${w}:r><${w}:r>${rPr}<${w}:tab/></${w}:r>`;
+      xml += this.paraXml(anchor.part, pPr, this.trackRun(w, (k === 0 ? begin : "") + body + (k === entries.length - 1 ? end : ""), o), o);
+    });
+    const nodes = this.insertBlockXml(anchor, p.position, xml);
+    this.setUpdateFieldsOnOpen();
+    return { changedRefs: this.refsOf(nodes), summary: `已插入目录（${levels} 级标题，${heads.length} 个条目）。目录是 Word 的 TOC 域：打开文件时 Word 会提示更新域，更新后页码自动填好。`, preview: [{ ref: "", before: "", after: entries.map((h) => `${"  ".repeat(h.level - 1)}${h.text}`).join("\n") }], structural: true };
+  }
+
+  /** settings.xml 里设置 updateFields，Word 打开时自动刷新目录 / 页码等域 */
+  private setUpdateFieldsOnOpen(): void {
+    const rels = parseRels(this.optText(relsPathFor(this.mainPart)));
+    const r = rels.find((x) => x.type === REL_EXTRA.settings);
+    if (!r) return;
+    const name = resolveTarget(this.mainPart, r.target);
+    if (!this.pkg.has(name)) return;
+    const doc = this.part(name);
+    const w = this.w(name);
+    if (doc.root.child(`${w}:updateFields`)) return;
+    // CT_Settings 中 updateFields 位于 hdrShapeDefaults / footnotePr 等之前、trackRevisions 等之后：
+    // 放在第一个"必须在它之后"的元素前面
+    const after = new Set(["hdrShapeDefaults", "footnotePr", "endnotePr", "compat", "docVars", "rsids", "mathPr", "attachedSchema", "themeFontLang", "clrSchemeMapping", "doNotIncludeSubdocsInStats", "doNotAutoCompressPictures", "forceUpgrade", "captions", "readModeInkLockDown", "smartTagType", "schemaLibrary", "shapeDefaults", "doNotEmbedSmartTags", "decimalSymbol", "listSeparator"]);
+    const [node] = parseFragment(`<${w}:updateFields ${w}:val="true"/>`);
+    const kids = doc.root.children;
+    const idx = kids.findIndex((c) => c.type === "el" && after.has(c.local));
+    if (idx === -1) appendChild(doc.root, [node]);
+    else { kids.splice(idx, 0, node); node.parent = doc.root; markDirty(doc.root); }
+  }
+
+  // ------------------------------- 样式 -------------------------------
+
+  modifyStyle(p: { style: string; type?: "paragraph" | "character"; create?: boolean; based_on?: string; font?: string; size_pt?: number; bold?: boolean; italic?: boolean; color?: string; alignment?: "left" | "center" | "right" | "justify"; space_before_pt?: number; space_after_pt?: number; line_spacing?: number; first_line_pt?: number; indent_left_pt?: number; keep_with_next?: boolean; outline_level?: number }, _o: EditOptions): EditResult {
+    if (!this.stylesPart) throw new DocError("文档没有样式表（styles.xml）", "unsupported");
+    const part = this.stylesPart;
+    const doc = this.part(part);
+    const w = this.w(part);
+    const type = p.type ?? "paragraph";
+    let def = this.styles.resolve(p.style, type);
+    let el: XElement | undefined;
+    let created = false;
+    if (def) el = doc.root.elements().find((e) => e.local === "style" && e.getAttr(`${w}:styleId`) === def!.id);
+    if (!el) {
+      if (!p.create) throw new DocError(`找不到样式"${p.style}"。设置 create=true 可以新建；用 doc_styles 查看已有样式。`, "not_found");
+      const base = p.based_on ? this.styles.resolve(p.based_on, type) : this.styles.defaultParagraphStyle();
+      const id = p.style.replace(/[^A-Za-z0-9]/g, "") || `AgentStyle${doc.root.elements().length}`;
+      const xml = `<${w}:style ${w}:type="${type}" ${w}:customStyle="1" ${w}:styleId="${encodeAttr(id)}"><${w}:name ${w}:val="${encodeAttr(p.style)}"/>${base && type === "paragraph" ? `<${w}:basedOn ${w}:val="${base.id}"/>` : ""}<${w}:qFormat/></${w}:style>`;
+      [el] = parseFragment(xml) as XElement[];
+      appendChild(doc.root, [el]);
+      created = true;
+    }
+    const changes: string[] = [];
+    if (type === "paragraph") {
+      const pPr = this.ensureChild(el, "pPr", STYLE_ORDER, w);
+      if (p.alignment) { this.setProp(pPr, "jc", { val: p.alignment === "justify" ? "both" : p.alignment }, PPR_ORDER, w); changes.push(`对齐 ${p.alignment}`); }
+      const sp: Record<string, string> = {};
+      if (p.space_before_pt !== undefined) { sp.before = String(twip(p.space_before_pt)); changes.push(`段前 ${p.space_before_pt}pt`); }
+      if (p.space_after_pt !== undefined) { sp.after = String(twip(p.space_after_pt)); changes.push(`段后 ${p.space_after_pt}pt`); }
+      if (p.line_spacing !== undefined) { sp.line = String(Math.round(p.line_spacing * 240)); sp.lineRule = "auto"; changes.push(`行距 ${p.line_spacing} 倍`); }
+      if (Object.keys(sp).length) { const e = this.ensureChild(pPr, "spacing", PPR_ORDER, w); for (const [k, v] of Object.entries(sp)) e.setAttr(`${w}:${k}`, v); }
+      const ind: Record<string, string> = {};
+      if (p.first_line_pt !== undefined) { ind.firstLine = String(twip(p.first_line_pt)); changes.push(`首行缩进 ${p.first_line_pt}pt`); }
+      if (p.indent_left_pt !== undefined) { ind.left = String(twip(p.indent_left_pt)); changes.push(`左缩进 ${p.indent_left_pt}pt`); }
+      if (Object.keys(ind).length) { const e = this.ensureChild(pPr, "ind", PPR_ORDER, w); for (const [k, v] of Object.entries(ind)) e.setAttr(`${w}:${k}`, v); if (ind.firstLine) e.removeAttr(`${w}:hanging`); }
+      if (p.keep_with_next !== undefined) { this.setProp(pPr, "keepNext", p.keep_with_next ? {} : { val: "0" }, PPR_ORDER, w); changes.push(p.keep_with_next ? "与下段同页" : "取消与下段同页"); }
+      if (p.outline_level !== undefined) { this.setProp(pPr, "outlineLvl", p.outline_level > 0 ? { val: String(p.outline_level - 1) } : null, PPR_ORDER, w); changes.push(`大纲级别 ${p.outline_level}`); }
+      if (!pPr.elements().length) removeNode(pPr);
+    }
+    const rPr = this.ensureChild(el, "rPr", STYLE_ORDER, w);
+    if (p.font) { this.setProp(rPr, "rFonts", { ascii: p.font, hAnsi: p.font, eastAsia: p.font, cs: p.font }, RPR_ORDER, w); changes.push(`字体 ${p.font}`); }
+    if (p.bold !== undefined) { this.setProp(rPr, "b", p.bold ? {} : { val: "0" }, RPR_ORDER, w); this.setProp(rPr, "bCs", p.bold ? {} : { val: "0" }, RPR_ORDER, w); changes.push(p.bold ? "加粗" : "不加粗"); }
+    if (p.italic !== undefined) { this.setProp(rPr, "i", p.italic ? {} : { val: "0" }, RPR_ORDER, w); changes.push(p.italic ? "斜体" : "非斜体"); }
+    if (p.color) { this.setProp(rPr, "color", { val: p.color.replace(/^#/, "").toUpperCase() }, RPR_ORDER, w); changes.push(`颜色 ${p.color}`); }
+    if (p.size_pt) { const hp = String(Math.round(p.size_pt * 2)); this.setProp(rPr, "sz", { val: hp }, RPR_ORDER, w); this.setProp(rPr, "szCs", { val: hp }, RPR_ORDER, w); changes.push(`字号 ${p.size_pt}pt`); }
+    if (!rPr.elements().length) removeNode(rPr);
+    markDirty(el);
+    // 刷新样式表
+    this.styles = new StyleSheet(serializeDocument(doc));
+    const uses = this.paras.filter((x) => this.styleIdOf(x) === (def?.id ?? el!.getAttr(`${w}:styleId`))).length;
+    def = this.styles.resolve(p.style, type);
+    return { changedRefs: [], summary: `${created ? "已新建" : "已修改"}样式"${p.style}"：${changes.join("，") || "（无属性变化）"}。文档中使用该样式的 ${uses} 个段落会一起变化（直接格式优先于样式）。`, preview: [{ ref: "", before: `样式 ${p.style}`, after: changes.join("，") }], structural: false };
+  }
+
+  // ------------------------------- 修订审阅 -------------------------------
+
+  reviewChanges(p: { action: "accept" | "reject"; refs?: string[]; author?: string }, _o: EditOptions): EditResult {
+    const scopeParas = p.refs?.length ? p.refs.map((r) => this.resolve(r)) : null;
+    let count = 0;
+    const parts = scopeParas ? [...new Set(scopeParas.map((x) => x.part))] : this.contentParts;
+    const accept = p.action === "accept";
+    for (const part of parts) {
+      const w = this.w(part);
+      const byAuthor = (el: XElement) => !p.author || el.getAttr(`${w}:author`) === p.author;
+      const roots: XElement[] = scopeParas ? scopeParas.filter((x) => x.part === part).map((x) => x.el) : [this.part(part).root];
+      for (const root of roots) {
+        const isMark = (el: XElement) => ["rPr", "trPr"].includes((el.parent as XElement)?.local ?? "");
+        const revs = () => [root, ...root.descendants()].filter((d) => d.prefix === w && ["ins", "del", "moveFrom", "moveTo"].includes(d.local) && byAuthor(d));
+        // 第一遍：段落内的插入/删除内容
+        for (const el of revs().filter((e) => !isMark(e))) {
+          if (!el.parent) continue;
+          const isAdd = el.local === "ins" || el.local === "moveTo";
+          if (accept === isAdd) {
+            insertBefore(el, [...el.children]);
+            removeNode(el);
+          } else removeNode(el);
+          count++;
+        }
+        // 第二遍：段落标记、表格行标记
+        for (const el of revs().filter(isMark)) {
+          if (!el.parent) continue;
+          const isAdd = el.local === "ins" || el.local === "moveTo";
+          const owner = el.parent as XElement;
+          removeNode(el);
+          count++;
+          if (accept === isAdd) continue;
+          if (owner.local === "trPr") {
+            const tr = owner.parent as XElement;
+            if (tr?.parent) removeNode(tr);
+          } else {
+            const pEl = (owner.parent as XElement | null)?.parent as XElement | undefined;
+            if (pEl?.local === "p" && pEl.parent && ![...pEl.descendants()].some((d) => (d.local === "t" && d.prefix === w) || d.local === "drawing")) {
+              const parent = pEl.parent as XElement;
+              if (!(parent.local === "tc" && parent.childrenNamed(`${w}:p`).length <= 1)) removeNode(pEl);
+            }
+          }
+        }
+        // 格式修订：接受 = 去掉记录；拒绝 = 恢复记录里的旧属性
+        for (const el of [root, ...root.descendants()].filter((d) => d.prefix === w && /PrChange$/.test(d.local) && byAuthor(d))) {
+          if (!el.parent) continue;
+          const owner = el.parent as XElement;
+          if (!accept) {
+            const oldPr = el.elements()[0];
+            const keep = owner.local === "pPr" ? owner.children.filter((c) => c.type === "el" && ["rPr", "sectPr"].includes(c.local)) : [];
+            for (const c of [...owner.children]) removeNode(c);
+            if (oldPr) appendChild(owner, [...oldPr.children]);
+            if (keep.length) appendChild(owner, keep);
+          } else removeNode(el);
+          count++;
+        }
+      }
+      // 拒绝删除后，留下的 delText / delInstrText 改回普通文字
+      if (!accept) {
+        for (const d of [...this.part(part).root.descendants()]) {
+          if (d.prefix !== w || d.closest(`${w}:del`) || d.closest(`${w}:moveFrom`)) continue;
+          if (d.local === "delText") { d.name = `${w}:t`; d.attrsDirty = true; markDirty(d); }
+          else if (d.local === "delInstrText") { d.name = `${w}:instrText`; d.attrsDirty = true; markDirty(d); }
+        }
+      }
+      markDirty(this.part(part).root);
+    }
+    this._structureVersion++;
+    this.reindex();
+    return { changedRefs: [], summary: count ? `已${accept ? "接受" : "拒绝"} ${count} 处修订${p.author ? `（作者 ${p.author}）` : ""}${scopeParas ? `（范围：${scopeParas.length} 个段落）` : "（全文）"}。` : "范围内没有修订标记。", preview: [{ ref: "", before: "修订", after: `${accept ? "接受" : "拒绝"} ${count} 处` }], structural: true };
+  }
+
+  // ------------------------------- 批注管理 -------------------------------
+
+  listComments(): Array<{ id: string; author: string; date: string; text: string; ref?: string; anchor: string }> {
+    const cp = this.commentsPartName();
+    if (!cp || !this.pkg.has(cp)) return [];
+    const cw = this.w(cp);
+    const w = this.w(this.mainPart);
+    const out: Array<{ id: string; author: string; date: string; text: string; ref?: string; anchor: string }> = [];
+    for (const c of this.part(cp).root.elements()) {
+      if (c.local !== "comment") continue;
+      const id = c.getAttr(`${cw}:id`) ?? "";
+      const text = c.elements().map((p) => innerText(p)).join("\n").trim();
+      const pe = this.paras.find((x) => x.part === this.mainPart && [...x.el.descendants()].some((d) => d.prefix === w && (d.local === "commentRangeStart" || d.local === "commentReference") && d.getAttr(`${w}:id`) === id));
+      out.push({ id, author: c.getAttr(`${cw}:author`) ?? "", date: c.getAttr(`${cw}:date`) ?? "", text, ref: pe?.ref, anchor: pe ? clip(this.textOf(pe), 60) : "" });
+    }
+    return out;
+  }
+
+  deleteComments(p: { ids?: string[]; all?: boolean }): EditResult {
+    const cp = this.commentsPartName();
+    if (!cp || !this.pkg.has(cp)) throw new DocError("文档中没有批注", "not_found");
+    const cw = this.w(cp);
+    const w = this.w(this.mainPart);
+    const want = new Set(p.all ? this.listComments().map((c) => c.id) : (p.ids ?? []).map(String));
+    if (!want.size) throw new DocError("请提供要删除的批注 id（doc_comments action=list 查看），或 all=true", "invalid");
+    let n = 0;
+    for (const c of [...this.part(cp).root.elements()]) if (c.local === "comment" && want.has(c.getAttr(`${cw}:id`) ?? "")) { removeNode(c); n++; }
+    for (const d of [...this.part(this.mainPart).root.descendants()]) {
+      if (d.prefix !== w || !d.parent) continue;
+      if ((d.local === "commentRangeStart" || d.local === "commentRangeEnd") && want.has(d.getAttr(`${w}:id`) ?? "")) removeNode(d);
+      else if (d.local === "commentReference" && want.has(d.getAttr(`${w}:id`) ?? "")) {
+        const run = d.parent as XElement;
+        if (run.local === "r" && run.elements().every((e) => e.local === "rPr" || e === d)) removeNode(run);
+        else removeNode(d);
+      }
+    }
+    this.reindex();
+    return { changedRefs: [], summary: `已删除 ${n} 条批注。`, preview: [{ ref: "", before: `${n} 条批注`, after: "" }], structural: false };
+  }
+
+  // ------------------------------- 移动段落 -------------------------------
+
+  moveBlocks(p: { refs: string[]; anchor: string; position: "before" | "after" }, o: EditOptions): EditResult {
+    const anchor = this.resolve(p.anchor);
+    const items = p.refs.map((r) => this.resolve(r));
+    for (const pe of items) {
+      this.isEditable(pe);
+      if (pe.part !== anchor.part || pe.container !== anchor.container) throw new DocError("只能在同一部件、同类容器内移动段落（正文到正文、同一表格单元格内）。", "invalid");
+      if (pe.el.child(`${this.w(pe.part)}:pPr`)?.child(`${this.w(pe.part)}:sectPr`)) throw new DocError(`段落 ${pe.ref} 携带分节符，不能移动`, "protected");
+      if (pe === anchor) throw new DocError("锚点不能是被移动的段落之一", "invalid");
+    }
+    if (o.track) throw new DocError("修订模式下暂不支持移动段落（Word 的移动修订需要成对标记）。请先关闭修订模式。", "unsupported");
+    const ordered = [...items].sort((a, b) => a.ordinal - b.ordinal);
+    for (const pe of ordered) removeNode(pe.el);
+    if (p.position === "before") insertBefore(anchor.el, ordered.map((x) => x.el));
+    else insertAfter(anchor.el, ordered.map((x) => x.el));
+    this._structureVersion++;
+    this.reindex();
+    return { changedRefs: ordered.map((x) => this.paras.find((y) => y.el === x.el)!.ref), summary: `已把 ${ordered.length} 个段落移动到 ${anchor.ref} ${p.position === "before" ? "之前" : "之后"}。`, preview: ordered.map((x) => ({ ref: x.ref, before: "（原位置）", after: clip(this.textOf(x), 80) })), structural: true };
   }
 
   // -------------------------------------------------------------------------

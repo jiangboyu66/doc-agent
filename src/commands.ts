@@ -11,6 +11,7 @@ import type { Session } from "./session/Session.js";
 import type { Runtime } from "./bootstrap.js";
 import { formatCost } from "./services/costTracker.js";
 import { exportDocument, type ExportFormat } from "./services/convert.js";
+import { convertPdfSession, convertPdfInPlace } from "./session/convertPdf.js";
 import { featureTable } from "./config/features.js";
 import { appendProjectMemory } from "./context.js";
 import { renderSkill } from "./skills/loadSkills.js";
@@ -106,14 +107,43 @@ const BUILTIN: Command[] = [
     },
   },
   {
-    type: "local", name: "export", description: "导出文件", argumentHint: "docx|pdf|html|markdown",
+    type: "local", name: "export", description: "导出文件（PDF 可导出为 Word）", argumentHint: "docx|pdf|html|markdown [exact|flow]",
     async run(a, ctx) {
-      const fmt = (a.trim() || ctx.session.meta.format) as ExportFormat;
+      const args = a.trim().split(/\s+/).filter(Boolean);
+      const fmt = (args.find((x) => ["docx", "pdf", "html", "markdown"].includes(x)) ?? (ctx.session.meta.format === "pdf" ? "docx" : ctx.session.meta.format)) as ExportFormat;
       if (!["docx", "pdf", "html", "markdown"].includes(fmt)) return "格式可选：docx / pdf / html / markdown";
-      const out = await exportDocument(ctx.session.current(), ctx.session.meta.format, fmt);
+      const out = await exportDocument(ctx.session.current(), ctx.session.meta.format, fmt, { pdfMode: args.includes("flow") ? "flow" : "exact" });
       const name = `${ctx.session.meta.filename.replace(/\.[^.]+$/, "")}-v${ctx.session.meta.currentVersion}.${out.ext}`;
       const file = await ctx.session.writeExport(name, out.data);
       return `已导出：${file}\n${out.note}`;
+    },
+  },
+  {
+    type: "local", name: "convert", description: "把 PDF 转换为可编辑的 Word 文档（默认在当前会话内转换并继续编辑；加 new 则生成新会话）", argumentHint: "exact|flow [builtin|pdf2docx|libreoffice] [new]",
+    async run(a, ctx) {
+      if (ctx.session.meta.format !== "pdf") return "当前文档不是 PDF，无需转换。";
+      const args = a.trim().split(/\s+/).filter(Boolean);
+      const mode = args.includes("flow") ? "flow" : "exact";
+      const engine = (["pdf2docx", "libreoffice"].find((e) => args.includes(e)) ?? "builtin") as "builtin" | "pdf2docx" | "libreoffice";
+      const s = ctx.runtime.settings;
+      if (!args.includes("new")) {
+        const r = await convertPdfInPlace(ctx.session, { engine, mode });
+        const v = await ctx.session.commit(r.label, []);
+        return `${r.text}\n已在当前会话内转换为 Word（版本 v${v}），现在可以直接让我修改；原 PDF 保留为 v0，可随时回滚。`;
+      }
+      const { session, text } = await convertPdfSession(ctx.session, { engine, mode, defaults: { mode: s.permissionMode, trackChanges: s.trackChanges, author: s.author } });
+      return `${text}\n新会话 ID：${session.id}（Web 界面会自动打开；命令行可用 --resume ${session.id} 继续编辑）`;
+    },
+  },
+  {
+    type: "local", name: "think", description: "开关深度思考模式（本会话）", argumentHint: "on|off",
+    async run(a, ctx) {
+      const arg = a.trim().toLowerCase();
+      const cur = ctx.session.meta.thinking ?? ctx.runtime.settings.thinking === "enabled";
+      const next = arg === "on" ? true : arg === "off" ? false : !cur;
+      ctx.session.meta.thinking = next;
+      await ctx.session.save();
+      return next ? "已开启深度思考：模型先思考再回答，复杂修改更可靠，但更慢、消耗更多 tokens。" : "已关闭深度思考：直接回答，更快更省。";
     },
   },
   {

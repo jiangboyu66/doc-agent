@@ -21,6 +21,7 @@ import { toPdfViaOffice, exportDocument, type ExportFormat } from "../services/c
 import { featureTable } from "../config/features.js";
 import type { EngineEvent, PermissionRequest, PermissionResponse } from "../bridge/protocol.js";
 import { PermissionModeSchema } from "../config/settings.js";
+import { convertPdfSession, convertPdfInPlace } from "../session/convertPdf.js";
 
 interface Live {
   session: Session;
@@ -55,8 +56,10 @@ app.get("/api/runtime", (_req, res) => {
   res.json({
     model: runtime.settings.model,
     thinking: runtime.settings.thinking,
+    thinkingAvailable: featureTable().THINKING,
     apiKey: !!process.env.DEEPSEEK_API_KEY,
     external: runtime.external,
+    pdfEngines: runtime.pdfEngines,
     features: featureTable(),
     skills: runtime.skills.list().map((s) => ({ name: s.name, description: s.description, source: s.source })),
     agents: runtime.agents.map((a) => ({ type: a.agentType, description: a.description, readOnly: a.readOnly })),
@@ -94,6 +97,7 @@ app.patch("/api/sessions/:id/settings", wrap(async (req, res) => {
   if (req.body.mode !== undefined) m.mode = PermissionModeSchema.parse(req.body.mode);
   if (req.body.trackChanges !== undefined) m.trackChanges = !!req.body.trackChanges && l.session.doc.capabilities.trackChanges;
   if (typeof req.body.author === "string" && req.body.author.trim()) m.author = req.body.author.trim().slice(0, 60);
+  if (typeof req.body.thinking === "boolean") m.thinking = req.body.thinking;
   await l.session.save();
   res.json({ meta: m });
 }));
@@ -185,10 +189,12 @@ const MIME: Record<string, string> = {
 app.get("/api/sessions/:id/document", wrap(async (req, res) => {
   const l = await getLive(String(req.params.id));
   const v = req.query.version !== undefined ? Number(req.query.version) : l.session.meta.currentVersion;
-  const buf = req.query.original ? await l.session.original() : await l.session.versionBuffer(v);
+  const up = req.query.original ? await l.session.uploaded() : null;
+  const buf = up ? up.data : await l.session.versionBuffer(v);
+  const ext = up ? up.ext : ({ docx: "docx", markdown: "md", html: "html", pdf: "pdf" } as const)[l.session.versionFormat(v)];
   const base = l.session.meta.filename.replace(/\.[^.]+$/, "");
-  const name = req.query.original ? l.session.meta.filename : `${base}-v${v}.${l.session.ext}`;
-  res.setHeader("Content-Type", MIME[l.session.ext] ?? "application/octet-stream");
+  const name = up ? up.filename : `${base}-v${v}.${ext}`;
+  res.setHeader("Content-Type", MIME[ext] ?? "application/octet-stream");
   res.setHeader("Content-Disposition", `${req.query.download ? "attachment" : "inline"}; filename*=UTF-8''${encodeURIComponent(name)}`);
   res.end(buf);
 }));
@@ -197,13 +203,14 @@ const previewCache = new Map<string, Promise<Buffer>>();
 app.get("/api/sessions/:id/preview.pdf", wrap(async (req, res) => {
   const l = await getLive(String(req.params.id));
   const v = req.query.version !== undefined ? Number(req.query.version) : l.session.meta.currentVersion;
-  if (l.session.meta.format === "pdf") {
+  const vf = l.session.versionFormat(v);
+  if (vf === "pdf") {
     res.setHeader("Content-Type", "application/pdf");
-    return res.end(await l.session.versionBuffer(0));
+    return res.end(await l.session.versionBuffer(v));
   }
   const key = `${l.session.id}:${v}`;
   if (!previewCache.has(key)) {
-    const p = l.session.versionBuffer(v).then((b) => toPdfViaOffice(b, l.session.ext));
+    const p = l.session.versionBuffer(v).then((b) => toPdfViaOffice(b, ({ docx: "docx", markdown: "md", html: "html", pdf: "pdf" } as const)[vf]));
     p.catch(() => previewCache.delete(key));
     previewCache.set(key, p);
   }
@@ -211,13 +218,60 @@ app.get("/api/sessions/:id/preview.pdf", wrap(async (req, res) => {
   res.end(await previewCache.get(key)!);
 }));
 
+/** 上传素材（图片），供 Agent 用 doc_insert_image 插入文档 */
+const assetUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024, files: 10 } });
+app.post("/api/sessions/:id/assets", assetUpload.array("files", 10), wrap(async (req, res) => {
+  const l = await getLive(String(req.params.id));
+  const files = (req.files as Express.Multer.File[] | undefined) ?? [];
+  if (!files.length) throw new Error("请选择图片文件");
+  const saved: string[] = [];
+  for (const f of files) {
+    const name = Buffer.from(f.originalname, "latin1").toString("utf8");
+    if (!/\.(png|jpe?g|gif|bmp|svg|webp)$/i.test(name)) throw new Error(`不支持的图片格式：${name}（支持 PNG / JPG / GIF / BMP / SVG / WebP）`);
+    saved.push(await l.session.saveAsset(name, f.buffer));
+  }
+  res.json({ assets: saved, all: l.session.meta.assets ?? [] });
+}));
+
+app.get("/api/sessions/:id/assets/:name", wrap(async (req, res) => {
+  const l = await getLive(String(req.params.id));
+  const buf = await l.session.readAsset(String(req.params.name));
+  const ext = path.extname(String(req.params.name)).slice(1).toLowerCase();
+  res.setHeader("Content-Type", ({ png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif", bmp: "image/bmp", svg: "image/svg+xml", webp: "image/webp" } as Record<string, string>)[ext] ?? "application/octet-stream");
+  res.end(buf);
+}));
+
+/** PDF → Word：生成一个新的可编辑会话（原 PDF 会话不变） */
+app.post("/api/sessions/:id/convert", wrap(async (req, res) => {
+  const l = await getLive(String(req.params.id));
+  const engine = ["builtin", "pdf2docx", "libreoffice"].includes(req.body?.engine) ? req.body.engine : "builtin";
+  const mode = req.body?.mode === "flow" ? "flow" : "exact";
+  if (req.body?.inPlace) {
+    // 在当前会话内转换：对话保留，转换后直接继续编辑
+    if (l.abort) throw new Error("Agent 正在运行，请等待完成或先中断。");
+    const r = await convertPdfInPlace(l.session, { engine, mode });
+    const version = await l.session.commit(r.label, []);
+    return res.json({ meta: l.session.meta, report: r.report, text: r.text, version });
+  }
+  const { session, report, text } = await convertPdfSession(l.session, {
+    engine, mode,
+    defaults: { mode: runtime.settings.permissionMode, trackChanges: runtime.settings.trackChanges, author: runtime.settings.author },
+  });
+  live.set(session.id, { session, abort: null, pending: new Map() });
+  res.json({ meta: session.meta, report, text });
+}));
+
 /** 直接导出（不经过模型）：同格式导出即编辑后的原文件，逐字节保真 */
 app.post("/api/sessions/:id/export", wrap(async (req, res) => {
   const l = await getLive(String(req.params.id));
   const fmt = String(req.body?.format ?? l.session.meta.format) as ExportFormat;
   if (!["docx", "pdf", "html", "markdown"].includes(fmt)) throw new Error("格式可选：docx / pdf / html / markdown");
-  const out = await exportDocument(l.session.current(), l.session.meta.format, fmt);
-  const name = `${l.session.meta.filename.replace(/\.[^.]+$/, "")}-v${l.session.meta.currentVersion}.${out.ext}`;
+  const pdfMode = req.body?.mode === "flow" ? "flow" : "exact";
+  const pdfEngine = ["pdf2docx", "libreoffice"].includes(req.body?.engine) ? req.body.engine : "builtin";
+  const out = await exportDocument(l.session.current(), l.session.meta.format, fmt, { pdfMode, pdfEngine });
+  const base = l.session.meta.filename.replace(/\.[^.]+$/, "");
+  // PDF 导出 Word：直接用原文件名（例如 表单.pdf → 表单.docx）
+  const name = l.session.meta.format === "pdf" ? `${base}${pdfMode === "flow" ? "（可改写）" : ""}.${out.ext}` : `${base}-v${l.session.meta.currentVersion}.${out.ext}`;
   await l.session.writeExport(name, out.data);
   res.json({ name, url: `/api/sessions/${l.session.id}/exports/${encodeURIComponent(name)}`, note: out.note, lossy: out.lossy });
 }));
@@ -241,8 +295,15 @@ app.get("/api/sessions/:id/exports/:name", wrap(async (req, res) => {
 }));
 
 const webDist = fileURLToPath(new URL("../../web/dist/", import.meta.url));
-app.use(express.static(webDist));
+// 前端资源：带哈希的 assets 长期缓存；index.html 每次都重新验证，保证更新后不会加载到旧版前端
+app.use(express.static(webDist, {
+  setHeaders(res, file) {
+    if (file.endsWith("index.html")) res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+    else if (file.includes(`${path.sep}assets${path.sep}`)) res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+  },
+}));
 app.get(/^\/(?!api\/).*/, (_req, res) => {
+  res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
   res.sendFile(path.join(webDist, "index.html"), (err) => {
     if (err) res.status(200).send("前端尚未构建：请先运行 npm run build:web");
   });

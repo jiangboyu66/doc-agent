@@ -43,7 +43,7 @@ export interface CompletionResult {
 
 export interface ModelClient {
   complete(
-    req: { system: string; messages: ApiMessage[]; tools: ApiToolSchema[]; toolChoice?: "auto" | "none"; maxTokens?: number },
+    req: { system: string; messages: ApiMessage[]; tools: ApiToolSchema[]; toolChoice?: "auto" | "none"; maxTokens?: number; /** 覆盖本次请求的思考模式 */ thinking?: boolean },
     opts: { signal: AbortSignal; onChunk?: (c: StreamChunk) => void; onRetry?: (attempt: number, delayMs: number, reason: string) => void }
   ): Promise<CompletionResult>;
   readonly model: string;
@@ -121,20 +121,21 @@ export class DeepSeekClient implements ModelClient {
     opts: Parameters<ModelClient["complete"]>[1],
     markStreamed: () => void
   ): Promise<CompletionResult> {
+    const thinking = req.thinking ?? this.thinking;
     const body: Record<string, unknown> = {
       model: this.model,
       messages: [{ role: "system", content: req.system }, ...req.messages],
       stream: true,
       stream_options: { include_usage: true },
-      thinking: { type: this.thinking ? "enabled" : "disabled" },
+      thinking: { type: thinking ? "enabled" : "disabled" },
     };
     if (req.tools.length) {
       body.tools = req.tools;
       body.tool_choice = req.toolChoice ?? "auto";
     }
-    if (this.thinking && this.effort) body.reasoning_effort = this.effort;
+    if (thinking && this.effort) body.reasoning_effort = this.effort;
     if (req.maxTokens) body.max_tokens = req.maxTokens;
-    if (!this.thinking) body.temperature = 0.3;
+    if (!thinking) body.temperature = 0.3;
 
     const stream: any = await this.client.chat.completions.create(body as any, { signal: opts.signal });
     let content = "";

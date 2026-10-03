@@ -10,8 +10,9 @@
 import type { Tool, ToolUseContext } from "./Tool.js";
 import { DOC_TOOLS } from "./tools/docTools.js";
 import { META_TOOLS } from "./tools/metaTools.js";
+import { EDITING_TOOLS } from "./tools/editingTools.js";
 
-export const ALL_TOOLS: Tool[] = [...DOC_TOOLS, ...META_TOOLS];
+export const ALL_TOOLS: Tool[] = [...DOC_TOOLS, ...EDITING_TOOLS, ...META_TOOLS];
 
 export function findTool(name: string): Tool | undefined {
   return ALL_TOOLS.find((t) => t.name === name);

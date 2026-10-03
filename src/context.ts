@@ -46,6 +46,7 @@ export function buildTurnReminder(session: Session, extra?: string): string {
   if (m.todos.length) {
     lines.push("待办清单：" + m.todos.map((t) => `${t.status === "completed" ? "✓" : t.status === "in_progress" ? "▶" : "○"} ${t.content}`).join("；"));
   }
+  if (m.assets?.length) lines.push(`已上传素材（可用 doc_insert_image 插入）：${m.assets.join("、")}`);
   if (extra) lines.push(extra);
   return `<system-reminder>\n${lines.join("\n")}\n</system-reminder>`;
 }

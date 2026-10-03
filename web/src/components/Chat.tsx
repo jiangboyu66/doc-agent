@@ -28,6 +28,27 @@ function ToolCard({ item, hidePreview }: { item: Tool; hidePreview?: boolean }) 
   );
 }
 
+/**
+ * 思考过程：受控的展开/折叠（思考进行中自动展开，答复开始后自动收起；用户手动点过之后以用户为准）
+ */
+function Reasoning({ text, streaming, answering }: { text: string; streaming: boolean; answering: boolean }) {
+  const [userOpen, setUserOpen] = useState<boolean | null>(null);
+  const thinking = streaming && !answering;
+  const open = userOpen ?? thinking;
+  const body = text.trim();
+  if (!body) return null;
+  return (
+    <div className={`reasoning ${open ? "open" : ""}`}>
+      <button type="button" className="reasoning-head" aria-expanded={open} onClick={() => setUserOpen(!open)}>
+        <span className="chev" aria-hidden>{open ? "▾" : "▸"}</span>
+        {thinking ? <span>思考中…</span> : <span>思考过程</span>}
+        <span className="muted small">{body.length} 字</span>
+      </button>
+      {open && <div className="reasoning-body">{body}</div>}
+    </div>
+  );
+}
+
 function SubagentBlock({ item, children }: { item: Extract<ChatItem, { kind: "subagent" }>; children: ChatItem[] }) {
   const [open, setOpen] = useState(false);
   return (
@@ -75,6 +96,13 @@ export function Chat(props: {
   runtime: RuntimeInfo | null;
   onSend: (text: string) => void;
   onInterrupt: () => void;
+  /** 思考模式：当前状态与切换（不可用时为 undefined，不显示按钮） */
+  thinking?: boolean;
+  onToggleThinking?: () => void;
+  /** 上传图片等素材（供 Agent 插入文档） */
+  onAttach?: (files: File[]) => void;
+  attaching?: boolean;
+  format?: string;
   onDecide: (requestId: string, b: { decision: "allow" | "deny"; remember?: "session" | "project"; feedback?: string }) => Promise<void>;
 }) {
   const { items, busy, onSend } = props;
@@ -136,7 +164,12 @@ export function Chat(props: {
           <div className="chat-empty">
             <p className="serif">告诉我你想怎么改这份文档。</p>
             <div className="chips">
-              {["通读全文，列出语病与错别字", "把摘要润色得更学术", "检查格式是否统一", "/review"].map((s) => (
+              {(props.format === "pdf"
+                ? ["转换成 Word 后帮我润色摘要", "总结这篇文档的要点", "检查参考文献格式", "/review"]
+                : props.format === "docx"
+                  ? ["通读全文，列出语病与错别字", "把摘要润色得更学术", "统一正文格式：宋体小四、1.5 倍行距、首行缩进 2 字", "在页脚加上「第 X 页 共 Y 页」", "在标题后插入目录", "/review"]
+                  : ["通读全文，列出语病与错别字", "把摘要润色得更学术", "检查格式是否统一", "/review"]
+              ).map((s) => (
                 <button key={s} className="chip" onClick={() => onSend(s)}>{s}</button>
               ))}
             </div>
@@ -150,12 +183,7 @@ export function Chat(props: {
             case "assistant":
               return (
                 <div key={item.key} className="msg assistant">
-                  {item.reasoning && (
-                    <details className="reasoning">
-                      <summary>{item.streaming && !item.text ? "思考中…" : "思考过程"}</summary>
-                      <div>{item.reasoning}</div>
-                    </details>
-                  )}
+                  <Reasoning text={item.reasoning} streaming={item.streaming} answering={!!item.text} />
                   {item.text && <Markdown text={item.text} />}
                   {item.streaming && <span className="caret" aria-hidden />}
                 </div>
@@ -180,6 +208,35 @@ export function Chat(props: {
       <Todos todos={props.todos} />
 
       <div className="composer">
+        <div className="composer-tools">
+          {props.onToggleThinking && (
+            <button
+              type="button"
+              className={`pill ${props.thinking ? "on" : ""}`}
+              aria-pressed={!!props.thinking}
+              title={props.thinking ? "已开启：模型先思考再回答，复杂修改更可靠，但更慢、消耗更多 tokens" : "已关闭：直接回答，更快更省"}
+              onClick={props.onToggleThinking}
+            >
+              <span aria-hidden>{props.thinking ? "●" : "○"}</span> 深度思考
+            </button>
+          )}
+          {props.onAttach && (
+            <label className={`pill ${props.attaching ? "busy" : ""}`} title="上传图片（PNG/JPG/GIF/SVG），之后可以让 Agent 把它插入文档">
+              <input
+                type="file"
+                accept="image/png,image/jpeg,image/gif,image/svg+xml,image/bmp,image/webp"
+                multiple
+                hidden
+                onChange={(e) => {
+                  const files = [...(e.target.files ?? [])];
+                  e.target.value = "";
+                  if (files.length) props.onAttach!(files);
+                }}
+              />
+              <span aria-hidden>＋</span> {props.attaching ? "上传中…" : "图片"}
+            </label>
+          )}
+        </div>
         {suggestions.length > 0 && (
           <ul className="suggest" role="listbox">
             {suggestions.map((c, i) => (

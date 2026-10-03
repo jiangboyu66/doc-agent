@@ -32,7 +32,7 @@ function App() {
       </div>
     );
   }
-  return id ? <Workspace key={id} id={id} runtime={runtime} onBack={() => go(null)} /> : <Home runtime={runtime} onOpen={go} />;
+  return id ? <Workspace key={id} id={id} runtime={runtime} onBack={() => go(null)} onOpen={go} /> : <Home runtime={runtime} onOpen={go} />;
 }
 
 createRoot(document.getElementById("root")!).render(

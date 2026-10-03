@@ -9,7 +9,7 @@ export function fromTranscript(t: TranscriptItem[], pending: PermissionRequest[]
     if (x.kind === "user") return x.text.startsWith("/") || x.text.startsWith("用户调用了 /")
       ? { kind: "user", key: key(), text: x.text.replace(/^用户调用了 /, "") }
       : { kind: "user", key: key(), text: x.text };
-    if (x.kind === "assistant") return { kind: "assistant", key: key(), text: x.text, reasoning: "", streaming: false, agentId: "main" };
+    if (x.kind === "assistant") return { kind: "assistant", key: key(), text: x.text, reasoning: x.reasoning ?? "", streaming: false, agentId: "main" };
     return { kind: "tool", key: key(), id: x.id, name: x.name, title: x.title, status: x.ok ? "ok" : "error", content: x.content, agentId: "main" };
   });
   for (const p of pending) items.push({ kind: "permission", key: key(), request: p, status: "pending" });

@@ -22,7 +22,7 @@ export class MarkdownDocument implements DocumentAdapter {
   readonly format = "markdown" as const;
   readonly capabilities: DocumentCapabilities = {
     replaceText: true, formatText: true, paragraphProps: true, insertBlocks: true, deleteBlocks: true,
-    tables: false, comments: true, trackChanges: false, styles: false,
+    tables: false, comments: true, trackChanges: false, styles: false, rawInsert: true, links: true, move: true,
   };
   structureVersion = 0;
   private src: string;
@@ -258,6 +258,45 @@ export class MarkdownDocument implements DocumentAdapter {
     }
     this.reparse(true);
     return { changedRefs: p.refs, summary: `已删除 ${idxs.length} 个块。`, preview, structural: true };
+  }
+
+  /** 插入一段原始 Markdown（表格、图片、公式、SVG 等由工具层生成） */
+  insertRaw(p: { anchor: string; position: "before" | "after"; markup: string; label?: string }, _o: EditOptions): EditResult {
+    const b = this.blocks[this.resolve(p.anchor)];
+    const content = p.markup.replace(/\r?\n/g, this.eol);
+    if (p.position === "after") this.splice(b.end, b.end, this.eol + this.eol + content);
+    else this.splice(b.start, b.start, content + this.eol + this.eol);
+    this.reparse(true);
+    return { changedRefs: [], summary: `已插入${p.label ?? "内容"}。结构已变化，请重新读取以获得新引用。`, preview: [{ ref: "", before: "", after: clip(content, 400) }], structural: true };
+  }
+
+  /** Markdown 超链接：把文字改为 [文字](地址) */
+  insertLink(p: { ref: string; text: string; url: string }, o: EditOptions): EditResult {
+    return this.replaceText({ ref: p.ref, oldText: p.text, newText: `[${p.text}](${p.url})` }, o);
+  }
+
+  moveBlocks(p: { refs: string[]; anchor: string; position: "before" | "after" }, _o: EditOptions): EditResult {
+    const idx = [...new Set(p.refs.map((r) => this.resolve(r)))].sort((a, b) => a - b);
+    const target = this.resolve(p.anchor);
+    if (idx.includes(target)) throw new DocError("锚点不能是被移动的块之一", "invalid");
+    const texts = idx.map((i) => this.text(this.blocks[i]));
+    const t = this.blocks[target];
+    const insertAt = p.position === "after" ? t.end : t.start;
+    // 先在目标位置插入，再从后往前删除原块（偏移量从后往前处理不会互相影响）
+    const ops: Array<{ s: number; e: number; t: string }> = [];
+    const joined = texts.join(this.eol + this.eol);
+    ops.push({ s: insertAt, e: insertAt, t: p.position === "after" ? this.eol + this.eol + joined : joined + this.eol + this.eol });
+    for (const i of idx) {
+      const b = this.blocks[i];
+      let e = b.end;
+      const m = /^(\r?\n)+/.exec(this.src.slice(e));
+      if (m) e += m[0].length;
+      ops.push({ s: b.start, e, t: "" });
+    }
+    ops.sort((a, b) => b.s - a.s || b.e - a.e);
+    for (const op of ops) this.splice(op.s, op.e, op.t);
+    this.reparse(true);
+    return { changedRefs: [], summary: `已移动 ${idx.length} 个块。结构已变化，请重新读取。`, preview: texts.map((x) => ({ ref: "", before: "（原位置）", after: clip(x, 80) })), structural: true };
   }
 
   insertTableRow(): EditResult {

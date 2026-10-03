@@ -8,6 +8,8 @@
  * 核心原则：所有编辑都直接作用于"源格式"本身，不做格式往返转换，因此未被修改的内容保持原样。
  */
 
+import type { ShapeSpec, ChartSpec } from "./docx/build.js";
+
 export type DocFormat = "docx" | "markdown" | "html" | "pdf";
 
 export interface DocumentCapabilities {
@@ -20,6 +22,28 @@ export interface DocumentCapabilities {
   comments: boolean;
   trackChanges: boolean;
   styles: boolean;
+  /** 插入图片 / 矢量图形 / 图表 */
+  media?: boolean;
+  /** 分页符分节符、页面设置、页眉页脚、目录 */
+  layout?: boolean;
+  /** 项目符号与编号 */
+  lists?: boolean;
+  /** 脚注尾注 */
+  notes?: boolean;
+  /** 超链接 */
+  links?: boolean;
+  /** 修改 / 新建样式 */
+  styleEdit?: boolean;
+  /** 接受 / 拒绝修订 */
+  revisions?: boolean;
+  /** 新建表格与表格结构编辑 */
+  tableEdit?: boolean;
+  /** 移动段落 */
+  move?: boolean;
+  /** 公式 */
+  equations?: boolean;
+  /** 可以插入原始标记（Markdown / HTML 源码），表格、图片等由工具层生成标记后插入 */
+  rawInsert?: boolean;
 }
 
 export interface BlockInfo {
@@ -149,6 +173,30 @@ export interface DocumentAdapter {
 
   serialize(): Buffer;
   fidelity(original: Buffer): FidelityReport;
+
+  /** 把旧版本的临时引用换算成当前引用（段落仍在时） */
+  translateRef?(ref: string): string;
+
+  // ---- 扩展能力（可选，由 capabilities 声明是否支持）----
+  insertRaw?(p: { anchor: string; position: "before" | "after"; markup: string; label?: string }, o: EditOptions): EditResult;
+  insertTable?(p: { anchor: string; position: "before" | "after"; rows: string[][]; header?: boolean; style?: "grid" | "three_line" | "plain" | "banded"; align?: "left" | "center" | "right"; widths?: number[]; width_pct?: number; font_size_pt?: number; caption?: string; caption_position?: "above" | "below" }, o: EditOptions): EditResult;
+  editTable?(p: any, o: EditOptions): EditResult;
+  insertImage?(p: { anchor: string; position: "before" | "after"; data: Buffer; width_pt?: number; height_pt?: number; align?: "left" | "center" | "right"; caption?: string; alt?: string; name?: string }, o: EditOptions): EditResult;
+  insertShapes?(p: { anchor: string; position: "before" | "after"; width_pt: number; height_pt: number; shapes: ShapeSpec[]; caption?: string; alt?: string; align?: "left" | "center" | "right"; fallbackPng?: Buffer }, o: EditOptions): EditResult;
+  insertChart?(p: { anchor: string; position: "before" | "after"; chart: ChartSpec; width_pt?: number; height_pt?: number; caption?: string; fallbackPng?: Buffer }, o: EditOptions): EditResult;
+  insertEquation?(p: { anchor?: string; position?: "before" | "after"; ref?: string; after_text?: string; latex: string; display?: boolean; number?: string }, o: EditOptions): EditResult;
+  insertBreak?(p: { anchor: string; position: "before" | "after"; kind: "page" | "column" | "section_next_page" | "section_continuous" | "section_odd_page" | "section_even_page" }, o: EditOptions): EditResult;
+  pageSetup?(p: any, o: EditOptions): EditResult;
+  setHeaderFooter?(p: { kind: "header" | "footer"; text: string; align?: "left" | "center" | "right"; ref?: string; first_page?: boolean }, o: EditOptions): EditResult;
+  setList?(p: { refs: string[]; kind: "bullet" | "number" | "chinese" | "outline" | "none"; level?: number; restart?: boolean }, o: EditOptions): EditResult;
+  insertNote?(p: { ref: string; after_text?: string; text: string; kind?: "footnote" | "endnote" }, o: EditOptions): EditResult;
+  insertLink?(p: { ref: string; text: string; url: string }, o: EditOptions): EditResult;
+  insertToc?(p: { anchor: string; position: "before" | "after"; levels?: number; title?: string }, o: EditOptions): EditResult;
+  modifyStyle?(p: any, o: EditOptions): EditResult;
+  reviewChanges?(p: { action: "accept" | "reject"; refs?: string[]; author?: string }, o: EditOptions): EditResult;
+  listComments?(): Array<{ id: string; author: string; date: string; text: string; ref?: string; anchor: string }>;
+  deleteComments?(p: { ids?: string[]; all?: boolean }): EditResult;
+  moveBlocks?(p: { refs: string[]; anchor: string; position: "before" | "after" }, o: EditOptions): EditResult;
 }
 
 export class DocError extends Error {

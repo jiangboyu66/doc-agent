@@ -39,7 +39,7 @@ export class HtmlDocument implements DocumentAdapter {
   readonly format = "html" as const;
   readonly capabilities: DocumentCapabilities = {
     replaceText: true, formatText: true, paragraphProps: true, insertBlocks: true, deleteBlocks: true,
-    tables: false, comments: true, trackChanges: false, styles: false,
+    tables: false, comments: true, trackChanges: false, styles: false, rawInsert: true,
   };
   structureVersion = 0;
   private src: string;
@@ -331,6 +331,21 @@ export class HtmlDocument implements DocumentAdapter {
     this.structureVersion++;
     this.parse();
     return { changedRefs: p.refs, summary: `已删除 ${p.refs.length} 个块。`, preview, structural: true };
+  }
+
+  /** 插入一段原始 HTML（表格、图片、SVG、公式等由工具层生成），沿用锚点所在行的缩进 */
+  insertRaw(p: { anchor: string; position: "before" | "after"; markup: string; label?: string }, _o: EditOptions): EditResult {
+    const b = this.blocks[this.resolve(p.anchor)];
+    for (let e: any = b.el; e; e = e.parentNode) if (e.tagName === "head") throw new DocError(`块 ${p.anchor} 位于 <head> 中，内容只能插在正文（<body>）里的块前后。`, "invalid");
+    const loc = b.el.sourceCodeLocation!;
+    const indent = this.indentBefore(loc.startOffset);
+    const eol = this.src.includes("\r\n") ? "\r\n" : "\n";
+    const markup = p.markup.split(/\r?\n/).join(eol + indent);
+    if (p.position === "after") this.apply([{ s: loc.endOffset, e: loc.endOffset, t: eol + indent + markup }]);
+    else this.apply([{ s: loc.startOffset, e: loc.startOffset, t: markup + eol + indent }]);
+    this.structureVersion++;
+    this.parse();
+    return { changedRefs: [], summary: `已插入${p.label ?? "内容"}，请重新读取以获得新引用。`, preview: [{ ref: "", before: "", after: clip(markup, 400) }], structural: true };
   }
 
   insertTableRow(): EditResult {

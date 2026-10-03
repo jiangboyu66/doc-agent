@@ -1,6 +1,6 @@
 # 文案 Agent v2
 
-基于 DeepSeek 的文档编辑 Agent，支持 Word（.docx）、Markdown、HTML，PDF 只读审阅。
+基于 DeepSeek 的文档编辑 Agent，支持 Word（.docx）、Markdown、HTML；PDF 可在会话内一键转换为 Word 后继续编辑。
 提供 Web 界面和命令行（CLI）两种用法，二者共用同一个引擎。
 
 **核心目标：100% 保真。** 只改你要求改的地方，文档其余部分逐字节保持不变。
@@ -72,6 +72,38 @@ v1 先把 Word 转成 Markdown 再转回去，每转一次都会丢格式。v2 �
    每次修改都保存完整的版本。可以回滚到任意版本，回滚本身也是一个新版本，历史不会丢失。
    原始文件永远不改，作为保真对比的基准。
 
+## PDF 转 Word
+
+PDF 是只读的最终版式格式，不能直接改写。上传 PDF 后，页面上方会出现「PDF → Word」卡片：
+
+- **下载 Word 文件**：直接得到 `原文件名.docx`；
+- **转换并继续编辑**：在**当前会话内**转换为 Word（对话保留），之后直接让 Agent 修改；原 PDF 保留为版本 v0，可随时回滚。
+
+卡片可以点标题左侧的 ▾ 收起成一行，让文档预览占满空间（折叠状态会记住）。在对话里直接说"把摘要润色一下"也可以：Agent 会先调用 `doc_convert_to_word` 在会话内转换，再接着修改，不需要你手动切换文档。
+
+也可以在对话中直接说"把这个 PDF 导出成 Word"（Agent 调用 `doc_export`），或输入 `/export docx`（`/export docx flow` 为便于改写版），或在右上角「下载 / 导出」菜单中选择「导出为 Word（.docx）」。
+
+内置转换引擎（`src/services/pdfConvert/`，纯 Node 实现，不需要安装任何额外程序）按"字在哪里、线在哪里"重建 Word 文档：
+
+- **文字**：字体（含子集字体名解析；LaTeX 的 Nimbus / URW / TeX Gyre / Computer Modern / Latin Modern 字体、LibreOffice/Linux 度量兼容字体映射回 Times New Roman / Arial / Calibri / Cambria Math 等，并按 Word 字体的实际字宽做不折行校验）、字号、粗斜体、颜色、上下标、下划线、删除线、Symbol 字体符号（Φ → ×）、连字（ﬁ → fi）。
+- **段落**：按基线成行、按折行规律成段；对齐方式由实测字宽判断（两端对齐的行会被拉宽或压缩）；首行缩进、悬挂缩进、列表符号、制表位（原位置）、段前距与行距（按原基线位置计算）；样式中的字符紧缩/加宽也会被测出并还原。
+- **表格**：由边框线还原网格，含合并单元格、每条边的有无/粗细/颜色、底纹、单元格垂直对齐；学术论文常见的"三线表"（只有横线）也能识别。
+- **版面**：双栏检测（两栏基线不对齐也能识别）→ Word 分栏；页眉页脚、分隔线、色块、图片按页面绝对位置放置，不参与文字流，不会被挤动；每页以分页开始。
+- **矢量图、行间公式、首字下沉**：流程图、曲线图、TeX 公式（分式、根号、大括号、求和号）无法用段落还原，会被自动识别，按 288 dpi 从 PDF 原样渲染成透明背景的高清图片，贴回原位置；图中/公式中的文字写入图片的替代文字，并计入完整性校验。渲染依赖 `@napi-rs/canvas`（`npm install` 时自动安装预编译版本，Windows / macOS / Linux 通用）；加载失败时自动退回文字重建。设置 `PDF_RASTER=0` 可关闭此功能。
+- **图文并排**：照片框、表格旁边并排有文字时（如作者简介），表格改为浮动定位，旁边文字保持原位。
+- **标题**：按视觉样式识别标题层级，转换后的文档有大纲，Agent 可以按章节定位。
+
+两种排版方式：
+
+| 方式 | 适合 | 说明 |
+| --- | --- | --- |
+| 保留原排版（默认） | 表单、表格、论文、需要与原件对照的文档 | 每一行以换行结束，行、页与 PDF 完全对应；逐行做"不折行"校验（基于 PDF 自带的字宽数据） |
+| 便于大段改写 | 需要大幅改写的文档 | 段落自动换行，改写后自然重排；行尾位置可能与 PDF 不同 |
+
+每次转换都会做**文字完整性校验**（逐字符比对 PDF 与生成的 Word），结果显示在新会话的开头。实测（用 LibreOffice 渲染后与原 PDF 逐像素比对墨迹重合度）：含流程图与 17 个公式的 IEEE Access 双栏论文 12 页 → 12 页、平均 96%；IEEE 双栏论文模板 9 页 → 9 页、平均 96%；中文表单 96%；双栏测试文档 99%；文字完整性均为 100%。
+
+也可以选择其他引擎：`pdf2docx`（需要 `pip install pdf2docx`，有时对无框线表格更好）、LibreOffice（每行一个文本框，版面接近但不便编辑）。命令行直接转换：`npm run cli -- 表单.pdf --output 表单.docx`。
+
 Markdown 和 HTML 采用同样的思路：直接在源文本上按位置拼接，保留原有的换行符（CRLF/LF）、实体写法、属性和注释。
 
 实测结果（IEEE Access 模板，10 类修改，覆盖普通模式和修订模式）：
@@ -82,6 +114,33 @@ Markdown 和 HTML 采用同样的思路：直接在源文本上按位置拼接�
 - 38 个部件中 34 个字节一致。
 
 输入 `/verify` 可以随时查看当前文档的保真报告。
+
+---
+
+## 编辑、排版与绘图工具
+
+除了改文字、改格式、插入/删除段落、表格加行、批注之外，Agent 还可以使用下面这些工具（只在当前文档支持时出现）。Word 中全部生成**原生对象**，在 Word 里可以继续编辑；Markdown / HTML 生成等价的源码片段。
+
+| 类别 | 工具 | Word 中的效果 | Markdown / HTML |
+| --- | --- | --- | --- |
+| 表格 | `doc_insert_table` 新建表格（网格线 / 三线表 / 无边框 / 隔行底纹、题注、列宽） | 原生表格，表头跨页重复 | 管道表格 / `<table>` |
+| | `doc_edit_table` 删除行列、插入列、合并单元格、底纹、对齐、边框、宽度、删除表格 | 原生表格结构 | — |
+| 图片 | `doc_insert_image` 插入你上传的图片（输入框上方「＋ 图片」按钮） | 嵌入图片 + 图题 | 内嵌 data URI |
+| 绘图 | `doc_draw` 矩形、圆角矩形、椭圆、菱形、三角形、平行四边形、六边形、圆柱、云形、直线、箭头、文字框任意组合 | 可编辑的形状组合 | 内嵌 SVG |
+| | `doc_insert_diagram` 给出节点和连线，自动分层排版成流程图 / 结构图 / 架构图 | 可编辑的形状组合 | 内嵌 SVG |
+| 图表 | `doc_insert_chart` 柱状、条形、折线、饼图、环形、面积、散点（可堆叠、数据标签） | 原生图表，数据内嵌 Excel，可右键"编辑数据" | 内嵌 SVG |
+| 公式 | `doc_insert_equation` LaTeX → Word 公式（分式、根式、上下标、求和积分、括号、希腊字母…），行间公式可带编号且编号与公式同行 | 原生公式（OMML） | `$$…$$` / `\[…\]` |
+| 版面 | `doc_insert_break` 分页符 / 分栏符 / 分节符；`doc_page_setup` 纸张、横向、边距、分栏、行号 | 原生分节 | 分页符 |
+| | `doc_header_footer` 页眉页脚，`{PAGE}` `{NUMPAGES}` 自动页码；`doc_insert_toc` 自动目录 | 页码域、TOC 域 | 目录（Markdown） |
+| 样式 | `doc_modify_style` 修改 / 新建样式（统一全文格式最规范的方式）；`doc_set_list` 项目符号与多级编号 | 样式表、编号定义 | — |
+| 引用 | `doc_insert_footnote` 脚注 / 尾注；`doc_insert_link` 超链接 | 原生脚注、超链接 | Markdown 链接 |
+| 审阅 | `doc_review_changes` 接受 / 拒绝修订；`doc_comments` 查看 / 删除批注；`doc_move_blocks` 移动段落 | — | 移动块（Markdown） |
+
+形状组合与图表另外带一张 PNG 后备图（`mc:AlternateContent`）：Word / WPS / LibreOffice 显示可编辑对象，浏览器内的"快速预览"显示后备图。修订模式下插入的表格、图片、图表、公式、目录都记录为修订，可以在 Word 中整体拒绝。
+
+## 深度思考
+
+输入框上方的「深度思考」按钮控制本会话是否开启 DeepSeek 思考模式（也可以输入 `/think on|off`）：开启时模型先思考再回答，复杂修改更可靠，但更慢、消耗更多 tokens。思考过程显示在每条回复上方，点击即可展开（思考进行中自动展开），刷新页面后仍然保留。
 
 ---
 
@@ -124,9 +183,13 @@ src/
   QueryEngine.ts          代理主循环
   Tool.ts  tools.ts       工具接口与工具池
   tools/docTools.ts       文档工具（读取/搜索/修改/格式/插入/删除/表格/批注/导出/校验）
+  tools/editingTools.ts   编辑 / 排版 / 绘图工具（表格、图片、形状、流程图、图表、公式、分节、页面、页眉页脚、目录、编号、脚注、链接、样式、修订、批注、移动）
+  tools/markup.ts         Markdown / HTML 的表格、图片、SVG 图形与图表标记
   tools/metaTools.ts      todo_write / exit_plan_mode / skill / agent
+  services/fallbackImages.ts  形状与图表的 PNG 后备图（快速预览用）
+  services/pdfConvert/    PDF → Word 版面重建（extract 提取 / fonts 字体映射 / layout 重建 / raster 矢量图与公式识别 / render 区域渲染 / docxWriter 生成）
   documents/              文档适配器（策略模式）
-    docx/                 原生 OOXML 引擎（zip / xml / ooxml / DocxDocument）
+    docx/                 原生 OOXML 引擎（zip / xml / ooxml / build 构件生成 / DocxDocument）
     markdown/ html/ pdf/
   permissions/ hooks/ skills/ agents/ plugins/ config/ services/ session/
   entrypoints/server.ts   Web 服务（Express + SSE）
@@ -177,11 +240,13 @@ test/                     自动化测试
 - 路径统一用 `fileURLToPath` / `pathToFileURL` 处理，中文路径和文件名可正常使用。
 - LibreOffice 每次都用独立的临时用户配置启动，不会被已打开的 LibreOffice 窗口卡住。转换有超时保护。
 - 如果 `soffice` 不在 PATH 中：`SOFFICE_PATH=C:\Program Files\LibreOffice\program\soffice.exe`。
+- 使用 pdf2docx 引擎时，若 Python 不在 PATH 中：`PYTHON_PATH=C:\Python312\python.exe`（内置引擎不需要 Python）。
 
 ## 已知限制
 
-- **PDF 只读。** PDF 没有可编辑的段落结构，只能阅读、搜索和审阅。需要修改请提供原始 Word 文件。
+- **PDF 需先转换为 Word 才能修改**（会话内一键完成）。转换是版面重建：文字 100% 保留、版面高度还原；矢量图与行间公式以高清图片还原（不是可编辑对象），旋转文字不转换；扫描件（整页图片）需要先做 OCR。有原始 Word 文件时，直接上传 Word 效果最好。
+- **公式工具支持常用 LaTeX 子集。** 矩阵、多行对齐（align）等复杂环境暂不支持，可拆成多个公式。
 - **不支持 .doc。** 请先在 Word 中另存为 .docx。
 - **跨格式导出（Word → HTML/Markdown）必然有损。** 需要完全保真请导出原格式。
-- **“快速预览”由浏览器渲染，与 Word 在分页和字体度量上可能略有差异。** 以“精确版式”（LibreOffice）或 Word 为准。下载的文件本身不受影响。
+- **“快速预览”由浏览器渲染，与 Word 在分页和字体度量上可能略有差异。** 以“精确版式”（LibreOffice）或 Word 为准。下载的文件本身不受影响。快速预览不能显示原生图表与形状本身，显示的是它们的后备图片；公式在快速预览中不显示。
 - 修改跨越图片、公式、域代码等对象时会被拒绝，这是保护机制。Agent 会改为分段修改。

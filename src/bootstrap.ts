@@ -24,6 +24,8 @@ export interface Runtime {
   pluginErrors: string[];
   memory: string;
   external: { pandoc: string | null; soffice: string | null };
+  /** PDF 转 Word 可用的引擎 */
+  pdfEngines: { builtin: boolean; pdf2docx: boolean; libreoffice: boolean };
   startupMs: number;
 }
 
@@ -50,10 +52,11 @@ export async function bootstrap(cli: Settings = {}): Promise<Runtime> {
   const t0 = Date.now();
   const settings = await loadSettings(cli);
   configureFeatures(settings.features);
-  const [pluginRes, memory, external] = await Promise.all([
+  const [pluginRes, memory, external, hasPdf2docx] = await Promise.all([
     feature("PLUGINS") ? loadPlugins() : Promise.resolve({ plugins: [] as LoadedPlugin[], errors: [] as string[] }),
     loadMemory(),
     checkExternalTools(),
+    import("./services/pdfConvert/index.js").then((m) => m.hasPdf2docx()).catch(() => false),
   ]);
   for (const p of pluginRes.plugins) {
     for (const [ev, list] of Object.entries(p.hooks)) (settings.hooks[ev] ??= []).push(...list);
@@ -61,7 +64,8 @@ export async function bootstrap(cli: Settings = {}): Promise<Runtime> {
   const skills = await loadSkills(pluginRes.plugins.filter((p) => p.skillsDir).map((p) => ({ dir: p.skillsDir!, plugin: p.name })));
   const agents = [...BUILT_IN_AGENTS, ...pluginRes.plugins.flatMap((p) => p.agents)];
   registerBuiltinHooks();
-  return { settings, skills, agents, plugins: pluginRes.plugins, pluginErrors: pluginRes.errors, memory, external, startupMs: Date.now() - t0 };
+  const pdfEngines = { builtin: true, pdf2docx: hasPdf2docx, libreoffice: !!external.soffice };
+  return { settings, skills, agents, plugins: pluginRes.plugins, pluginErrors: pluginRes.errors, memory, external, pdfEngines, startupMs: Date.now() - t0 };
 }
 
 export function createClient(settings: ResolvedSettings): ModelClient {

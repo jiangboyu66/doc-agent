@@ -114,6 +114,12 @@ export class QueryEngine {
     });
   }
 
+  /** 思考模式：会话级开关（界面上的"深度思考"按钮）优先，其次全局配置；特性开关关闭时一律不开 */
+  private thinkingEnabled(): boolean {
+    if (!feature("THINKING")) return false;
+    return this.session.meta.thinking ?? this.deps.client.thinking;
+  }
+
   private async persist() {
     if (this.isMain) await this.session.save();
   }
@@ -148,11 +154,12 @@ export class QueryEngine {
       const system = this.systemPrompt();
       await this.maybeCompact(system, prompt, signal, emit, ctx);
       const tools = assembleToolPool(ctx, this.opts.agentDef?.tools);
+      const thinking = this.thinkingEnabled();
       const t0 = Date.now();
       let res;
       try {
         res = await client.complete(
-          { system, messages: normalizeMessagesForAPI(this.messages, client.thinking), tools: tools.map((t) => toolSchema(t, ctx)) },
+          { system, messages: normalizeMessagesForAPI(this.messages, thinking), tools: tools.map((t) => toolSchema(t, ctx)), thinking },
           {
             signal,
             onChunk: (c) => emit(c.kind === "text" ? { type: "text_delta", text: c.text, agentId: this.agentId } : { type: "reasoning_delta", text: c.text, agentId: this.agentId }),

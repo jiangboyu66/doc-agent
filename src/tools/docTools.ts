@@ -45,19 +45,34 @@ function editResultText(r: EditResult): string {
   return lines.join("\n");
 }
 
-function cap(ctx: ToolUseContext, k: keyof DocumentAdapter["capabilities"]) {
-  return ctx.session.doc.capabilities[k];
+function cap(ctx: ToolUseContext, k: keyof DocumentAdapter["capabilities"]): boolean {
+  return !!ctx.session.doc.capabilities[k];
+}
+
+/**
+ * 同一轮里连续多次插入时，模型手里的 P 序号引用来自插入前的读取结果：
+ * 只要段落还在，就换算成当前引用（#开头的稳定引用不受影响）
+ */
+function translateRefs<T>(input: T, doc: DocumentAdapter): T {
+  if (!doc.translateRef) return input;
+  const fix = (v: unknown): unknown =>
+    typeof v === "string" ? (/^P\d+@v\d+$/.test(v.trim()) ? doc.translateRef!(v) : v)
+    : Array.isArray(v) ? v.map(fix)
+    : v && typeof v === "object" && !(v instanceof Buffer) ? Object.fromEntries(Object.entries(v).map(([k, x]) => [k, fix(x)]))
+    : v;
+  return fix(input) as T;
 }
 
 /** 写工具的通用骨架：先读后改校验 + 干跑预览 + 执行 + 生成版本 */
-function editTool<I extends { reason?: string }>(def: {
+export function editTool<I extends { reason?: string }>(def: {
   name: string;
   capability: keyof DocumentAdapter["capabilities"];
   description: (ctx: ToolUseContext) => string;
   inputSchema: z.ZodType<I>;
   title: (i: Partial<I>) => string;
-  apply: (doc: DocumentAdapter, input: I, ctx: ToolUseContext) => EditResult;
+  apply: (doc: DocumentAdapter, input: I, ctx: ToolUseContext) => EditResult | Promise<EditResult>;
   destructive?: (i: I) => boolean;
+  isEnabled?: (ctx: ToolUseContext) => boolean;
   permissionContent?: (i: I) => string;
   checkPermissions?: Tool<I>["checkPermissions"];
 }): Tool<I> {
@@ -67,16 +82,17 @@ function editTool<I extends { reason?: string }>(def: {
     description: def.description,
     inputSchema: def.inputSchema,
     userFacingName: def.title,
-    isEnabled: (ctx) => cap(ctx, def.capability),
+    isEnabled: def.isEnabled ?? ((ctx) => cap(ctx, def.capability)),
     isDestructive: (i) => def.destructive?.(i) ?? false,
     permissionContent: def.permissionContent,
     checkPermissions: def.checkPermissions,
     validateInput: async (_i, ctx) => requireRead(ctx),
     async preview(input, ctx) {
-      return (await ctx.session.dryRun((doc) => def.apply(doc, input, ctx))).preview;
+      const fixed = translateRefs(input, ctx.session.doc);
+      return (await ctx.session.dryRun(async (doc) => await def.apply(doc, fixed, ctx))).preview;
     },
     async call(input, ctx) {
-      const r = def.apply(ctx.session.doc, input, ctx);
+      const r = await def.apply(ctx.session.doc, translateRefs(input, ctx.session.doc), ctx);
       return {
         content: editResultText(r),
         preview: r.preview,
@@ -275,7 +291,7 @@ render=true 时额外用 LibreOffice 渲染一次，确认文件可以被正常�
 // 写工具
 // ---------------------------------------------------------------------------
 
-const reason = z.string().describe("一句话说明这次修改的目的，会展示给用户确认").optional();
+export const reason = z.string().describe("一句话说明这次修改的目的，会展示给用户确认").optional();
 
 export const DocReplaceTextTool = editTool({
   name: "doc_replace_text",
@@ -441,17 +457,23 @@ export const DocExportTool = buildTool({
   description: () => `把当前文档导出为文件供用户下载：docx / pdf / html / markdown。
 - 导出与原文件相同的格式 = 编辑后的原文件本身，未修改部分逐字节不变（推荐）；
 - Word 导出 PDF 由 LibreOffice 按 Word 版式渲染；
-- 跨格式导出（如 Word → Markdown）只能近似保留结构，会在结果中注明。
+- 跨格式导出（如 Word → Markdown）只能近似保留结构，会在结果中注明；
+- PDF 文档可导出为 Word（docx）：pdf_layout = exact 逐行保留原排版（默认，适合表单/表格/论文），flow 段落自动换行（适合大段改写）。
 导出不修改文档本身。`,
-  inputSchema: z.object({ format: z.enum(["docx", "pdf", "html", "markdown"]), filename: z.string().optional() }),
+  inputSchema: z.object({
+    format: z.enum(["docx", "pdf", "html", "markdown"]),
+    filename: z.string().optional(),
+    pdf_layout: z.enum(["exact", "flow"]).optional().describe("仅 PDF 导出 Word 时使用"),
+  }),
   userFacingName: (i) => `导出 ${String(i.format ?? "").toUpperCase()}`,
-  isEnabled: (ctx) => ctx.session.meta.format !== "pdf",
+  isEnabled: () => true,
   permissionContent: (i) => i.format,
   checkPermissions: async () => ({ behavior: "allow" }),
   async call(i, ctx) {
-    const out = await exportDocument(ctx.session.current(), ctx.session.meta.format, i.format);
+    const isPdf = ctx.session.meta.format === "pdf";
+    const out = await exportDocument(ctx.session.current(), ctx.session.meta.format, i.format, { pdfMode: i.pdf_layout ?? "exact" });
     const base = (i.filename || ctx.session.meta.filename).replace(/\.[^.]+$/, "").replace(/[\\/:*?"<>|]/g, "_");
-    const name = `${base}-v${ctx.session.meta.currentVersion}.${out.ext}`;
+    const name = isPdf ? `${base}.${out.ext}` : `${base}-v${ctx.session.meta.currentVersion}.${out.ext}`;
     const file = await ctx.session.writeExport(name, out.data);
     return {
       content: `已导出 ${name}（${Math.round(out.data.length / 1024)} KB）。${out.note}`,
@@ -460,8 +482,34 @@ export const DocExportTool = buildTool({
   },
 });
 
+export const DocConvertToWordTool = buildTool({
+  name: "doc_convert_to_word",
+  category: "edit",
+  description: () => `把当前的 PDF 文档在本会话内转换为可编辑的 Word 文档，转换后可以直接用 doc_replace_text 等写工具修改。
+- PDF 是只读格式：用户要求修改/润色/改写 PDF 的内容时，先调用本工具，再按正常流程读取并修改；
+- layout = exact（默认）逐行保留原排版，适合小范围修改；flow 段落自动换行，适合大段改写；
+- 转换后文档结构全部变化：必须重新调用 doc_outline / doc_read 获取新的段落引用；
+- 原 PDF 保留为版本 v0，用户可随时回滚；转换报告会给出文字完整性。
+只想"导出一份 Word 文件给用户下载"而不修改时，用 doc_export(format="docx")。`,
+  inputSchema: z.object({
+    layout: z.enum(["exact", "flow"]).optional().describe("exact 保留原排版（默认）；flow 便于大段改写"),
+    reason,
+  }),
+  userFacingName: (i) => `PDF 转换为 Word（${i.layout === "flow" ? "便于改写" : "保留原排版"}）`,
+  isEnabled: (ctx) => ctx.session.meta.format === "pdf",
+  checkPermissions: async () => ({ behavior: "allow" }),
+  async call(i, ctx) {
+    const { convertPdfInPlace } = await import("../session/convertPdf.js");
+    const r = await convertPdfInPlace(ctx.session, { mode: i.layout ?? "exact" });
+    return {
+      content: `${r.text}\n已切换为 Word 文档，写工具现在可用。下一步：调用 doc_outline 重新获取段落引用后再修改。`,
+      docChange: { label: r.label, changedRefs: [], structural: true },
+    };
+  },
+});
+
 export const DOC_TOOLS: Tool[] = [
   DocOutlineTool, DocReadTool, DocSearchTool, DocInspectTool, DocStylesTool, DocVerifyTool,
   DocReplaceTextTool, DocFormatTextTool, DocSetParagraphTool, DocInsertBlocksTool, DocDeleteBlocksTool,
-  DocInsertTableRowTool, DocAddCommentTool, DocExportTool,
+  DocInsertTableRowTool, DocAddCommentTool, DocExportTool, DocConvertToWordTool,
 ] as Tool[];

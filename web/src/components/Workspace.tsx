@@ -5,6 +5,7 @@ import type { ChatItem, DocumentSummary, EngineEvent, PermissionMode, RuntimeInf
 import { Chat } from "./Chat";
 import { DocPreview } from "./DocPreview";
 import { OutlinePanel, VersionsPanel } from "./Panels";
+import { ConvertCard } from "./ConvertCard";
 
 const MODES: Array<[PermissionMode, string, string]> = [
   ["default", "逐一确认", "每次修改前展示预览，由你确认"],
@@ -15,7 +16,7 @@ const MODES: Array<[PermissionMode, string, string]> = [
 
 type Tab = "doc" | "outline" | "versions";
 
-export function Workspace({ id, runtime, onBack }: { id: string; runtime: RuntimeInfo | null; onBack: () => void }) {
+export function Workspace({ id, runtime, onBack, onOpen }: { id: string; runtime: RuntimeInfo | null; onBack: () => void; onOpen: (id: string) => void }) {
   const [meta, setMeta] = useState<SessionMeta | null>(null);
   const [summary, setSummary] = useState<DocumentSummary | null>(null);
   const [items, setItems] = useState<ChatItem[]>([]);
@@ -27,6 +28,20 @@ export function Workspace({ id, runtime, onBack }: { id: string; runtime: Runtim
   const [exporting, setExporting] = useState<string | null>(null);
   const [exported, setExported] = useState<{ name: string; url: string; note: string; lossy: boolean } | null>(null);
   const [menu, setMenu] = useState(false);
+  const [attaching, setAttaching] = useState(false);
+
+  const attach = async (files: File[]) => {
+    setAttaching(true);
+    try {
+      const r = await api.uploadAssets(id, files);
+      setItems((x) => [...x, { kind: "notice", key: `as${Date.now()}`, tone: "success", text: `已上传图片：${r.assets.join("、")}。可以告诉我插到哪里，例如"把 ${r.assets[0]} 插到第二节末尾，图题为……"。` }]);
+      refresh().catch(() => {});
+    } catch (e: any) {
+      setErr(`上传失败：${e.message}`);
+    } finally {
+      setAttaching(false);
+    }
+  };
   const followLatest = useRef(true);
 
   const refresh = useCallback(async () => {
@@ -41,7 +56,12 @@ export function Workspace({ id, runtime, onBack }: { id: string; runtime: Runtim
   useEffect(() => {
     refresh()
       .then((d) => {
-        setItems(fromTranscript(d.transcript, d.pending));
+        const restored = fromTranscript(d.transcript, d.pending);
+        // 由 PDF 转换而来的会话：先展示转换报告
+        if (d.meta.origin && !restored.length) {
+          restored.push({ kind: "notice", key: "origin", tone: d.meta.origin.coverage >= 0.995 ? "success" : "warn", text: `已由「${d.meta.origin.fromFile}」转换为 Word。\n${d.meta.origin.report}` });
+        }
+        setItems(restored);
         setViewing(d.meta.currentVersion);
         if (d.busy) setItems((x) => [...x, { kind: "notice", key: "busy", tone: "warn", text: "这个会话正在另一个窗口中运行。" }]);
       })
@@ -53,11 +73,16 @@ export function Workspace({ id, runtime, onBack }: { id: string; runtime: Runtim
     if (e.type === "todos") setTodos(e.todos);
     if (e.type === "usage") setMeta((m) => (m ? { ...m, cost: { ...m.cost, costUsd: e.totalCostUsd } } : m));
     if (e.type === "mode_changed") setMeta((m) => (m ? { ...m, mode: e.mode as PermissionMode } : m));
+    // /convert 生成了新会话：自动打开
+    if (e.type === "command_output") {
+      const m = /新会话 ID：([A-Za-z0-9_-]+)/.exec(e.text);
+      if (m) setTimeout(() => onOpen(m[1]), 600);
+    }
     if (e.type === "doc_changed") {
       followLatest.current = true;
       refresh().catch(() => {});
     }
-  }, [refresh]);
+  }, [refresh, onOpen]);
 
   const send = async (text: string) => {
     if (busy) return;
@@ -83,7 +108,7 @@ export function Workspace({ id, runtime, onBack }: { id: string; runtime: Runtim
     }
   };
 
-  const patch = async (p: Partial<Pick<SessionMeta, "mode" | "trackChanges" | "author">>) => {
+  const patch = async (p: Partial<Pick<SessionMeta, "mode" | "trackChanges" | "author" | "thinking">>) => {
     try {
       const r = await api.settings(id, p);
       setMeta(r.meta);
@@ -127,7 +152,8 @@ export function Workspace({ id, runtime, onBack }: { id: string; runtime: Runtim
   }
 
   const readOnly = meta.format === "pdf";
-  const exportTargets = meta.format === "pdf" ? [] : (["docx", "pdf", "html", "markdown"] as const).filter((f) => f !== meta.format);
+  const thinkingOn = meta.thinking ?? runtime?.thinking === "enabled";
+  const exportTargets = (meta.format === "pdf" ? (["docx", "html", "markdown"] as const) : (["docx", "pdf", "html", "markdown"] as const)).filter((f) => f !== meta.format);
 
   return (
     <div className="workspace">
@@ -178,8 +204,8 @@ export function Workspace({ id, runtime, onBack }: { id: string; runtime: Runtim
                 </a>
                 {exportTargets.map((f) => (
                   <button key={f} onClick={() => doExport(f)} disabled={!!exporting}>
-                    <b>导出为 {f === "markdown" ? "Markdown" : f.toUpperCase()}</b>
-                    <span>{f === "pdf" ? (meta.format === "docx" ? "LibreOffice 按 Word 版式渲染" : "转换后渲染") : "跨格式转换，版式可能有损"}</span>
+                    <b>导出为 {f === "markdown" ? "Markdown" : f === "docx" ? "Word（.docx）" : f.toUpperCase()}</b>
+                    <span>{meta.format === "pdf" && f === "docx" ? "按原排版重建为 Word（更多选项见页面上方）" : f === "pdf" ? (meta.format === "docx" ? "LibreOffice 按 Word 版式渲染" : "转换后渲染") : "跨格式转换，版式可能有损"}</span>
                   </button>
                 ))}
               </div>
@@ -207,8 +233,25 @@ export function Workspace({ id, runtime, onBack }: { id: string; runtime: Runtim
             ))}
           </nav>
           <div className="left-body">
+            {tab === "doc" && readOnly && (
+              <ConvertCard
+                sessionId={id}
+                runtime={runtime}
+                onDone={(text) => {
+                  followLatest.current = true;
+                  refresh().catch(() => {});
+                  setItems((x) => [...x, { kind: "notice", key: `cv${Date.now()}`, tone: "success", text: `已在当前会话内转换为 Word，可以直接告诉我要怎么修改。原 PDF 保留为 v0，可随时回滚。\n${text}` }]);
+                }}
+              />
+            )}
             {tab === "doc" && (
-              <DocPreview sessionId={id} format={meta.format} version={viewing} isCurrent={viewing === meta.currentVersion} sofficeAvailable={!!runtime?.external.soffice} />
+              <DocPreview
+                sessionId={id}
+                format={meta.versions.find((x) => x.v === viewing)?.format ?? meta.sourceFormat ?? meta.format}
+                version={viewing}
+                isCurrent={viewing === meta.currentVersion}
+                sofficeAvailable={!!runtime?.external.soffice}
+              />
             )}
             {tab === "outline" && <OutlinePanel summary={summary} onAsk={send} />}
             {tab === "versions" && (
@@ -222,7 +265,20 @@ export function Workspace({ id, runtime, onBack }: { id: string; runtime: Runtim
             )}
           </div>
         </section>
-        <Chat items={items} busy={busy} todos={todos} runtime={runtime} onSend={send} onInterrupt={() => api.interrupt(id)} onDecide={decide} />
+        <Chat
+          items={items}
+          busy={busy}
+          todos={todos}
+          runtime={runtime}
+          onSend={send}
+          onInterrupt={() => api.interrupt(id)}
+          onDecide={decide}
+          thinking={thinkingOn}
+          onToggleThinking={runtime?.thinkingAvailable === false ? undefined : () => patch({ thinking: !thinkingOn })}
+          onAttach={meta.format === "pdf" ? undefined : attach}
+          attaching={attaching}
+          format={meta.format}
+        />
       </div>
     </div>
   );
