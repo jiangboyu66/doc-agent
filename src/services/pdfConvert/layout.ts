@@ -11,7 +11,8 @@
  */
 
 import type { FillRect, ImageBox, PageModel, Seg, Span } from "./extract.js";
-import { detectDropCaps, detectEquations, detectFigures, rawBase, rasterBox, spansText, type Box, type MathCtx } from "./raster.js";
+import { collectHyphenated, collectWords, isSoftHyphen, wordCounts } from "../../documents/hyphen.js";
+import { detectDropCaps, detectEquations, detectFigures, detectImageGrids, rawBase, rasterBox, removeInside, spansText, type Box, type MathCtx } from "./raster.js";
 
 export interface Run {
   text: string;
@@ -32,6 +33,10 @@ export interface Run {
   underline?: boolean;
   strike?: boolean;
   vertAlign?: "superscript" | "subscript";
+  /** 域（页眉页脚中的页码） */
+  field?: "PAGE";
+  /** 原 PDF 的分页位置（写成 lastRenderedPageBreak，浏览器预览据此分页） */
+  pageMark?: boolean;
 }
 
 export interface TabStop { pos: number; align: "left" | "right" }
@@ -62,6 +67,21 @@ export interface Para {
   textBoxes?: Array<{ x: number; y: number; w: number; h: number; para: Para }>;
   /** 逐行一致模式：每一行的 run 范围、自然宽度与可用宽度，用于最终的"不折行"校验 */
   lineFits?: Array<{ start: number; end: number; natural: number; chars: number; avail: number }>;
+  /** 独占一段的行内图片（行间公式、图）：随文字流移动，前后文字增减时不会与文字重叠 */
+  inlineImages?: ImageBox[];
+  /** 随段落浮动、文字环绕的图片（首字下沉、作者照片等旁边有文字的图）：相对栏左边界 / 段落顶部定位 */
+  floats?: Array<{ img: ImageBox; dx: number; dy: number }>;
+  /** 区域（栏 / 页）的最后一段、第一段：流式模式下用于合并被分栏、分页切断的段落 */
+  regionEnd?: boolean;
+  regionStart?: boolean;
+  /** 最后一行排满到右边界（段落可能在此被切断） */
+  lastFull?: boolean;
+  /** 原 PDF 中新的一页从这一段开始（流式模式）：写成 lastRenderedPageBreak，浏览器预览据此分页 */
+  pageMark?: boolean;
+  /** 与下段同页（表题与表格、图与图题不分开） */
+  keepNext?: boolean;
+  /** 页眉中的图片（徽标等）：相对页边距左边界 / 段落顶部定位，不环绕文字 */
+  hfImages?: Array<{ img: ImageBox; dx: number; dy: number }>;
 }
 
 export interface Cell {
@@ -87,7 +107,14 @@ export interface Table {
 
 export type Block = Para | Table;
 
-export interface SectionProps { cols: number; colWidths: number[]; colGap: number }
+export interface SectionProps {
+  cols: number; colWidths: number[]; colGap: number;
+  /** 本节从第一页开始（流式模式）：首页使用"首页"页眉页脚 */
+  titlePg?: boolean;
+}
+
+/** 页眉 / 页脚（流式模式）：首页、奇数页（默认）、偶数页 */
+export interface HeaderSet { default?: Para[]; first?: Para[]; even?: Para[] }
 
 export interface DocModel {
   pageW: number;
@@ -100,6 +127,14 @@ export interface DocModel {
   stats: { pages: number; paragraphs: number; tables: number; images: number; vectorShapes: number; rotatedText: number; columnPages: number; figures: number; equations: number };
   /** 渲染为图片的区域中的文字（计入完整性校验） */
   rasterText: string;
+  mode: LayoutMode;
+  /** 流式模式：真正的页眉页脚（含页码域） */
+  headers?: HeaderSet;
+  footers?: HeaderSet;
+  headerDist?: number;
+  footerDist?: number;
+  /** 第一页的页码（PDF 中印刷的页码不从 1 开始时） */
+  pageNumStart?: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -192,7 +227,61 @@ export function buildLines(spans: Span[]): Line[] {
       }
     } else groups.push({ spans: [s], top: s.top, bottom: s.bottom, baseline: s.baseline });
   }
+  attachMarks(groups);
   return groups.map((g) => finishLine(g.spans)).sort((a, b) => a.baseline - b.baseline || a.x0 - b.x0);
+}
+
+/** 重音符号 → 组合字符（F + ˆ → F̂） */
+const COMBINING: Record<string, string> = { "ˆ": "\u0302", "^": "\u0302", "˜": "\u0303", "~": "\u0303", "¯": "\u0304", "˙": "\u0307", "¨": "\u0308", "´": "\u0301", "`": "\u0300", "ˇ": "\u030C", "→": "\u20D7", "⃗": "\u20D7" };
+
+/**
+ * 行内公式的上下标、重音符号与正文字母上下叠放（W 的上标 Q 与下标 e 在同一横坐标），
+ * 成行时会因"横向重叠"被分到单独的一行，转换后变成正文上方多出的一行碎片、行距被撑大。
+ * 这里把这类"碎片行"并回它所属的正文行：重音变成组合字符，上下标作为上标 / 下标片段。
+ */
+function attachMarks(groups: Array<{ spans: Span[]; top: number; bottom: number; baseline: number }>) {
+  const sizeOf = (g: { spans: Span[] }) => Math.max(...g.spans.map((x) => x.size));
+  const isAccent = (t: string) => /^[ˆ^˜~¯˙¨´`ˇ→⃗\s]+$/.test(t);
+  for (let i = groups.length - 1; i >= 0; i--) {
+    const g = groups[i];
+    const text = g.spans.map((x) => x.text).join("").trim();
+    if (!text || text.replace(/\s/g, "").length > 30) continue;
+    // 重音符号的字号与正文相同，不参与判断
+    const plain = g.spans.filter((x) => !isAccent(x.text));
+    const gs = plain.length ? Math.max(...plain.map((x) => x.size)) : sizeOf(g);
+    // 找竖直方向紧挨着、字号更大、横向覆盖它的正文行
+    let host: (typeof groups)[number] | null = null, best = Infinity;
+    for (const h of groups) {
+      if (h === g) continue;
+      const hs = sizeOf(h);
+      const allAccent = g.spans.every((x) => isAccent(x.text));
+      if (!allAccent && gs > 0.85 * hs) continue;
+      const hx0 = Math.min(...h.spans.map((x) => x.x0)), hx1 = Math.max(...h.spans.map((x) => x.x1));
+      const gx0 = Math.min(...g.spans.map((x) => x.x0)), gx1 = Math.max(...g.spans.map((x) => x.x1));
+      // 行末的上标（i 的 th）可能略超出正文行
+      if (gx0 < hx0 - 2 || gx1 > hx1 + 2.5 * hs) continue;
+      const d = Math.abs(h.baseline - g.baseline);
+      if (d > 0.75 * hs) continue;
+      if (d < best) { best = d; host = h; }
+    }
+    if (!host) continue;
+    for (const sp of g.spans) {
+      if (isAccent(sp.text)) {
+        const ch = COMBINING[sp.text.trim()[0]];
+        const cx = (sp.x0 + sp.x1) / 2;
+        const k = host.spans.findIndex((o) => o.x0 - 0.5 <= cx && o.x1 + 0.5 >= cx && o.text.trim());
+        if (ch && k >= 0) {
+          const o = host.spans[k];
+          const n = o.text.length;
+          const idx = Math.min(n - 1, Math.max(0, Math.floor(((cx - o.x0) / Math.max(0.1, o.x1 - o.x0)) * n)));
+          host.spans[k] = { ...o, text: o.text.slice(0, idx + 1) + ch + o.text.slice(idx + 1) };
+          continue;
+        }
+      }
+      host.spans.push(sp);
+    }
+    groups.splice(i, 1);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -244,6 +333,26 @@ function mergeV(segs: Seg[]): VSeg[] {
   return out;
 }
 
+/**
+ * 曲线图 / 柱状图的网格线也是横竖线构成的网格，但不是表格：网格内有曲线、斜线（折线）或多块彩色填充，
+ * 而几乎没有文字（刻度标签在网格外）。这类区域留给矢量图识别，整体渲染成图片。
+ */
+function isChartGrid(page: PageModel, x0: number, y0: number, x1: number, y1: number, cells: number): boolean {
+  const inside = (b: { x0: number; y0: number; x1: number; y1: number }) => b.x0 >= x0 - 4 && b.x1 <= x1 + 4 && b.y0 >= y0 - 4 && b.y1 <= y1 + 4;
+  // 折线 / 曲线：大部分落在网格内即可（线宽、超出坐标轴的少许部分不影响）
+  const mostlyIn = (p: { x0: number; y0: number; x1: number; y1: number }) => {
+    const w = Math.max(0, Math.min(p.x1, x1) - Math.max(p.x0, x0)), h = Math.max(0, Math.min(p.y1, y1) - Math.max(p.y0, y0));
+    return w >= 0.8 * (p.x1 - p.x0) && h >= 0.8 * (p.y1 - p.y0);
+  };
+  const curves = page.paths.filter((p) => (p.curved || p.diagonal) && (inside(p) || mostlyIn(p)) && Math.max(p.x1 - p.x0, p.y1 - p.y0) > 0.15 * Math.min(x1 - x0, y1 - y0)).length;
+  const gray = (c: string) => { const n = parseInt(c, 16); const r = n >> 16, g = (n >> 8) & 255, b = n & 255; return Math.max(r, g, b) - Math.min(r, g, b) < 24; };
+  const colored = page.fills.filter((f) => inside(f) && /^[0-9a-f]{6}$/i.test(f.color) && !gray(f.color)).length;
+  if (!curves && colored < 3) return false;
+  const textChars = page.spans.filter((sp) => { const cx = (sp.x0 + sp.x1) / 2, cy = (sp.top + sp.bottom) / 2; return cx > x0 && cx < x1 && cy > y0 && cy < y1; })
+    .reduce((n, sp) => n + sp.text.replace(/\s/g, "").length, 0);
+  return textChars <= Math.max(6, cells * 2);
+}
+
 function detectTables(page: PageModel): { tables: TableDraft[]; used: Set<Seg> } {
   const hs = mergeH(page.segs);
   const vs = mergeV(page.segs);
@@ -269,6 +378,7 @@ function detectTables(page: PageModel): { tables: TableDraft[]; used: Set<Seg> }
     if (xs.length < 2 || ys.length < 2) continue;
     const x0 = xs[0], x1 = xs[xs.length - 1], y0 = ys[0], y1 = ys[ys.length - 1];
     if (x1 - x0 < 20 || y1 - y0 < 8) continue;
+    if (isChartGrid(page, x0, y0, x1, y1, (xs.length - 1) * (ys.length - 1))) continue;
     const t: TableDraft = { x0, x1, y0, y1, xs, ys, hs: c.hs, vs: c.vs, spans: [] };
     tables.push(t);
     for (const h of c.hs) h.src.forEach((s) => used.add(s));
@@ -508,6 +618,12 @@ interface Ctx {
   mode: LayoutMode;
   /** 字符间距样本：字体键 → 每字符的宽度差（pt） */
   spacing: Map<string, number[]>;
+  /** 全文的单词表 / 带连字符的写法：流式模式下判断行尾连字符是否为排版断词 */
+  words: Set<string>;
+  hyphenated: Set<string>;
+  counts: Map<string, number>;
+  /** 去掉的排版断词连字符（计入完整性校验） */
+  softHyphens: number;
 }
 
 const fontKey = (f: { font: string; size: number; bold: boolean; italic: boolean }) => `${f.font}|${f.size}|${f.bold ? 1 : 0}|${f.italic ? 1 : 0}`;
@@ -561,9 +677,15 @@ function buildPara(lines: Line[], r: Region, blockEdge: number, ctx: Ctx): Para 
         if (prev && !prev.tab) prev.text = prev.text.replace(/\s+$/, "");
         runs.push({ text: "", br: true, ...spanFormat(lines[li - 1].spans[lines[li - 1].spans.length - 1], lines[li - 1].size, lines[li - 1].baseline) });
       } else {
+        if (prev && !prev.tab) prev.text = prev.text.replace(/\s+$/, "");
         const prevCh = prev?.text.slice(-1) ?? "";
-        const nextCh = l.spans[0].text.trimStart()[0] ?? "";
-        if (prev && !prev.tab && prevCh !== " " && prevCh !== "-" && !CJK.test(prevCh) && !CJK.test(nextCh)) prev.text += " ";
+        const nextText = l.spans[0].text.trimStart();
+        const nextCh = nextText[0] ?? "";
+        if (prev && !prev.tab && /[A-Za-z]-$/.test(prev.text) && /^[A-Za-z]/.test(nextText) && isSoftHyphen(prev.text.slice(0, -1), nextText, ctx.words, ctx.hyphenated, ctx.counts)) {
+          // 排版断词（"sharp-" + "ness"）：去掉连字符直接相连，重新排版后不会在行中出现多余的连字符
+          prev.text = prev.text.slice(0, -1);
+          ctx.softHyphens++;
+        } else if (prev && !prev.tab && prevCh !== "-" && prevCh !== "‐" && !CJK.test(prevCh) && !CJK.test(nextCh)) prev.text += " ";
       }
     }
     // 字符间距采样：未被两端对齐拉伸的行（左对齐段落的每行、两端对齐段落的末行）
@@ -663,7 +785,9 @@ function buildPara(lines: Line[], r: Region, blockEdge: number, ctx: Ctx): Para 
   const kept = runs.map((x) => x.tab || x.br || !!x.text);
   // run 过滤后下标会变化：换算成过滤后的下标
   const remap = (k: number) => kept.slice(0, k).filter(Boolean).length;
+  const lastLine = lines[lines.length - 1];
   return {
+    lastFull: r.x1 - lastLine.x1 <= Math.max(3, 0.04 * W),
     kind: "p", runs: runs.filter((_, k) => kept[k]), align, indLeft, indRight, firstLine,
     spaceBefore: 0, lineHeight, tabs: tabs.sort((a, b) => a.pos - b.pos), size,
     lineFits: lineFits.map((f) => ({ ...f, start: remap(f.start), end: remap(f.end) })),
@@ -674,16 +798,37 @@ function buildPara(lines: Line[], r: Region, blockEdge: number, ctx: Ctx): Para 
 const baselineOffset = (lineHeight: number, size: number) => lineHeight - 0.22 * size;
 
 /** 把一组行在给定区域里排成段落，并按实测位置计算段前距。返回段落与结束位置 */
-function layoutLines(lines: Line[], r: Region, cursor: number, ctx: Ctx): { paras: Para[]; cursor: number } {
+function layoutLines(lines: Line[], r: Region, cursor: number, ctx: Ctx, floats?: Map<Line, ImageBox[]>): { paras: Para[]; cursor: number } {
   const paras: Para[] = [];
   for (const { lines: group, edge } of groupParagraphs(lines, r)) {
     const p = buildPara(group, r, edge, ctx);
     const top = group[0].baseline - baselineOffset(p.lineHeight, p.size);
     p.spaceBefore = Math.max(0, top - cursor);
+    // 旁边的浮动图片挂在这一段上：相对栏左边界、段落顶部定位
+    for (const l of group) for (const img of floats?.get(l) ?? []) (p.floats ??= []).push({ img, dx: img.x0 - r.x0, dy: img.y0 - top });
     paras.push(p);
     cursor = Math.max(cursor, top) + p.lineHeight * group.length;
   }
   return { paras, cursor };
+}
+
+/** 独占一段的行内图片：段前距 = 与上一块的实测间距，左缩进 = 图片的横坐标（并排的多张图用制表位定位） */
+function imagePara(imgs: ImageBox[], r: Region, cursor: number): Para {
+  const sorted = [...imgs].sort((a, b) => a.x0 - b.x0);
+  const y0 = Math.min(...sorted.map((i) => i.y0)), y1 = Math.max(...sorted.map((i) => i.y1));
+  const p = tinyPara({ inlineImages: sorted, lineHeight: y1 - y0 });
+  p.spaceBefore = Math.max(0, y0 - cursor);
+  if (sorted.length === 1) p.indLeft = Math.max(-(r.overhang ?? 0), sorted[0].x0 - r.x0);
+  else p.tabs = sorted.map((i) => ({ pos: Math.max(0, Math.round((i.x0 - r.x0) * 20) / 20), align: "left" as const }));
+  return p;
+}
+
+/** 一个区域的第一段 / 最后一段文字（跳过占位空段）：流式模式下合并被切断的段落 */
+function markRegion(bs: Block[]) {
+  const real = bs.filter((b) => !(b.kind === "p" && b.tiny && !b.inlineImages && !b.borderBottom));
+  const f = real[0], l = real[real.length - 1];
+  if (f?.kind === "p" && !f.tiny) f.regionStart = true;
+  if (l?.kind === "p" && !l.tiny) l.regionEnd = true;
 }
 
 // ---------------------------------------------------------------------------
@@ -809,7 +954,8 @@ function classify(l: Line, x: number): LineSide {
   const left = l.spans.filter((s) => (s.x0 + s.x1) / 2 < x), right = l.spans.filter((s) => (s.x0 + s.x1) / 2 >= x);
   if (left.length && right.length) {
     const gap = Math.min(...right.map((s) => s.x0)) - Math.max(...left.map((s) => s.x1));
-    return gap < 1.0 * l.size ? "cross" : "two";
+    // 栏间距可能只有一个字宽（LaTeX 默认 10pt）：两端对齐的词间距通常小于 0.8 个字宽
+    return gap < 0.8 * l.size ? "cross" : "two";
   }
   return left.length ? "L" : "R";
 }
@@ -819,7 +965,7 @@ function classify(l: Line, x: number): LineSide {
  * 之后按行的纵向顺序切带：不跨越栏间距、且含至少 2 行"两侧都有文字"的连续行才算分栏带，
  * 这样页首的通栏标题/摘要与下面的双栏正文可以共存于同一页。
  */
-function detectGutter(lines: Line[], r: Region): { g0: number; g1: number; x: number } | null {
+export function detectGutter(lines: Line[], r: Region): { g0: number; g1: number; x: number } | null {
   if (lines.length < 6) return null;
   const W = r.x1 - r.x0;
   // 逐点打分：左侧整行都在 x 左边的"长行"数、右侧整行都在 x 右边的"长行"数取较小者，减去跨越 x 的行数。
@@ -868,7 +1014,11 @@ function detectGutter(lines: Line[], r: Region): { g0: number; g1: number; x: nu
 export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; raster?: boolean } = {}): DocModel {
   // 识别渲染区域时会从页面中移除元素：在副本上进行，原始提取结果保持不变（用于完整性校验、失败时回退）
   const pages = opts.raster ? pages0.map((p) => ({ ...p })) : pages0;
-  const ctx: Ctx = { mode: opts.mode ?? "exact", spacing: new Map() };
+  const allText = pages0.map((p) => p.spans.map((s) => s.text).join(" ")).join("\n");
+  const ctx: Ctx = { mode: opts.mode ?? "exact", spacing: new Map(), words: collectWords(allText), hyphenated: new Set(), counts: wordCounts(allText), softHyphens: 0 };
+  // 行尾断开的写法不算"本身带连字符"：只收集行中间出现的
+  ctx.hyphenated = collectHyphenated(pages0.map((p) => p.spans.map((s) => s.text.replace(/[A-Za-z]+-\s*$/, "")).join(" ")).join("\n"));
+  const flow = ctx.mode === "flow";
   const pageW = pages[0]?.width ?? 595, pageH = pages[0]?.height ?? 842;
 
   // 正文字号 / 字体（按字符数的众数）：用于识别图注、公式
@@ -892,6 +1042,19 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
       const tb: Box[] = t0.tables.map((t) => ({ x0: t.x0, y0: t.y0, x1: t.x1, y1: t.y1 }));
       tb.push(...detectRuledTables(pg, t0.used, new Set(t0.tables.flatMap((t) => t.spans))).map((t) => ({ x0: t.x0, y0: t.y0, x1: t.x1, y1: t.y1 })));
       figures = detectFigures(pg, mathCtx.bodySize, tb);
+      figures.push(...detectImageGrids(pg, mathCtx.bodySize));
+      // 带文字标注的位图（子图编号 (a)(b)…、坐标轴文字压在图片上）：连同标注整体渲染成一张图，
+      // 否则标注会被当成正文、图片被当成"文字下方的底图"
+      for (const im of [...pg.images]) {
+        if (im.render) continue;
+        const over = pg.spans.filter((s) => s.x1 > im.x0 && s.x0 < im.x1 && s.bottom > im.y0 && s.top < im.y1);
+        if (!over.length) continue;
+        const inside = over.every((s) => s.x0 >= im.x0 - 2 && s.x1 <= im.x1 + 2 && s.top >= im.y0 - 2 && s.bottom <= im.y1 + 2);
+        const chars = over.reduce((n, s) => n + s.text.replace(/\s/g, "").length, 0);
+        if (!inside || chars > 300) continue;
+        const gone = removeInside(pg, im);
+        figures.push(rasterBox({ x0: im.x0, y0: im.y0, x1: im.x1, y1: im.y1 }, pg.index, "figure", spansText(gone)));
+      }
       for (const f of figures) if (f.alt) rasterText.push(f.alt);
       figureCount += figures.length;
     }
@@ -925,17 +1088,19 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
 
   const blocks: Block[] = [];
   const stats = { pages: pages.length, paragraphs: 0, tables: 0, images: 0, vectorShapes: 0, rotatedText: 0, columnPages: 0, figures: 0, equations: 0 };
-  let curSection: SectionProps = { cols: 1, colWidths: [right - left], colGap: 0 };
+  let curSection: SectionProps = { cols: 1, colWidths: [right - left], colGap: 0, titlePg: flow };
+  let curPage = 0;
+  const sectKey = (x: SectionProps) => JSON.stringify([x.cols, x.colWidths, x.colGap]);
 
   // 分节：以一个极小段落承载上一节的属性；返回占用的高度，计入纵向位置
   let freshPage = false;
   const endSection = (next: SectionProps): number => {
     // 分栏节不跨页延续：每页的第一个分栏带都另起一节（跨页延续时，右栏顶部的段前距在部分排版引擎中会丢失）
-    const force = freshPage && next.cols > 1;
+    const force = !flow && freshPage && next.cols > 1;
     freshPage = false;
-    if (!force && JSON.stringify(next) === JSON.stringify(curSection)) return 0;
+    if (!force && sectKey(next) === sectKey(curSection)) return 0;
     blocks.push(tinyPara({ sectionEnd: curSection }));
-    curSection = next;
+    curSection = { ...next, titlePg: flow && curPage === 0 };
     return TINY;
   };
 
@@ -960,6 +1125,13 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
     }
     return out;
   });
+  // 流式模式：只有在多页重复出现的（页眉、页码、刊名卷期）才写进页眉页脚；只在一页出现的栏底标题、正文末行等放回正文
+  if (flow && pages.length > 1) {
+    const norm = (l: Line) => l.spans.map((sp) => sp.text).join(" ").replace(/\d+/g, "#").replace(/\s+/g, " ").trim();
+    const seen = new Map<string, Set<number>>();
+    floating.forEach((ls, i) => { for (const l of ls) { const k = norm(l); if (!seen.has(k)) seen.set(k, new Set()); seen.get(k)!.add(i); } });
+    floating.forEach((ls, i) => { floating[i] = ls.filter((l) => (seen.get(norm(l))?.size ?? 0) >= 2); });
+  }
   pageLines.forEach((ls, i) => {
     const f = new Set(floating[i]);
     pageLines[i] = ls.filter((l) => !f.has(l));
@@ -985,59 +1157,118 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
     });
   }
 
+  // 流式模式：上下边距按正文（不含页眉页脚）计算，页眉页脚写进真正的页眉页脚部件
+  let mTop = marginTop, mBottom = marginBottom;
+  let headerDist: number | undefined, footerDist: number | undefined;
+  if (flow) {
+    const bt: number[] = [], bb: number[] = [], ht: number[] = [], fb: number[] = [];
+    pre.forEach(({ pg, tables, figures }, i) => {
+      const ls = pageLines[i];
+      const pics = [...pg.images.filter((im) => !im.behind && im.y0 > pg.height * 0.1 && im.y1 < pg.height * 0.9), ...figures];
+      const ys = [...ls.map((l) => l.top), ...tables.map((t) => t.y0), ...pics.map((f) => f.y0)];
+      const ye = [...ls.map((l) => l.bottom), ...tables.map((t) => t.y1), ...pics.map((f) => f.y1)];
+      if (ys.length) bt.push(Math.min(...ys));
+      if (ye.length) bb.push(Math.max(...ye));
+      for (const l of floating[i]) if (l.top < pg.height / 2) ht.push(l.top); else fb.push(l.bottom);
+    });
+    mTop = Math.max(9, (bt.length ? Math.min(...bt) : 72) - 2);
+    mBottom = Math.max(9, pageH - (bb.length ? Math.max(...bb) : pageH - 72) - 2);
+    if (ht.length) headerDist = Math.max(4, Math.min(...ht) - 1);
+    if (fb.length) footerDist = Math.max(4, pageH - Math.max(...fb) - 1);
+  }
+  // 流式模式：每页的页眉页脚文字由页眉页脚部件（含页码域）统一表示，计入完整性校验
+  if (flow) for (const fl of floating) for (const l of fl) rasterText.push(l.spans.map((sp) => sp.text).join(""));
+  // 全文正文的上下界（按页统计会被"整页大图 + 一行图注"的页面误导）
+  const allBody = pageLines.flat();
+  const bodyTop = allBody.length ? Math.min(...allBody.map((l) => l.top)) : 0;
+  const bodyBottom = allBody.length ? Math.max(...allBody.map((l) => l.bottom)) : pageH;
+  /** 每页的页眉 / 页脚行（流式模式） */
+  const hf: Array<{ head: Line[]; foot: Line[]; imgs: ImageBox[]; mid: number }> = [];
+  /** 首页栏底的注释（作者单位、基金等）：流式模式下放进首页页脚，正文增减时位置不变 */
+  let notes: Para[] = [];
+  let notesBottom = 0;
+
   for (const [pi, { pg, tables, free, rules, figures }] of pre.entries()) {
+    curPage = pi;
     stats.images += pg.images.length;
     // 与文字重叠的图片（水印、底图）放在文字下方
-    for (const img of pg.images) img.behind = pg.spans.some((s) => s.x1 > img.x0 && s.x0 < img.x1 && s.bottom > img.y0 && s.top < img.y1);
+    // 文字真正压在图片上（文字中心落在图片内部）才算底图；只是边缘相接的（作者照片旁边的简介）不算
+    for (const img of pg.images) img.behind = pg.spans.some((s) => {
+      const cx = (s.x0 + s.x1) / 2, cy = (s.top + s.bottom) / 2;
+      return s.text.trim() && cx > img.x0 + 2 && cx < img.x1 - 2 && cy > img.y0 + 2 && cy < img.y1 - 2;
+    });
     stats.vectorShapes += pg.vectorShapes;
     stats.rotatedText += pg.rotatedText;
     stats.tables += tables.length;
 
-    // 页首锚点段落：承载本页的浮动图片与页眉页脚文本框，并负责分页
-    // 表格之外的线条与色块：作为绝对定位的图形放在页首锚点段落上（不占文字流，位置与原文完全一致）
-    const inTableArea = (x0: number, y0: number, x1: number, y1: number) =>
-      tables.some((t) => x0 >= t.x0 - 2 && x1 <= t.x1 + 2 && y0 >= t.y0 - 2 && y1 <= t.y1 + 2);
-    const shapes: NonNullable<Para["shapes"]> = [];
-    for (const h of rules) shapes.push({ kind: "line", x0: h.x0, y0: h.y, x1: h.x1, y1: h.y, width: h.w, color: h.color, behind: false });
-    const usedV = new Set(tables.flatMap((t) => t.vs.flatMap((v) => v.src)));
-    for (const v of mergeV(pg.segs.filter((sg) => !sg.horizontal && !usedV.has(sg)))) {
-      if (v.y1 - v.y0 >= 8 && !inTableArea(v.x - 1, v.y0, v.x + 1, v.y1)) shapes.push({ kind: "line", x0: v.x, y0: v.y0, x1: v.x, y1: v.y1, width: v.w, color: v.color, behind: false });
-    }
-    for (const f of pg.fills) {
-      if (inTableArea(f.x0, f.y0, f.x1, f.y1)) continue;
-      shapes.push({ kind: "rect", x0: f.x0, y0: f.y0, x1: f.x1, y1: f.y1, width: 0, color: f.color, behind: true });
-    }
-    const anchor = tinyPara({ pageBreakBefore: pg.index > 0, images: [...pg.images, ...figures], textBoxes: [], shapes });
-    freshPage = true;
-    blocks.push(anchor);
-    let cursor = marginTop + TINY;
-    // 页眉页脚：每一段（按大间距切开）一个绝对定位的文字框
-    for (const l of floating[pi]) {
-      const groups: Span[][] = [];
-      for (const sp of l.spans) {
-        const g = groups[groups.length - 1];
-        if (g && sp.x0 - g[g.length - 1].x1 < 3 * l.size) g.push(sp);
-        else groups.push([sp]);
-      }
-      for (const g of groups) {
-        const gl = finishLine(g);
-        const w = gl.x1 - gl.x0 + 6;
-        const p = buildPara([gl], { x0: gl.x0, x1: gl.x0 + w }, gl.x0 + w, ctx);
-        p.align = "left"; p.indLeft = 0; p.indRight = 0; p.firstLine = 0; p.tabs = [];
-        const lh = gl.size * 1.17;
-        p.lineHeight = lh;
-        anchor.textBoxes!.push({ x: gl.x0, y: gl.baseline - baselineOffset(lh, gl.size), w, h: lh, para: p });
-      }
-    }
-
     const lines = pageLines[pi];
     const gutter = gutters[pi];
+    // 正文的上下界：之外（页眉页脚区域）的图形、图片属于页面装饰，以页面绝对坐标定位
+    const inMarginZone = (y0: number, y1: number) => y1 <= bodyTop + 1 || y0 >= bodyBottom - 1;
 
-    // 条目：行 / 表格 / 分隔线，按纵向位置排序后切成"通栏带"与"分栏带"
+    // 页首锚点段落：承载本页的浮动图片与页眉页脚文本框，并负责分页（逐页一致模式）
+    // 表格之外的线条与色块：作为绝对定位的图形放在页首锚点段落上（不占文字流，位置与原文完全一致）
+    // 流式模式：正文区域的横线改为段落边框（随文字移动），竖线、色块等装饰只保留首页页眉页脚区域的
+    const inTableArea = (x0: number, y0: number, x1: number, y1: number) =>
+      tables.some((t) => x0 >= t.x0 - 2 && x1 <= t.x1 + 2 && y0 >= t.y0 - 2 && y1 <= t.y1 + 2);
+    const keepShape = (y0: number, y1: number) => !flow || (pi === 0 && inMarginZone(y0, y1));
+    const shapes: NonNullable<Para["shapes"]> = [];
+    const ruleSegs: HSeg[] = [];
+    for (const h of rules) {
+      if (flow && !inMarginZone(h.y, h.y)) ruleSegs.push(h);
+      else if (keepShape(h.y, h.y)) shapes.push({ kind: "line", x0: h.x0, y0: h.y, x1: h.x1, y1: h.y, width: h.w, color: h.color, behind: false });
+    }
+    const usedV = new Set(tables.flatMap((t) => t.vs.flatMap((v) => v.src)));
+    for (const v of mergeV(pg.segs.filter((sg) => !sg.horizontal && !usedV.has(sg)))) {
+      if (v.y1 - v.y0 >= 8 && !inTableArea(v.x - 1, v.y0, v.x + 1, v.y1) && keepShape(v.y0, v.y1)) shapes.push({ kind: "line", x0: v.x, y0: v.y0, x1: v.x, y1: v.y1, width: v.w, color: v.color, behind: false });
+    }
+    for (const f of pg.fills) {
+      if (inTableArea(f.x0, f.y0, f.x1, f.y1) || !keepShape(f.y0, f.y1)) continue;
+      shapes.push({ kind: "rect", x0: f.x0, y0: f.y0, x1: f.x1, y1: f.y1, width: 0, color: f.color, behind: true });
+    }
+    const anchor = tinyPara({ pageBreakBefore: !flow && pg.index > 0, images: pg.images.filter((im) => im.behind), textBoxes: [], shapes });
+    freshPage = true;
+    const anchorAt = blocks.length;
+    blocks.push(anchor);
+    let cursor = (flow ? mTop : marginTop) + TINY;
+    if (flow) {
+      hf.push({ head: floating[pi].filter((l) => l.top < pg.height / 2), foot: floating[pi].filter((l) => l.top >= pg.height / 2), imgs: [], mid: pg.height / 2 });
+    } else {
+      // 页眉页脚：每一段（按大间距切开）一个绝对定位的文字框
+      for (const l of floating[pi]) {
+        const groups: Span[][] = [];
+        for (const sp of l.spans) {
+          const g = groups[groups.length - 1];
+          if (g && sp.x0 - g[g.length - 1].x1 < 3 * l.size) g.push(sp);
+          else groups.push([sp]);
+        }
+        for (const g of groups) {
+          const gl = finishLine(g);
+          const w = gl.x1 - gl.x0 + 6;
+          const p = buildPara([gl], { x0: gl.x0, x1: gl.x0 + w }, gl.x0 + w, ctx);
+          p.align = "left"; p.indLeft = 0; p.indRight = 0; p.firstLine = 0; p.tabs = [];
+          const lh = gl.size * 1.17;
+          p.lineHeight = lh;
+          anchor.textBoxes!.push({ x: gl.x0, y: gl.baseline - baselineOffset(lh, gl.size), w, h: lh, para: p });
+        }
+      }
+    }
+
+    // 条目：行 / 表格 / 分隔线 / 图片，按纵向位置排序后切成"通栏带"与"分栏带"
     type Item = PageItem;
     const items: Array<Item & { top: number }> = [];
     // 行的类型：跨栏 / 两侧 / 仅左 / 仅右；连续的非跨栏行里至少有 2 行"两侧"才算分栏带
     const kinds = lines.map((l) => (gutter ? classify(l, gutter.x) : "cross"));
+    // 通栏段落的末行（图题、摘要的最后一行很短，只落在左半边）：与上一行行距相同、左端对齐或同样居中 → 仍属通栏
+    for (let i = 1; i < lines.length; i++) {
+      if (kinds[i] === "cross" || kinds[i] === "two" || kinds[i - 1] !== "cross") continue;
+      const l = lines[i], p = lines[i - 1];
+      const pitch = l.baseline - p.baseline;
+      const sameStyle = Math.abs(l.size - p.size) < 0.3;
+      const aligned = Math.abs(l.x0 - p.x0) < 2 || Math.abs((l.x0 + l.x1) / 2 - (p.x0 + p.x1) / 2) < 3;
+      const nextGap = lines[i + 1] ? lines[i + 1].baseline - l.baseline : Infinity;
+      if (sameStyle && aligned && pitch > 0.9 * l.size && pitch < 1.4 * l.size && nextGap > pitch + 0.5) kinds[i] = "cross";
+    }
     // 分栏行的判定：按"跨栏行"与大的纵向空白把行切成若干段；一段属于分栏区域，当且仅当
     //   段内至少 2 行两侧都有文字，或者至少 2 行恰好止于栏的右边界（两端对齐的栏内正文，如图下方只有一栏有字的区域）。
     // 通栏的标题、摘要末行等短行不会被误切进分栏节里，段落也不会被拆散。
@@ -1056,13 +1287,19 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
         const segTop = Math.min(...seg.map((l) => l.top)), segBottom = Math.max(...seg.map((l) => l.bottom));
         // 或者紧挨着栏内的表格/图（两栏表题并排、表题与表格之间没有跨栏内容）
         const onlySide = ks.every((k) => k === "L") ? "L" : ks.every((k) => k === "R") ? "R" : null;
-        const facing = [...tables, ...figures].some((t) => {
+        const facing = [...tables, ...figures, ...pg.images.filter((im) => !im.render)].some((t) => {
           const side = t.x1 <= gutter.x + 2 ? "L" : t.x0 >= gutter.x - 2 ? "R" : "full";
           if (side === "full") return false;
           if (onlySide && side !== onlySide) return t.y0 < segBottom + 6 && t.y1 > segTop - 6;
+          // 栏内图表紧挨着的题注（在图下方或表上方）：属于这一栏
+          if (onlySide && side === onlySide) return (segTop - t.y1 > -2 && segTop - t.y1 < 18) || (t.y0 - segBottom > -2 && t.y0 - segBottom < 18);
           return !onlySide && t.y0 < segBottom + 12 && t.y1 > segTop - 12;
         });
-        if (two >= 2 || edge >= 2 || both || facing) for (let k = i; k < j; k++) colLine[k] = true;
+        // 只有一栏有文字、且像栏内正文（有接近整栏宽的行）：例如最后一页左栏剩下的几行
+        const colW = (gutter.g0 - left);
+        const sideBody = !!onlySide && seg.length >= 3 && seg.every((l) => l.size <= mathCtx.bodySize * 1.15) &&
+          seg.filter((l) => l.x1 - l.x0 > 0.85 * colW).length >= 2 && seg.every((l) => l.x1 - l.x0 < 1.05 * colW);
+        if (two >= 2 || edge >= 2 || both || facing || sideBody) for (let k = i; k < j; k++) colLine[k] = true;
         i = j;
       }
     }
@@ -1074,17 +1311,32 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
     });
     for (const l of buildLines(leftSpans)) items.push({ kind: "line", line: l, side: "L", top: l.top });
     for (const l of buildLines(rightSpans)) items.push({ kind: "line", line: l, side: "R", top: l.top });
-    // 表格、分隔线：完全落在某一栏内的归入该栏，否则为通栏
+    // 表格、分隔线、图片：完全落在某一栏内的归入该栏，否则为通栏
     const sideOf = (x0: number, x1: number): "full" | "L" | "R" =>
       !gutter ? "full" : x1 <= gutter.x + 2 ? "L" : x0 >= gutter.x - 2 ? "R" : "full";
+    const regionOf = (side: "full" | "L" | "R"): Region =>
+      side === "full" || !gutter ? { x0: left, x1: right } : side === "L" ? { x0: left, x1: gutter.g0 } : { x0: gutter.g1, x1: right };
     for (const t of tables) items.push({ kind: "table", t, side: sideOf(t.x0, t.x1), top: t.y0 });
 
-    // 行间公式、首字下沉：按区域识别，渲染为图片贴回原位，从文字流中移除
+    // 旁边有文字的图片（流式模式）：挂在段落上、文字环绕；旁边那几行的缩进由环绕产生，行本身改为从栏边界起排
+    const floatBeside = (img: ImageBox, side: "full" | "L" | "R", besideLines: Array<Extract<Item, { kind: "line" }> & { top: number }>) => {
+      const reg = regionOf(side);
+      for (const it of besideLines) it.line = it.line.x0 >= img.x1 - 6 ? { ...it.line, x0: reg.x0 } : { ...it.line, x1: reg.x1 };
+      items.push({ kind: "float", img, side, top: img.y0 - 0.01 });
+    };
+    const besideOf = (img: { x0: number; y0: number; x1: number; y1: number }, side: "full" | "L" | "R") =>
+      items.filter((it): it is Extract<Item, { kind: "line" }> & { top: number } =>
+        it.kind === "line" && (side === "full" || it.side === side || it.side === "full") &&
+        it.line.bottom > img.y0 + 2 && it.line.top < img.y1 - 2 && (it.line.x0 >= img.x1 - 6 || it.line.x1 <= img.x0 + 6));
+
+    // 行间公式、首字下沉：按区域识别，渲染为图片，从文字流中移除
+    //   公式：独占一段的行内图片（随文字流移动，正文增减时不会与文字重叠）；
+    //   首字下沉：逐行一致模式按页面坐标定位，流式模式挂在段落上、文字环绕
+    const rasters: Box[] = [];
     if (opts.raster) {
       const extra: Box[] = [...pg.segs, ...pg.fills, ...pg.paths];
-      const rasters: Box[] = [];
       for (const side of ["full", "L", "R"] as const) {
-        const reg = side === "full" || !gutter ? { x0: left, x1: right } : side === "L" ? { x0: left, x1: gutter.g0 } : { x0: gutter.g1, x1: right };
+        const reg = regionOf(side);
         const sideLines = items.filter((it): it is Extract<typeof it, { kind: "line" }> & { top: number } => it.kind === "line" && it.side === side).map((it) => it.line);
         if (!sideLines.length) continue;
         const found = [
@@ -1097,21 +1349,92 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
             const it = items[k];
             if (it.kind === "line" && gone.has(it.line)) items.splice(k, 1);
           }
-          // 公式前后的文字不能被并成同一段
-          items.push({ kind: "break", side, top: f.box.y0 + 0.01 });
           const alt = spansText(f.lines.flatMap((l) => l.spans));
           if (alt) rasterText.push(alt);
-          anchor.images!.push(rasterBox(f.box, pg.index, f.kind, alt));
+          const box = rasterBox(f.box, pg.index, f.kind, alt);
+          if (f.kind === "equation") {
+            items.push({ kind: "image", imgs: [box], side, top: f.box.y0 });
+            equationCount++;
+          } else if (flow) {
+            floatBeside(box, side, besideOf(f.box, side));
+          } else {
+            // 首字下沉前后的文字不能被并成同一段
+            items.push({ kind: "break", side, top: f.box.y0 + 0.01 });
+            anchor.images!.push(box);
+          }
           rasters.push(f.box);
-          if (f.kind === "equation") equationCount++;
         }
       }
       if (rasters.length) {
         const within = (x0: number, y0: number, x1: number, y1: number) => rasters.some((r) => x0 >= r.x0 - 1 && x1 <= r.x1 + 1 && y0 >= r.y0 - 1 && y1 <= r.y1 + 1);
         anchor.shapes = anchor.shapes!.filter((sh) => !within(Math.min(sh.x0, sh.x1), Math.min(sh.y0, sh.y1), Math.max(sh.x0, sh.x1), Math.max(sh.y0, sh.y1)));
+        for (let k = ruleSegs.length - 1; k >= 0; k--) if (within(ruleSegs[k].x0, ruleSegs[k].y, ruleSegs[k].x1, ruleSegs[k].y)) ruleSegs.splice(k, 1);
       }
     }
+    // 流式模式：正文区域的横线 → 段落边框
+    for (const h of ruleSegs) items.push({ kind: "rule", h, side: sideOf(h.x0, h.x1), top: h.y });
+
+    // 图片（照片、矢量图）：
+    //   - 页眉页脚区域的（徽标等）：页面绝对坐标；
+    //   - 旁边有文字的：逐行一致模式用页面绝对坐标，流式模式挂在段落上、文字环绕；
+    //   - 其余：独占一段的行内图片，并排的几张放在同一段里
+    const pics = [...pg.images.filter((im) => !im.behind), ...figures].sort((a, b) => a.y0 - b.y0);
+    const rest: ImageBox[] = [];
+    for (const img of pics) {
+      const side = sideOf(img.x0, img.x1);
+      // 流式模式：页眉页脚区域的图片（徽标）写进页眉页脚，每页都在原位置，不随正文移动
+      if (inMarginZone(img.y0, img.y1)) { (flow ? hf[pi].imgs : anchor.images!).push(img); continue; }
+      const beside = besideOf(img, side);
+      if (beside.length) {
+        if (flow) floatBeside(img, side, beside);
+        else anchor.images!.push(img);
+        continue;
+      }
+      rest.push(img);
+    }
+    const groups: ImageBox[][] = [];
+    for (const img of rest) {
+      const g = groups.find((gr) => gr.some((o) => sideOf(o.x0, o.x1) === sideOf(img.x0, img.x1) &&
+        Math.min(o.y1, img.y1) - Math.max(o.y0, img.y0) > 0.5 * Math.min(o.y1 - o.y0, img.y1 - img.y0)));
+      if (g) g.push(img); else groups.push([img]);
+    }
+    for (const g of groups) {
+      const overlap = g.some((a, i) => g.some((b, j) => j > i && Math.min(a.x1, b.x1) - Math.max(a.x0, b.x0) > 2));
+      if (overlap) { anchor.images!.push(...g); continue; } // 互相叠放的图片：保持页面绝对坐标
+      const x0 = Math.min(...g.map((i) => i.x0)), x1 = Math.max(...g.map((i) => i.x1));
+      items.push({ kind: "image", imgs: g, side: sideOf(x0, x1), top: Math.min(...g.map((i) => i.y0)) });
+    }
     items.sort((a, b) => a.top - b.top);
+
+    // 首页栏底的注释（流式模式）：栏内最后几行字号小于正文、上方有空白或短横线隔开 → 移到首页页脚
+    if (flow && pi === 0) {
+      for (const side of ["L", "R", "full"] as const) {
+        const own = items.filter((it) => it.side === side);
+        let k = own.length;
+        const small = (it: Item) => it.kind === "line" && it.line.size <= mathCtx.bodySize * 0.92;
+        while (k > 0 && small(own[k - 1])) k--;
+        if (k === own.length || k === 0) continue;
+        const first = own[k] as Extract<Item, { kind: "line" }> & { top: number };
+        const prev = own[k - 1];
+        if (first.line.top < pg.height * 0.65 || /^(fig(ure)?|table|图|表)\b/i.test(spansText(first.line.spans))) continue;
+        let start = k;
+        if (prev.kind === "rule") start = k - 1;
+        else if (!(prev.kind === "line" && first.line.top - prev.line.bottom > 0.8 * first.line.size)) continue;
+        const moved = own.slice(start);
+        for (const it of moved) items.splice(items.indexOf(it), 1);
+        const reg = regionOf(side);
+        const out = layoutItems(moved, reg, moved[0].top - 0.01, [], ctx);
+        for (const b of out.blocks) {
+          if (b.kind !== "p") continue;
+          b.indLeft += reg.x0 - left;
+          b.indRight += right - reg.x1;
+          b.tabs = b.tabs.map((t) => ({ ...t, pos: t.pos + reg.x0 - left }));
+          if (!notes.length && b === out.blocks[0]) b.spaceBefore = 0;
+          notes.push(b);
+        }
+        notesBottom = Math.max(notesBottom, ...moved.map((it) => (it.kind === "line" ? it.line.bottom : it.top)));
+      }
+    }
 
     // 通栏条目把页面切成若干带；分栏条目只有在两侧都有内容的区域才构成分栏带
     const bands: Array<{ cols: boolean; items: typeof items }> = [];
@@ -1122,26 +1445,45 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
       else bands.push({ cols, items: [it] });
     }
     if (bands.some((b) => b.cols)) stats.columnPages++;
+    // 流式模式：每页的第一块紧接上一页的内容，不保留页面顶部的空白
+    if (flow && pi > 0 && items.length) cursor = items[0].top;
+    const pageFirst = blocks.length;
 
     for (const band of bands) {
       if (!band.cols) {
         cursor += endSection({ cols: 1, colWidths: [right - left], colGap: 0 });
         const out = layoutItems(band.items, body, cursor, pg.fills, ctx);
+        if (flow) markRegion(out.blocks);
         blocks.push(...out.blocks);
         cursor = out.cursor;
       } else {
         const g = gutter!;
         const lw = g.g0 - left + 0.3, rw = right - g.g1 + 0.3;
+        if (flow) {
+          // 两栏共同的上方空白放在分节之前（单栏节里的空段），左右两栏的顶部对齐
+          const gap = Math.min(...band.items.map((i) => i.top)) - cursor - 3;
+          if (gap > 2) { blocks.push(spacer(gap)); cursor += gap; }
+        }
         cursor += endSection({ cols: 2, colWidths: [Math.round(lw * 2) / 2, Math.round(rw * 2) / 2], colGap: Math.round((g.g1 - g.g0 - 0.6) * 2) / 2 });
         const start = cursor;
         const L = layoutItems(band.items.filter((i) => i.side === "L"), { x0: left, x1: left + lw, overhang: Math.max(0, g.g1 - g.g0 - 4) }, start, pg.fills, ctx);
-        const R = layoutItems(band.items.filter((i) => i.side === "R"), { x0: g.g1 - 0.3, x1: right, overhang: body.overhang }, start, pg.fills, ctx);
+        // 流式模式：右栏紧接左栏排（同一个分栏节内连续流动），段前距从本带顶部算起
+        const rStart = flow ? Math.min(...band.items.map((i) => i.top)) : start;
+        const R = layoutItems(band.items.filter((i) => i.side === "R"), { x0: g.g1 - 0.3, x1: right, overhang: body.overhang }, rStart, pg.fills, ctx);
+        if (flow) {
+          markRegion(L.blocks);
+          markRegion(R.blocks);
+          blocks.push(...L.blocks, ...R.blocks);
+          cursor = Math.max(L.cursor, R.cursor);
+          continue;
+        }
         // 段前距统一改为"固定高度的空段"：
         //   - LibreOffice 把分栏节第一段的段前距放在栏区域之上（右栏顶部随之下移），分栏符后的段前距则被吞掉；
         //   - Word 则保留两者。空段的行高在两种排版引擎中都不会被压缩，位置一致。
+        const hoistable = (f: Block | undefined): f is Para => f?.kind === "p" && (!f.tiny || !!f.inlineImages) && f.spaceBefore > 0.5;
         const hoist = (bs: Block[], lead: Para[]) => {
           const f = bs[0];
-          if (f?.kind === "p" && !f.tiny && f.spaceBefore > 0.5) {
+          if (hoistable(f)) {
             lead.push(spacer(f.spaceBefore - (lead.length ? TINY : 0)));
             f.spaceBefore = 0;
           }
@@ -1151,13 +1493,37 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
         if (R.blocks.length) {
           // 右栏：先放一个承载分栏符的极小段落，再放占位空段与右栏内容
           const lead = [tinyPara({ columnBreakBefore: true })];
-          const f = R.blocks[0];
-          blocks.push(...(f.kind === "p" && !f.tiny && f.spaceBefore > 0.5 ? hoist(R.blocks, lead) : [...lead, ...R.blocks]));
+          blocks.push(...(hoistable(R.blocks[0]) ? hoist(R.blocks, lead) : [...lead, ...R.blocks]));
           R.cursor += TINY;
         }
         cursor = Math.max(L.cursor, R.cursor);
       }
     }
+    // 流式模式：记下原 PDF 的分页位置
+    if (flow && pi > 0) {
+      const f = blocks.slice(pageFirst).find((b): b is Para => b.kind === "p" && (!b.tiny || !!b.inlineImages));
+      if (f) f.pageMark = true;
+    }
+    // 流式模式：没有挂任何东西的页首锚点段落不需要
+    if (flow && !anchor.images!.length && !anchor.shapes!.length && !anchor.textBoxes!.length) blocks.splice(anchorAt, 1);
+  }
+
+  // 流式模式：合并被分栏、分页切断的段落（左栏末段 + 右栏首段、上一页末段 + 下一页首段）
+  if (flow) mergeSplitParagraphs(blocks, ctx);
+  // 流式模式：表题与下面的表格 / 表格图片、图片与下面的图题保持在同一页
+  if (flow) {
+    const capRe = /^\s*((table|tab\.)\s*[\dIVXLC]+|TABLE\s+[IVXLC\d]+|表\s*\d+)/i, figRe = /^\s*((fig\.?|figure)\s*\d+|图\s*\d+)/i;
+    const real = blocks.filter((b) => !(b.kind === "p" && b.tiny && !b.inlineImages));
+    real.forEach((b, i) => {
+      const n = real[i + 1];
+      if (!n || b.kind !== "p") return;
+      const t = textOfPara(b);
+      const nIsObj = n.kind === "table" || (n.kind === "p" && !!n.inlineImages);
+      if (capRe.test(t) && nIsObj) b.keepNext = true;
+      if (b.inlineImages && n.kind === "p" && figRe.test(textOfPara(n))) b.keepNext = true;
+      // 题注分成了两段（第二段是题注的续行）
+      if ((capRe.test(t) || figRe.test(t)) && n.kind === "p" && !n.inlineImages && n.size === b.size && textOfPara(n).length < 200 && real[i + 2] && (real[i + 2].kind === "table" || (real[i + 2] as Para).inlineImages)) b.keepNext = (n as Para).keepNext = true;
+    });
   }
 
   // 字符间距：同一字体/字号/字形的样本中位数明显偏离 0 时应用（例如样式里设置了紧缩 0.1 磅）
@@ -1224,33 +1590,225 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
     if (k >= 0) p.heading = Math.min(3, k + 1);
   }
 
+  // 流式模式：页眉页脚
+  const hfOut = flow ? buildHeaders(hf, notes, notesBottom, { x0: left, x1: right }, right, ctx, headerDist ?? mTop / 2) : undefined;
+  // 去掉的排版断词连字符：计入完整性校验
+  if (ctx.softHyphens) rasterText.push("-".repeat(ctx.softHyphens));
+
   return {
     pageW, pageH,
-    margins: { top: marginTop, bottom: marginBottom, left, right: pageW - right },
+    margins: flow ? { top: mTop, bottom: mBottom, left, right: pageW - right } : { top: marginTop, bottom: marginBottom, left, right: pageW - right },
     blocks,
     finalSection: curSection,
     bodyFont, bodySize,
     stats: { ...stats, figures: figureCount, equations: equationCount },
     rasterText: rasterText.join("\n"),
+    mode: ctx.mode,
+    ...(hfOut ? { headers: hfOut.headers, footers: hfOut.footers, pageNumStart: hfOut.pageNumStart, headerDist, footerDist } : {}),
   };
 }
 
-type PageItem = { side: "full" | "L" | "R" } & ({ kind: "line"; line: Line } | { kind: "table"; t: TableDraft } | { kind: "rule"; h: HSeg } | { kind: "break" });
+const textOfPara = (p: Para) => p.runs.map((r) => (r.tab ? "\t" : r.text)).join("");
+
+/** 流式模式：合并被分栏、分页切断的段落 */
+function mergeSplitParagraphs(blocks: Block[], ctx: Ctx) {
+  const body = blocks.filter((b): b is Para => b.kind === "p" && !b.tiny && textOfPara(b).length > 40);
+  if (!body.length) return;
+  const sizeN = new Map<number, number>(), fontN = new Map<string, number>();
+  for (const p of body) {
+    sizeN.set(p.size, (sizeN.get(p.size) ?? 0) + 1);
+    const f = p.runs.find((r) => r.text.trim())?.font ?? "";
+    fontN.set(f, (fontN.get(f) ?? 0) + 1);
+  }
+  const bodySize = [...sizeN.entries()].sort((a, b) => b[1] - a[1])[0][0];
+  const bodyFont = [...fontN.entries()].sort((a, b) => b[1] - a[1])[0][0];
+  // 正文段落普遍首行缩进（如 IEEE）：栏首没有缩进的段落就是上一栏的延续
+  const indented = body.filter((p) => Math.abs(p.size - bodySize) < 0.3 && p.firstLine > 0.5 * p.size).length;
+  const indentStyle = indented >= 3 && indented >= 0.25 * body.length;
+
+  const canMerge = (a: Para, b: Para) => {
+    if (!a.lastFull || a.tabs.length || b.tabs.length || b.floats?.length) return false;
+    if (!(a.align === "both" || a.align === "left") || !(b.align === "both" || b.align === "left")) return false;
+    if (Math.abs(a.size - b.size) > 0.3 || Math.abs(b.firstLine) > 0.3 * b.size) return false;
+    if (isHeadingCandidate(a, bodySize, bodyFont) || isHeadingCandidate(b, bodySize, bodyFont)) return false;
+    const at = textOfPara(a).trimEnd(), bt = textOfPara(b).trimStart();
+    if (!at || !bt || BULLET.test(bt.split(/\s/)[0])) return false;
+    // 图题、表题自成一段（"TABLE V: …""Fig. 2: …"），不能并进上一段
+    if (/^((fig\.?|figure|table)\s*[\dIVXLC]+[a-z]?\s*[:.．：]|TABLE\s+[IVXLC\d]+\b|[图表]\s*\d+)/i.test(bt)) return false;
+    return indentStyle || !/[.!?。！？:：]["'”’)\]]?$/.test(at) || /^[a-z]/.test(bt);
+  };
+  const out: Block[] = [];
+  let last: Para | null = null;
+  for (const b of blocks) {
+    if (b.kind === "p" && b.tiny) {
+      if (b.sectionEnd || b.inlineImages || b.borderBottom) last = null;
+      out.push(b);
+      continue;
+    }
+    if (b.kind === "p" && last && b.regionStart && last.regionEnd && canMerge(last, b)) {
+      const tail = last.runs[last.runs.length - 1], head = b.runs[0];
+      if (tail && head && !tail.tab && !head.tab) {
+        tail.text = tail.text.replace(/\s+$/, "");
+        const ht = head.text.replace(/^\s+/, "");
+        if (/[A-Za-z]-$/.test(tail.text) && /^[A-Za-z]/.test(ht) && isSoftHyphen(tail.text.slice(0, -1), ht, ctx.words, ctx.hyphenated, ctx.counts)) {
+          tail.text = tail.text.slice(0, -1);
+          ctx.softHyphens++;
+        } else if (!/[-‐]$/.test(tail.text) && !(CJK.test(tail.text.slice(-1)) && CJK.test(ht[0] ?? ""))) tail.text += " ";
+        head.text = ht;
+      }
+      if (b.pageMark && head) last.runs.push({ ...head, text: "", pageMark: true });
+      last.runs.push(...b.runs.filter((r) => r.tab || r.text));
+      last.regionEnd = b.regionEnd;
+      last.lastFull = b.lastFull;
+      continue;
+    }
+    out.push(b);
+    last = b.kind === "p" ? b : null;
+  }
+  blocks.splice(0, blocks.length, ...out);
+}
+
+/** 流式模式：由每页的页眉页脚行生成首页 / 奇数页 / 偶数页的页眉页脚，页码改为 PAGE 域 */
+function buildHeaders(hf: Array<{ head: Line[]; foot: Line[]; imgs: ImageBox[]; mid: number }>, notes: Para[], notesBottom: number, body: Region, right: number, ctx: Ctx, headerTop: number):
+  { headers: HeaderSet; footers: HeaderSet; pageNumStart?: number } | undefined {
+  const n = hf.length;
+  if (!hf.some((x) => x.head.length || x.foot.length || x.imgs.length) && !notes.length) return undefined;
+  const lineText = (l: Line) => l.spans.map((s) => s.text).join(" ");
+  // 页码：印刷的数字 - 页序号 在多数页上一致
+  let pageNumStart: number | undefined;
+  if (n >= 2) {
+    const off = new Map<number, Set<number>>();
+    hf.forEach((x, i) => {
+      for (const l of [...x.head, ...x.foot]) for (const m of lineText(l).matchAll(/(?<![\d.,])\d{1,4}(?![\d.,]?\d)/g)) {
+        const k = Number(m[0]) - i;
+        if (!off.has(k)) off.set(k, new Set());
+        off.get(k)!.add(i);
+      }
+    });
+    const best = [...off.entries()].sort((a, b) => b[1].size - a[1].size)[0];
+    if (best && best[1].size >= Math.max(2, Math.ceil(n * 0.5))) pageNumStart = best[0];
+  }
+  const printed = (i: number) => i + (pageNumStart ?? 1);
+
+  const markPage = (p: Para, num: number) => {
+    const s = String(num);
+    const re = new RegExp(`(?<!\\d)${s}(?!\\d)`, "g");
+    let idx = p.runs.findIndex((r) => !r.tab && r.text.trim() === s);
+    let at = -1;
+    if (idx < 0) {
+      for (let k = p.runs.length - 1; k >= 0 && idx < 0; k--) {
+        const r = p.runs[k];
+        if (r.tab) continue;
+        const ms = [...r.text.matchAll(re)];
+        if (ms.length) { idx = k; at = ms[ms.length - 1].index!; }
+      }
+    } else at = p.runs[idx].text.indexOf(s);
+    if (idx < 0) return false;
+    const r = p.runs[idx];
+    const parts: Run[] = [];
+    if (at > 0) parts.push({ ...r, text: r.text.slice(0, at) });
+    parts.push({ ...r, text: s, field: "PAGE" });
+    if (at + s.length < r.text.length) parts.push({ ...r, text: r.text.slice(at + s.length) });
+    p.runs.splice(idx, 1, ...parts);
+    return true;
+  };
+  const mk = (ls: Line[], i: number, kind: "head" | "foot" = "head"): Para[] => {
+    const out = mkText(ls, i);
+    const imgs = (hf[i]?.imgs ?? []).filter((im) => (kind === "head") === ((im.y0 + im.y1) / 2 < hf[i].mid));
+    if (imgs.length) {
+      if (!out.length) out.push(tinyPara({}));
+      const host = out[0];
+      if (kind === "head") {
+        // 相对页边距 / 第一段顶部：浏览器预览按偏移量直接定位，与 Word 一致
+        const top = ls.length ? Math.min(...ls.map((l) => l.baseline - baselineOffset(l.size * 1.17, l.size))) : headerTop;
+        host.hfImages = imgs.map((img) => ({ img, dx: img.x0 - body.x0, dy: img.y0 - top }));
+      } else host.images = imgs;
+    }
+    return out;
+  };
+  const mkText = (ls: Line[], i: number): Para[] => {
+    const out: Para[] = [];
+    let cur: number | null = null;
+    for (const l of [...ls].sort((a, b) => a.top - b.top)) {
+      const p = buildPara([l], body, right, ctx);
+      p.lineHeight = Math.round(l.size * 1.17 * 20) / 20;
+      const top = l.baseline - baselineOffset(p.lineHeight, l.size);
+      p.spaceBefore = cur === null ? 0 : Math.max(0, top - cur);
+      cur = top + p.lineHeight;
+      if (pageNumStart !== undefined) markPage(p, printed(i));
+      delete p.lineFits;
+      out.push(p);
+    }
+    return out;
+  };
+  const imgSig = (p: Para) => [...(p.hfImages ?? []).map((h) => h.img), ...(p.images ?? [])].map((im) => `${Math.round(im.x0)},${Math.round(im.y0)},${Math.round(im.x1)},${Math.round(im.y1)}`).join(";");
+  const sigOf = (ps: Para[]) => ps.map((p) => `${p.align}|${p.tabs.map((t) => t.align + t.pos).join(",")}|${p.runs.map((r) => (r.field ? "#" : r.tab ? "\t" : r.text)).join("")}|${imgSig(p)}`).join("\n");
+  const sig = (i: number) => sigOf(mk(hf[i].head, i)) + "||" + sigOf(mk(hf[i].foot, i, "foot"));
+  const rest = [...Array(n).keys()].slice(1);
+  const odd = rest.filter((i) => printed(i) % 2 === 1), even = rest.filter((i) => printed(i) % 2 === 0);
+  // 每组取出现最多的页眉页脚（个别页面不同时以多数为准）
+  const sigs = new Map<number, string>();
+  const sigAt = (i: number) => { if (!sigs.has(i)) sigs.set(i, sig(i)); return sigs.get(i)!; };
+  const major = (ids: number[]) => {
+    const n = new Map<string, number[]>();
+    for (const i of ids) { const k = sigAt(i); if (!n.has(k)) n.set(k, []); n.get(k)!.push(i); }
+    return [...n.values()].sort((a, b) => b.length - a.length)[0]?.[0];
+  };
+  const oddRep = major(odd), evenRep = major(even);
+  const evenOdd = oddRep !== undefined && evenRep !== undefined && sigAt(oddRep) !== sigAt(evenRep);
+  const defPage = evenOdd ? oddRep! : major(rest) ?? 0;
+  const rep0 = evenOdd && printed(0) % 2 === 0 ? evenRep! : defPage;
+  const titlePg = notes.length > 0 || (n > 1 && sigAt(0) !== sigAt(rep0));
+  const headers: HeaderSet = { default: mk(hf[defPage].head, defPage) };
+  const footers: HeaderSet = { default: mk(hf[defPage].foot, defPage, "foot") };
+  if (evenOdd) { headers.even = mk(hf[evenRep!].head, evenRep!); footers.even = mk(hf[evenRep!].foot, evenRep!, "foot"); }
+  if (titlePg) {
+    headers.first = mk(hf[0].head, 0);
+    const f0 = mk(hf[0].foot, 0, "foot");
+    if (notes.length && f0.length && hf[0].foot.length) {
+      const top = Math.min(...hf[0].foot.map((l) => l.top));
+      f0[0].spaceBefore = Math.max(0, top - notesBottom - 2);
+    }
+    footers.first = [...notes, ...f0];
+  }
+  return { headers, footers, pageNumStart: pageNumStart !== undefined && pageNumStart !== 1 ? pageNumStart : undefined };
+}
+
+type PageItem = { side: "full" | "L" | "R" } & (
+  | { kind: "line"; line: Line }
+  | { kind: "table"; t: TableDraft }
+  | { kind: "rule"; h: HSeg }
+  | { kind: "break" }
+  /** 独占一段的行内图片（行间公式、图） */
+  | { kind: "image"; imgs: ImageBox[] }
+  /** 旁边有文字的图片：挂在紧随其后的那一行所在的段落上，文字环绕 */
+  | { kind: "float"; img: ImageBox }
+);
 
 /** 在一个区域（整页版心 / 某一栏）内按纵向顺序排布行、表格、分隔线 */
 function layoutItems(items: Array<PageItem & { top: number }>, r: Region, cursor: number, fills: FillRect[], ctx: Ctx): { blocks: Block[]; cursor: number } {
   const blocks: Block[] = [];
   let pending: Line[] = [];
+  const floats = new Map<Line, ImageBox[]>();
+  let waiting: ImageBox[] = [];
   const flush = () => {
     if (!pending.length) return;
-    const out = layoutLines(pending, r, cursor, ctx);
+    const out = layoutLines(pending, r, cursor, ctx, floats);
     blocks.push(...out.paras);
     cursor = out.cursor;
     pending = [];
   };
   for (const it of items) {
-    if (it.kind === "line") pending.push(it.line);
-    else if (it.kind === "break") flush();
+    if (it.kind === "line") {
+      if (waiting.length) { floats.set(it.line, waiting); waiting = []; }
+      pending.push(it.line);
+    } else if (it.kind === "float") waiting.push(it.img);
+    else if (it.kind === "image") {
+      flush();
+      const p = imagePara(it.imgs, r, cursor);
+      blocks.push(p);
+      cursor = Math.max(cursor, Math.min(...it.imgs.map((i) => i.y0))) + p.lineHeight;
+    } else if (it.kind === "break") flush();
     else if (it.kind === "table") {
       flush();
       const t = it.t;
@@ -1277,6 +1835,12 @@ function layoutItems(items: Array<PageItem & { top: number }>, r: Region, cursor
     }
   }
   flush();
+  // 后面没有文字可挂的浮动图片：改为独占一段
+  for (const img of waiting) {
+    const p = imagePara([img], r, cursor);
+    blocks.push(p);
+    cursor = Math.max(cursor, img.y0) + p.lineHeight;
+  }
   return { blocks, cursor };
 }
 

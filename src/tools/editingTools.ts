@@ -14,6 +14,11 @@ import { editTool, reason } from "./docTools.js";
 import { layoutDiagram, imageInfo, type ShapeSpec, type ChartSpec } from "../documents/docx/build.js";
 import { tableMarkdown, tableHtml, imageMarkup, shapesSvg, chartSvg, svgDataUri } from "./markup.js";
 import { shapesPng, chartPng } from "../services/fallbackImages.js";
+import { applyJournalLayout, describeJournalReport } from "../services/journalLayout.js";
+import { toPdfViaOffice, checkExternalTools } from "../services/convert.js";
+
+let officeProbe: Promise<boolean> | null = null;
+const officeAvailable = () => process.env.DOC_AGENT_NO_OFFICE === "1" ? Promise.resolve(false) : (officeProbe ??= checkExternalTools().then((t) => !!t.soffice).catch(() => false));
 
 const caps = (ctx: ToolUseContext) => ctx.session.doc.capabilities;
 const fmt = (ctx: ToolUseContext) => ctx.session.meta.format;
@@ -510,8 +515,51 @@ export const DocMoveBlocksTool = editTool({
   apply: (doc, i, ctx) => need(doc, "moveBlocks")(i, ctx.editOptions()),
 });
 
+export const DocJournalLayoutTool = buildTool({
+  name: "doc_journal_layout",
+  category: "edit",
+  description: () => `学术期刊排版（Word）：按期刊版面规则整体调整全文排版，修改内容后可以反复运行。
+- 宽于一栏的图、表占满整行（通栏、居中），放在页面顶部；栏宽的图表当前栏放得下就留在原处，放不下移到下一栏顶部；
+  文字继续排满当前页，不留大面积空白；
+- 图表不被打断：表格每行不跨页、整表与表题在同一页，图与图题不分离；
+- 栏底平齐：所有段距、标题、公式、栏内图表的高度凑成正文行距的整数倍（基线网格），左右两栏逐行对齐；关闭孤行控制；
+- 依据 LibreOffice 的实际分页结果定位（需要安装 LibreOffice，耗时约每个图表 3 秒）；没有 LibreOffice 时只做通栏、不跨页与网格对齐；
+- 只改版面（段距、行距、分节、图表位置），不改任何文字与字体字号；题注须以 Fig. 1: / Figure 1. / TABLE I / 图 1 / 表 1 开头才会被识别。
+用户说"按期刊格式排版""图表不要跨页""页面不要留白""两栏底部对齐"等时使用；运行前先加载 journal-layout 技能。`,
+  inputSchema: z.object({
+    floats: z.enum(["auto", "wide", "none"]).optional().describe("auto（默认）：通栏图表放页顶、栏内图表放不下移到下一栏顶；wide：只处理通栏图表；none：不移动图表"),
+    grid: z.boolean().optional().describe("基线网格，两栏逐行对齐（默认 true）"),
+    exact_lines: z.boolean().optional().describe("正文统一为固定行距（默认 true，网格才精确）"),
+    widow_control_off: z.boolean().optional().describe("关闭孤行控制（默认 true）"),
+    reason,
+  }),
+  userFacingName: () => "学术期刊排版",
+  isEnabled: (ctx) => ctx.session.meta.format === "docx",
+  isDestructive: () => false,
+  permissionContent: (i) => `按期刊版面规则调整全文排版（浮动体：${i.floats ?? "auto"}；网格：${i.grid === false ? "关" : "开"}）`,
+  async call(i, ctx) {
+    const doc = ctx.session.doc;
+    if (doc.convertedLayout?.() === "exact") {
+      return { content: "这份 Word 是 PDF 以「逐页保留原排版」方式转换的（每行硬换行、逐页固定分页），不能做期刊排版。请先用 doc_convert_to_word(layout=\"flow\") 转换为可编辑排版。", isError: true };
+    }
+    if (!doc.reload) return { content: "当前文档不支持整体排版。", isError: true };
+    const render = (await officeAvailable()) ? (b: Buffer) => toPdfViaOffice(b, "docx") : undefined;
+    const { data, report } = await applyJournalLayout(doc.serialize(), {
+      floats: i.floats, grid: i.grid, exactLines: i.exact_lines, widowOff: i.widow_control_off, render,
+    });
+    doc.reload(data);
+    const trackNote = ctx.session.meta.trackChanges ? "\n注意：修订模式已开启，但排版调整是全局版面操作，没有记录为逐条修订（可在版本历史中回滚）。" : "";
+    return {
+      content: `${describeJournalReport(report)}${trackNote}\n文档结构已变化：继续修改前请重新调用 doc_outline / doc_read 获取段落引用。修改内容后可再次运行本工具重新排版。`,
+      data: report,
+      docChange: { label: "学术期刊排版", changedRefs: [], structural: true },
+    };
+  },
+});
+
 export const EDITING_TOOLS: Tool[] = [
   DocInsertTableTool, DocEditTableTool, DocInsertImageTool, DocDrawTool, DocInsertDiagramTool, DocInsertChartTool,
   DocInsertEquationTool, DocInsertBreakTool, DocPageSetupTool, DocHeaderFooterTool, DocInsertTocTool, DocSetListTool,
   DocInsertFootnoteTool, DocInsertLinkTool, DocModifyStyleTool, DocReviewChangesTool, DocCommentsTool, DocMoveBlocksTool,
+  DocJournalLayoutTool,
 ] as Tool[];

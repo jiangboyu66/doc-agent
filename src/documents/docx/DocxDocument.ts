@@ -95,18 +95,33 @@ export class DocxDocument implements DocumentAdapter {
     if (this.paras) this.reindex();
   }
 
-  private pkg: ZipPackage;
+  private pkg!: ZipPackage;
   private parts = new Map<string, XDocument>();
   private prefixes = new Map<string, string>();
-  readonly mainPart: string;
+  mainPart!: string;
   private contentParts: string[] = [];
-  private styles: StyleSheet;
+  private styles!: StyleSheet;
   private stylesPart: string | null = null;
   private paras: ParaEntry[] = [];
   private byRef = new Map<string, ParaEntry>();
   private nextRevisionId = -1;
 
   constructor(buf: Buffer) {
+    this.load(buf);
+  }
+
+  /** 整体替换文档内容（排版类工具在文档副本上完成全局调整后写回）；结构版本递增，旧引用失效 */
+  reload(buf: Buffer): void {
+    this.parts.clear();
+    this.prefixes.clear();
+    this.snapshots.clear();
+    this.paras = [];
+    this.load(buf);
+    this._structureVersion++;
+    this.reindex();
+  }
+
+  private load(buf: Buffer): void {
     this.pkg = new ZipPackage(buf);
     const rootRels = parseRels(this.optText("_rels/.rels"));
     const main = rootRels.find((r) => r.type === REL_TYPES.officeDocument);
@@ -2523,6 +2538,15 @@ export class DocxDocument implements DocumentAdapter {
       if (doc.dirty) this.pkg.write(name, Buffer.from(serializeDocument(doc), "utf8"));
     }
     return this.pkg.toBuffer();
+  }
+
+  convertedLayout(): "exact" | "flow" | undefined {
+    const txt = (n: string) => (this.pkg.has(n) ? this.pkg.read(n).toString("utf8") : "");
+    const m = /name="DocAgentLayout"[^>]*>\s*<vt:lpwstr>(exact|flow)</.exec(txt("docProps/custom.xml"));
+    if (m) return m[1] as "exact" | "flow";
+    // 早期版本转换的文档没有自定义属性：按"PDF 转换"标记与逐页分页样式判断
+    if (txt("docProps/app.xml").includes("文案 Agent PDF 转换")) return txt(this.mainPart).includes('w:val="PageStart"') ? "exact" : "flow";
+    return undefined;
   }
 
   fidelity(original: Buffer): FidelityReport {

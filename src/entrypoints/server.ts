@@ -245,7 +245,8 @@ app.get("/api/sessions/:id/assets/:name", wrap(async (req, res) => {
 app.post("/api/sessions/:id/convert", wrap(async (req, res) => {
   const l = await getLive(String(req.params.id));
   const engine = ["builtin", "pdf2docx", "libreoffice"].includes(req.body?.engine) ? req.body.engine : "builtin";
-  const mode = req.body?.mode === "flow" ? "flow" : "exact";
+  // 转换后用于编辑：默认流式（文字增减时自动重排）；明确要求时才逐页固定
+  const mode = req.body?.mode === "exact" ? "exact" : "flow";
   if (req.body?.inPlace) {
     // 在当前会话内转换：对话保留，转换后直接继续编辑
     if (l.abort) throw new Error("Agent 正在运行，请等待完成或先中断。");

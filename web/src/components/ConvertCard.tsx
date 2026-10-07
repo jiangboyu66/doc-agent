@@ -35,7 +35,8 @@ export function ConvertCard({ sessionId, runtime, onDone }: { sessionId: string;
     setCollapsedState(v);
     try { localStorage.setItem(COLLAPSE_KEY, v ? "1" : "0"); } catch { /* 隐私模式等 */ }
   };
-  const [mode, setMode] = useState<"exact" | "flow">("exact");
+  // 自动：下载 Word 时逐页保留原排版（外观与 PDF 一致），转换后继续编辑时用可编辑的流式排版（扩写改写不乱版）
+  const [mode, setMode] = useState<"auto" | "exact" | "flow">("auto");
   const [engine, setEngine] = useState("builtin");
   const [busy, setBusy] = useState<"" | "download" | "edit">("");
   const [err, setErr] = useState("");
@@ -47,7 +48,7 @@ export function ConvertCard({ sessionId, runtime, onDone }: { sessionId: string;
     setErr("");
     setDone(null);
     try {
-      const r = await api.exportAs(sessionId, "docx", { mode, engine });
+      const r = await api.exportAs(sessionId, "docx", { mode: mode === "flow" ? "flow" : "exact", engine });
       setDone(r);
       triggerDownload(r.url, r.name);
     } catch (e: any) {
@@ -61,7 +62,7 @@ export function ConvertCard({ sessionId, runtime, onDone }: { sessionId: string;
     setBusy("edit");
     setErr("");
     try {
-      const r = await api.convert(sessionId, { engine, mode, inPlace: true });
+      const r = await api.convert(sessionId, { engine, mode: mode === "exact" ? "exact" : "flow", inPlace: true });
       onDone(r.text);
     } catch (e: any) {
       setErr(`转换失败：${e.message}`);
@@ -82,7 +83,7 @@ export function ConvertCard({ sessionId, runtime, onDone }: { sessionId: string;
         <button className="convert-toggle" onClick={() => setCollapsed(false)} aria-expanded={false} title="展开 PDF → Word 选项">
           <span className="chev" aria-hidden>▸</span>
           <span className="convert-title">PDF → Word</span>
-          <span className="muted small">{mode === "exact" ? "保留原排版" : "便于大段改写"}</span>
+          <span className="muted small">{mode === "auto" ? "自动选择排版" : mode === "exact" ? "逐页保留原排版" : "可编辑排版"}</span>
         </button>
         {actions}
         {err && <div className="notice error">{err}</div>}
@@ -103,18 +104,25 @@ export function ConvertCard({ sessionId, runtime, onDone }: { sessionId: string;
         {actions}
       </div>
       <div className="convert-options" role="radiogroup" aria-label="排版方式">
+        <label className={`opt ${mode === "auto" ? "on" : ""}`}>
+          <input type="radio" name="mode" checked={mode === "auto"} onChange={() => setMode("auto")} />
+          <span>
+            <b>自动（推荐）</b>
+            <span className="muted small">下载 Word 文件时逐页保留原排版；转换并继续编辑时用可编辑排版，扩写、改写后版面自动重排。</span>
+          </span>
+        </label>
         <label className={`opt ${mode === "exact" ? "on" : ""}`}>
           <input type="radio" name="mode" checked={mode === "exact"} onChange={() => setMode("exact")} />
           <span>
-            <b>保留原排版（推荐）</b>
-            <span className="muted small">每一行、每一页都与 PDF 一致：表格、表单、分栏论文按原样还原。适合小范围修改。</span>
+            <b>逐页保留原排版</b>
+            <span className="muted small">每一行、每一页都与 PDF 一致（每行硬换行、逐页固定）。只适合改个别字词，增加文字会挤乱版面。</span>
           </span>
         </label>
         <label className={`opt ${mode === "flow" ? "on" : ""}`}>
           <input type="radio" name="mode" checked={mode === "flow"} onChange={() => setMode("flow")} />
           <span>
-            <b>便于大段改写</b>
-            <span className="muted small">段落自动换行，改写后文字自然重排；版面与 PDF 大体一致，行尾位置可能不同。</span>
+            <b>可编辑排版</b>
+            <span className="muted small">字体、字号、分栏、页眉页脚、公式与图片都与原文一致；段落自动换行、跨栏跨页连续，扩写改写不乱版。</span>
           </span>
         </label>
       </div>

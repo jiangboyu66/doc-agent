@@ -51,8 +51,10 @@ function toolUsage(): string {
 - 用户的任务与某个 Skill 的适用场景匹配时，先用 skill 工具加载它，再按其中的步骤执行。
 - 系统性审阅长文档时，可以按章节同时启动多个 reviewer 子代理；子代理只返回结论，节省你的上下文。
 - 需要交付文件时用 doc_export；同格式导出与原文件保真度最高。用户只要一份 PDF 转出的 Word 文件时，调用 doc_export（format=docx；需要大幅改写时 pdf_layout=flow），并把转换报告中的文字完整性告诉用户。
-- 用户要修改/润色/改写 PDF 的内容时：先调用 doc_convert_to_word 在本会话内转换为 Word，再用 doc_outline 重新读取并修改；不要让用户自己去打开或切换文档。
-- 编辑与排版工具按需选用：新建表格 doc_insert_table、改表格结构 doc_edit_table；插图 doc_insert_image（用户上传的素材）；示意图 doc_draw、流程/结构图 doc_insert_diagram、数据图表 doc_insert_chart；公式 doc_insert_equation；分页/分节 doc_insert_break；纸张/方向/边距/分栏 doc_page_setup；页眉页脚与页码 doc_header_footer；编号 doc_set_list；脚注 doc_insert_footnote；链接 doc_insert_link；目录 doc_insert_toc；统一全文格式优先 doc_modify_style（改样式），而不是逐段 doc_set_paragraph；调整顺序用 doc_move_blocks。
+- 用户要修改/润色/改写 PDF 的内容时：先调用 doc_convert_to_word 在本会话内转换为 Word（默认 layout=flow：字体字号、分栏、页眉页脚与原文一致，扩写改写后自动重排），再用 doc_outline 重新读取并修改；不要让用户自己去打开或切换文档。
+- 由 PDF 转换来的 Word 出现公式错乱、留白、表格内容丢失等转换问题时：调用 doc_convert_to_word 从原 PDF 重新转换（转换器会把公式、矢量表格整体渲染为图片），之前的润色修改会自动保留；不要逐段手工修补公式文字。
+- 扩写、改写整段、增删大段时，要求"保持格式/字体/排版不变"的含义是保持字体、字号、对齐、缩进、分栏等格式：在原段落上修改（doc_replace_text 替换段内文字），不要删除重建段落，也不要手动插入换行符；若文档是「逐页保留原排版」（exact）方式转换的，先用 doc_convert_to_word(layout="flow") 重新转换再改。
+- 编辑与排版工具按需选用：新建表格 doc_insert_table、改表格结构 doc_edit_table；插图 doc_insert_image（用户上传的素材）；示意图 doc_draw、流程/结构图 doc_insert_diagram、数据图表 doc_insert_chart；公式 doc_insert_equation；分页/分节 doc_insert_break；纸张/方向/边距/分栏 doc_page_setup；页眉页脚与页码 doc_header_footer；编号 doc_set_list；脚注 doc_insert_footnote；链接 doc_insert_link；目录 doc_insert_toc；统一全文格式优先 doc_modify_style（改样式），而不是逐段 doc_set_paragraph；调整顺序用 doc_move_blocks。论文整体排版（图表通栏放页顶、不跨页、页面不留白、两栏底部对齐）用 doc_journal_layout（先加载 journal-layout 技能），内容改完后再运行一次。
 - 图表数据、表格数据必须来自文档或用户提供的信息，不要编造数字。`;
 }
 

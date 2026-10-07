@@ -118,11 +118,25 @@ export function parseFontName(raw: string | undefined): FontInfo {
   const narrow = /cond|narrow/i.test(style + family);
 
   const key = family.toLowerCase().replace(/[\s_]/g, "");
+  // MathTime（IEEE / Elsevier 等出版社的数学字体）：MTSYN 符号、RMTMI / MTMI 数学斜体、MTEX / BLEX 大型定界符
+  if (/^(r?mt(mi|mib|sy|syn|syb|ex|ext|ms|mb)|blex|bmtex|mtpro\w*|mathtime\w*)$/.test(key.replace(/\d+$/, ""))) {
+    return { family: "Cambria Math", bold: /b$|bold/i.test(key + style), italic: /mi/.test(key), math: true };
+  }
   let out = MAP[key] ?? MAP[key.replace(/\d+$/, "")];
+  // 出版社定制字体（Times LT Std、Formata、Giovanni……）：按族名归到 Word 中一定有的同类字体，否则在没有该字体的电脑上会被随意替换
+  if (!out) {
+    if (/^(times|tmsrm|nimbusrom|ptmr|tirom)/.test(key)) out = "Times New Roman";
+    else if (/^(helvetica|helv|arialmt|phvr|formata|frutiger|univers|myriad|futura|gillsans|optima|syntax|segoe|opensans|roboto|lato|sourcesans|sans)/.test(key) || /sans|grotesk/.test(key)) out = narrow ? "Arial Narrow" : "Arial";
+    else if (/^(minion|giovanni|utopia|charter|baskerville|caslon|sabon|stempel|bembo|janson|plantin|lucidabright|stix|mtimes|adobetimes|serif)/.test(key)) out = "Times New Roman";
+    else if (/^(courier|mono|lucidatypewriter|inconsolata|menlo)/.test(key) || /mono$/.test(key)) out = "Courier New";
+  }
   if (out === "Arial" && narrow) out = "Arial Narrow";
   if (!out) out = /^[\x20-\x7e]+$/.test(family) && !/\s/.test(family) ? family.replace(/([a-z])([A-Z])/g, "$1 $2") : family;
   const math = /math/i.test(out) || /^(Symbol)$/.test(out);
-  return { family: out.trim() || "Times New Roman", bold, italic, math };
+  // 无衬线显示字体的 Medium（Formata Medium、Helvetica Neue Medium 等）笔画已接近粗体，替换成 Arial 时用粗体才接近原样
+  const medium = /(^|[^a-z])(md|med|medium)([^a-z]|$)|Md$|Medium$|Med$/.test(style) || /(Md|Medium|Med)$/.test(raw?.split(/[-,]/)[0] ?? "") || /OTFMd|Md(It)?$/.test(name.split(/[-,]/)[0]);
+  const sansOut = out === "Arial" || out === "Arial Narrow";
+  return { family: out.trim() || "Times New Roman", bold: bold || (sansOut && medium), italic: italic || /(It|Italic)$/.test(name.split(/[-,]/)[0]), math };
 }
 
 // ---------------------------------------------------------------------------

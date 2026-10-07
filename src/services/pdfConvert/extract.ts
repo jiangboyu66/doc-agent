@@ -205,7 +205,12 @@ async function extractPage(page: any, index: number, OPS: any, Util: any): Promi
       const xs = sp.pts.map((p) => p[0]), ys = sp.pts.map((p) => p[1]);
       const x0 = Math.min(...xs), x1 = Math.max(...xs), y0 = Math.min(...ys), y1 = Math.max(...ys);
       const w = x1 - x0, h = y1 - y0;
-      const axisAligned = sp.kind === "rect" || (!sp.curved && sp.pts.every((pt, i) => i === 0 || Math.abs(pt[0] - sp.pts[i - 1][0]) < 0.6 || Math.abs(pt[1] - sp.pts[i - 1][1]) < 0.6));
+      // 每一小段都是水平或竖直的（按段长的比例判断：曲线图的折线由大量很短的斜段组成，不能用绝对阈值）
+      const axisAligned = sp.kind === "rect" || (!sp.curved && sp.pts.every((pt, i) => {
+        if (i === 0) return true;
+        const dx = Math.abs(pt[0] - sp.pts[i - 1][0]), dy = Math.abs(pt[1] - sp.pts[i - 1][1]);
+        return Math.min(dx, dy) <= 0.1 * Math.max(dx, dy) + 0.05;
+      }));
       if ((stroke || fill) && (w > 0.3 || h > 0.3) && !(fill && !stroke && isWhite(gs.fill))) {
         const bb = sp.kind === "poly" && sp.ctrl.length ? [...sp.pts, ...sp.ctrl] : sp.pts;
         const bx = bb.map((p) => p[0]), by = bb.map((p) => p[1]);

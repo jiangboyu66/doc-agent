@@ -486,21 +486,25 @@ export const DocConvertToWordTool = buildTool({
   name: "doc_convert_to_word",
   category: "edit",
   description: () => `把当前的 PDF 文档在本会话内转换为可编辑的 Word 文档，转换后可以直接用 doc_replace_text 等写工具修改。
-- PDF 是只读格式：用户要求修改/润色/改写 PDF 的内容时，先调用本工具，再按正常流程读取并修改；
-- layout = exact（默认）逐行保留原排版，适合小范围修改；flow 段落自动换行，适合大段改写；
+- PDF 是只读格式：用户要求修改/润色/改写/扩写 PDF 的内容时，先调用本工具，再按正常流程读取并修改；
+- layout = flow（默认，推荐）：字体、字号、分栏、页眉页脚、公式与图片位置都与原文一致，但段落自动换行、跨栏跨页连续，
+  扩写、改写、增删段落后版式自动重排，不会错乱；
+- layout = exact：逐行逐页固定（每行硬换行、每页固定分页分栏），外观与原 PDF 完全一致，但只适合改个别字词，
+  一旦增加文字就会挤乱版面；
+- 已经由 PDF 转换过的 Word 也可以再调用本工具，从原 PDF 重新转换（换一种模式，或转换器改进后修复公式 / 表格问题）；之前做过的段落修改（润色、改写）会自动搬到新文档上，报告会列出没能搬运的段落，旧版本可回滚；
 - 转换后文档结构全部变化：必须重新调用 doc_outline / doc_read 获取新的段落引用；
 - 原 PDF 保留为版本 v0，用户可随时回滚；转换报告会给出文字完整性。
 只想"导出一份 Word 文件给用户下载"而不修改时，用 doc_export(format="docx")。`,
   inputSchema: z.object({
-    layout: z.enum(["exact", "flow"]).optional().describe("exact 保留原排版（默认）；flow 便于大段改写"),
+    layout: z.enum(["exact", "flow"]).optional().describe("flow 可编辑流式排版（默认，扩写/改写必须用它）；exact 逐页固定，只改字词时用"),
     reason,
   }),
-  userFacingName: (i) => `PDF 转换为 Word（${i.layout === "flow" ? "便于改写" : "保留原排版"}）`,
-  isEnabled: (ctx) => ctx.session.meta.format === "pdf",
+  userFacingName: (i) => `PDF 转换为 Word（${i.layout === "exact" ? "逐页保留原排版" : "可编辑流式排版"}）`,
+  isEnabled: (ctx) => ctx.session.meta.format === "pdf" || (ctx.session.meta.sourceFormat === "pdf" && ctx.session.meta.format === "docx"),
   checkPermissions: async () => ({ behavior: "allow" }),
   async call(i, ctx) {
     const { convertPdfInPlace } = await import("../session/convertPdf.js");
-    const r = await convertPdfInPlace(ctx.session, { mode: i.layout ?? "exact" });
+    const r = await convertPdfInPlace(ctx.session, { mode: i.layout ?? "flow" });
     return {
       content: `${r.text}\n已切换为 Word 文档，写工具现在可用。下一步：调用 doc_outline 重新获取段落引用后再修改。`,
       docChange: { label: r.label, changedRefs: [], structural: true },

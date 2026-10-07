@@ -1,6 +1,6 @@
 {
   "name": "doc-agent",
-  "version": "2.0.0",
+  "version": "2.7.1",
   "description": "文案 Agent：基于 DeepSeek 的文档编辑 Agent。Word 原生 OOXML 引擎，未修改内容字节级保真；架构对标 Claude Code 源码中的设计理念。",
   "type": "module",
   "scripts": {

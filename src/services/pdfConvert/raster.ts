@@ -77,7 +77,10 @@ export function detectFigures(pg: PageModel, bodySize: number, tableBoxes: Box[]
   const pageArea = pg.width * pg.height;
   for (const p of pg.paths) {
     // 贯穿整页的细线（页眉线、栏线）不参与聚类
-    if ((p.x1 - p.x0 > 0.6 * pg.width && p.y1 - p.y0 < 3) || (p.y1 - p.y0 > 0.6 * pg.height && p.x1 - p.x0 < 3)) continue;
+    // （横跨正文的表格横线要保留：它把表格的各列连成一簇）
+    const thinH = p.y1 - p.y0 < 3, thinV = p.x1 - p.x0 < 3;
+    const inMargin = p.y1 < 0.08 * pg.height || p.y0 > 0.92 * pg.height;
+    if ((thinH && (p.x1 - p.x0 > 0.8 * pg.width || (inMargin && p.x1 - p.x0 > 0.4 * pg.width))) || (thinV && p.y1 - p.y0 > 0.6 * pg.height)) continue;
     const curvy = p.curved || p.diagonal ? 1 : 0;
     const colored = p.filled && !isGray(p.fillColor) ? 1 : (p.stroked && !isGray(p.strokeColor) ? 1 : 0);
     els.push({ box: p, curvy, colored, paths: 1, image: false });
@@ -101,7 +104,37 @@ export function detectFigures(pg: PageModel, bodySize: number, tableBoxes: Box[]
   }
 
   const figs: Box[] = [];
+  // 文字被转成矢量轮廓的表格（出版社处理过的 PDF 常见）：几条等宽的横线之间密布着小的填充曲线（字形），
+  // 却几乎没有真正的文字 → 整张表作为一幅图渲染，否则表格内容会整个丢失
+  {
+    const rules = pg.paths.filter((p) => p.y1 - p.y0 < 2.5 && p.x1 - p.x0 > 40).sort((a, b) => a.y0 - b.y0);
+    const used = new Set<number>();
+    for (let i = 0; i < rules.length; i++) {
+      if (used.has(i)) continue;
+      const grp = [i];
+      for (let j = i + 1; j < rules.length; j++) {
+        const a = rules[grp[grp.length - 1]], b = rules[j];
+        if (!(Math.abs(b.x0 - rules[i].x0) < 4 && Math.abs(b.x1 - rules[i].x1) < 4)) continue;
+        // 两条横线之间有真正的文字（下一张表的表题等）：不是同一张表
+        const between = pg.spans.filter((sp) => { const cy = (sp.top + sp.bottom) / 2, cx = (sp.x0 + sp.x1) / 2; return cy > a.y1 && cy < b.y0 && cx > a.x0 && cx < a.x1; })
+          .reduce((n, sp) => n + sp.text.replace(/\s/g, "").length, 0);
+        if (between > 3 || b.y0 - a.y0 > 0.4 * pg.height) break;
+        grp.push(j);
+      }
+      if (grp.length < 2) continue;
+      const top = rules[grp[0]], bot = rules[grp[grp.length - 1]];
+      const box: Box = { x0: Math.min(top.x0, bot.x0), y0: top.y0, x1: Math.max(top.x1, bot.x1), y1: bot.y1 };
+      if (box.y1 - box.y0 < 12) continue;
+      const glyphs = pg.paths.filter((p) => p.filled && (p.curved || p.diagonal) && p.x1 - p.x0 < 20 && p.y1 - p.y0 < 20 && inside(p, box, 2)).length;
+      const realText = pg.spans.filter((sp) => centerIn(sp, box)).reduce((n, sp) => n + sp.text.replace(/\s/g, "").length, 0);
+      if (glyphs >= 20 && realText < 0.1 * glyphs) {
+        grp.forEach((k) => used.add(k));
+        figs.push({ x0: box.x0 - 1, y0: box.y0 - 1, x1: box.x1 + 1, y1: box.y1 + 1 });
+      }
+    }
+  }
   for (const c of clusters) {
+    if (figs.some((f) => inside(c.box, f, 2))) continue;
     const curvy = c.els.reduce((a, e) => a + e.curvy, 0);
     const colored = c.els.reduce((a, e) => a + e.colored, 0);
     const images = c.els.filter((e) => e.image);
@@ -122,11 +155,32 @@ export function detectFigures(pg: PageModel, bodySize: number, tableBoxes: Box[]
   // 合并相互接近的图区域，吸收图内文字与紧贴图边的小字号标注
   const out: ImageBox[] = [];
   const merged: Box[] = [];
-  for (const f of figs.sort((a, b) => a.y0 - b.y0)) {
-    const hit = merged.find((m) => near(m, f, 4));
-    if (hit) Object.assign(hit, union(hit, f));
-    else merged.push(f);
-  }
+  // 同一行并排的子图（曲线图的多个面板）：纵向范围大体重合、横向间隔不大 → 合成一幅图
+  const sameRow = (a: Box, b: Box) => {
+    const ov = Math.min(a.y1, b.y1) - Math.max(a.y0, b.y0);
+    const gap = Math.max(a.x0, b.x0) - Math.min(a.x1, b.x1);
+    const minH = Math.min(a.y1 - a.y0, b.y1 - b.y0);
+    // 子图面板顶端、底端基本齐平；只是部分重叠的（左右两栏各一张表）不算
+    const aligned = Math.abs(a.y0 - b.y0) < 0.2 * minH + 4 && Math.abs(a.y1 - b.y1) < 0.2 * minH + 4;
+    return ov > 0.5 * minH && gap < 0.1 * pg.width && aligned;
+  };
+  // 合并后的范围里出现了两者之外的正文（例如左右两栏各有一张表，中间是正文）：不是同一幅图
+  const textBetween = (a: Box, b: Box) => {
+    const u = union(a, b);
+    return pg.spans.some((s) => s.size >= 0.9 * bodySize && s.text.trim().length > 1 && centerIn(s, u) && !centerIn(s, a, 2) && !centerIn(s, b, 2));
+  };
+  // 各自带有题注（TABLE 5 / TABLE 6 分别在左右两栏）：是两个独立的图表
+  const ownCaption = (b: Box) => pg.spans.some((s) => CAPTION.test(s.text) && s.x0 < b.x1 && s.x1 > b.x0 && s.x0 >= b.x0 - 20 && (Math.abs(s.bottom - b.y0) < 40 || Math.abs(s.top - b.y1) < 40));
+  const mergeAll = (boxes: Box[]) => {
+    for (let changed = true; changed; ) {
+      changed = false;
+      for (let i = 0; i < boxes.length && !changed; i++) for (let j = i + 1; j < boxes.length; j++) {
+        if (near(boxes[i], boxes[j], 4) || (sameRow(boxes[i], boxes[j]) && !textBetween(boxes[i], boxes[j]) && !(ownCaption(boxes[i]) && ownCaption(boxes[j])))) { boxes[i] = union(boxes[i], boxes[j]); boxes.splice(j, 1); changed = true; break; }
+      }
+    }
+    return boxes;
+  };
+  merged.push(...mergeAll(figs.sort((a, b) => a.y0 - b.y0).map((f) => ({ ...f }))));
   for (const r0 of merged) {
     let r = { ...r0 };
     for (let iter = 0; iter < 4; iter++) {
@@ -134,7 +188,7 @@ export function detectFigures(pg: PageModel, bodySize: number, tableBoxes: Box[]
       for (const s of pg.spans) {
         if (centerIn(s, r, 0.5)) { const u = union(r, spanBox(s)); if (area(u) > area(r) + 0.01) { r = u; grown = true; } continue; }
         // 图边的小字标注：字号明显小于正文、紧贴图框、不是题注
-        if (s.size < 0.9 * bodySize && near(spanBox(s), r, 3) && !CAPTION.test(s.text)) {
+        if (s.size < 0.9 * bodySize && near(spanBox(s), r, 6) && !CAPTION.test(s.text)) {
           r = union(r, spanBox(s)); grown = true;
         }
       }
@@ -165,7 +219,11 @@ export interface MathCtx {
 
 export const rawBase = (s: Span) => (s.rawFont ?? s.font).split(/[-,+]/)[0].replace(/\d+$/, "").toUpperCase();
 const CJK_RE = /[\u2e80-\u9fff\uf900-\ufaff\uff00-\uffef\u3000-\u303f]/;
-const TEX_BASE = /^(CM|LM|MSAM|MSBM|EU[FRSX]|RSFS|STMARY|WASY|SF[A-Z]{2}\d|TC[A-Z]{2}\d|TXMI|TXSY|TXEX|PXMI|PXSY|PXEX|STIX|XITSMATH|CAMBRIAMATH|LATINMODERNMATH|ASANAMATH|MTMI|MTSY|MTEX|EUCLID)/;
+const TEX_BASE = /^(CM|LM|MSAM|MSBM|EU[FRSX]|RSFS|STMARY|WASY|SF[A-Z]{2}\d|TC[A-Z]{2}\d|TXMI|TXSY|TXEX|PXMI|PXSY|PXEX|STIX|XITSMATH|CAMBRIAMATH|LATINMODERNMATH|ASANAMATH|R?MT(MI|SY|EX|MS|MB|EXT|SYN|SYB|MIB)|BLEX|BMTEX|EUCLID|MTPRO|MATHTIME)/;
+/** 关系 / 运算符号：一行公式的标志 */
+const REL = /[=≈≃≅≡≠≤≥≪≫∈∉⊂⊆←→↦∝]|:=/;
+/** 公式中常见的运算符名称（不是英文正文） */
+const OPNAME = new Set(["softmax", "concat", "argmax", "argmin", "sigmoid", "tanh", "relu", "mean", "clamp", "clip", "exp", "log", "max", "min", "sum", "where", "and", "for", "with", "head"]);
 const EQ_NUM = /\(\s*\d{1,3}[a-z]?\s*\)\s*$/;
 const isBigOp = (s: Span) => /^(CMEX|LMMATHEXTENSION|EUEX)/.test(rawBase(s)) || (/[∑∏∫∮⋃⋂]/.test(s.text) && !!s.math);
 
@@ -175,17 +233,26 @@ function lineInfo(l: Line, r: { x0: number; x1: number }, ctx: MathCtx) {
     // 公式字体：数学字体，或正文不是 TeX 字体时出现的 TeX 字体（CMR 的数字、运算符名等）；含中日韩文字的片段一律视为正文
     const nonProse = !CJK_RE.test(s.text) && (s.math || isBigOp(s) || (!ctx.bodyIsTeX && TEX_BASE.test(rawBase(s))));
     if (nonProse) math += s.text.replace(/\s/g, "").length;
-    else prose += s.text;
+    else prose += (prose && !/\s$/.test(prose) ? " " : "") + s.text; // 片段之间加空格：下标 i、变量 F 不被拼成"单词"
   }
   const text = l.spans.map((s) => s.text).join("").trim();
   const numbered = EQ_NUM.test(text) && r.x1 - l.x1 < 4;
   const proseCore = prose.replace(EQ_NUM, "").replace(/[\s.,;:()[\]{}=+\-−–·×/|]/g, "");
   const words = (prose.match(/[A-Za-z]{4,}/g) ?? []).length;
+  // 英文正文单词：小写开头、4 个字母以上、不是运算符名称（ReLU、Conv、Upscale 等大写开头的函数名不算）
+  const engWords = (prose.match(/(?<![A-Za-z])[a-z]{4,}(?![A-Za-z])/g) ?? []).filter((w) => !OPNAME.has(w)).length;
+  // 公式里的变量：斜体的单个字母 / 短下标（正文斜体字体排的变量，如 Times Italic 的 F、rs）
+  const vars = l.spans.filter((s) => s.italic && /^[A-Za-z]{1,3}$/.test(s.text.trim())).length;
+  const rel = REL.test(text);
   const total = math + proseCore.length;
   const onlyNumber = /^\(\s*\d{1,3}[a-z]?\s*\)$/.test(text);
   const w = r.x1 - r.x0;
   const indented = l.x0 - r.x0 > 0.06 * w;
-  const strong = !onlyNumber && total > 0 && math >= 0.6 * total && (words === 0 || (words <= 1 && indented));
+  const strong = !onlyNumber && total > 0 && (
+    (math >= 0.6 * total && (words === 0 || (words <= 1 && indented)))
+    // 关系符号 + 缩进 + 没有英文正文单词 + 有变量或编号：MathTime / 正文字体排的公式（变量用正文斜体）
+    || (rel && (indented || numbered || l.x0 - r.x0 > 0.04 * w) && engWords === 0 && (vars >= 1 || numbered || math >= 2) && !/[.;,]\s+[A-Z][a-z]{3,}/.test(text))
+  );
   // 分式的分子/分母、上下标等碎片：很短、没有单词、缩进
   const fragment = !strong && !onlyNumber && total <= 12 && words === 0 && indented;
   const big = l.spans.some(isBigOp);
@@ -242,6 +309,44 @@ export function detectDropCaps(lines: Line[], ctx: MathCtx): Array<{ line: Line;
     const beside = lines.filter((o) => o !== l && o.x0 >= l.x1 - 1 && o.x0 - l.x1 < 2 * l.size && o.top < l.bottom && o.bottom > l.top + 0.15 * h);
     if (beside.length < 2) continue;
     out.push({ line: l, box: { x0: l.x0 - 1, y0: l.top - 0.5, x1: l.x1 + 1, y1: l.baseline + 0.1 * l.size } });
+  }
+  return out;
+}
+
+/**
+ * 多张照片排成的组图（子图 (a)(b)… 标注在图下）：整体渲染成一张图，保持原来的行列排布；
+ * 否则在分栏页面里各张照片会被拆到左右两栏、各占一段。
+ */
+export function detectImageGrids(pg: PageModel, bodySize: number): ImageBox[] {
+  const ims = pg.images.filter((i) => !i.render && (i.x1 - i.x0) * (i.y1 - i.y0) > 400);
+  if (ims.length < 2) return [];
+  let groups: Box[][] = ims.map((i) => [{ x0: i.x0, y0: i.y0, x1: i.x1, y1: i.y1 }]);
+  const bb = (g: Box[]) => g.reduce((a, b) => union(a, b));
+  for (let changed = true; changed; ) {
+    changed = false;
+    outer: for (let i = 0; i < groups.length; i++) for (let j = i + 1; j < groups.length; j++) {
+      const A = bb(groups[i]), B = bb(groups[j]);
+      const row = Math.min(A.y1, B.y1) - Math.max(A.y0, B.y0) > 0.5 * Math.min(A.y1 - A.y0, B.y1 - B.y0) && Math.max(A.x0, B.x0) - Math.min(A.x1, B.x1) < 0.15 * pg.width;
+      if (near(A, B, 3 * bodySize) || row) { groups[i].push(...groups[j]); groups.splice(j, 1); changed = true; break outer; }
+    }
+  }
+  const LABEL = /^\(?[a-zA-Z0-9]{1,3}[).]?$/;
+  const out: ImageBox[] = [];
+  for (const g of groups) {
+    if (g.length < 2) continue;
+    let r = bb(g);
+    // 子图编号：图内或紧贴图下方的短标注
+    for (const s of pg.spans) {
+      const t = s.text.trim();
+      if (!t) continue;
+      if (centerIn(s, r, 0.5) || (LABEL.test(t) && s.x0 >= r.x0 - 2 && s.x1 <= r.x1 + 2 && s.top >= r.y1 - 2 && s.top - r.y1 < 1.6 * bodySize)) r = union(r, spanBox(s));
+    }
+    const inner = pg.spans.filter((s) => centerIn(s, r));
+    if (inner.filter((s) => !LABEL.test(s.text.trim())).reduce((a, s) => a + s.text.trim().length, 0) > 80) continue; // 照片之间夹着正文：不是组图
+    const box = { x0: r.x0 - PAD, y0: r.y0 - PAD, x1: r.x1 + PAD, y1: r.y1 + PAD };
+    const alt = spansText(inner);
+    removeInside(pg, box);
+    out.push(rasterBox(box, pg.index, "figure", alt));
   }
   return out;
 }

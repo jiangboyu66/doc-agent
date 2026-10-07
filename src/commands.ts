@@ -119,11 +119,13 @@ const BUILTIN: Command[] = [
     },
   },
   {
-    type: "local", name: "convert", description: "把 PDF 转换为可编辑的 Word 文档（默认在当前会话内转换并继续编辑；加 new 则生成新会话）", argumentHint: "exact|flow [builtin|pdf2docx|libreoffice] [new]",
+    type: "local", name: "convert", description: "把 PDF 转换为可编辑的 Word 文档（默认在当前会话内转换并继续编辑；加 new 则生成新会话）", argumentHint: "flow|exact [builtin|pdf2docx|libreoffice] [new]",
     async run(a, ctx) {
-      if (ctx.session.meta.format !== "pdf") return "当前文档不是 PDF，无需转换。";
       const args = a.trim().split(/\s+/).filter(Boolean);
-      const mode = args.includes("flow") ? "flow" : "exact";
+      const reconvert = ctx.session.meta.format === "docx" && ctx.session.meta.sourceFormat === "pdf";
+      if (ctx.session.meta.format !== "pdf" && !(reconvert && !args.includes("new"))) return "当前文档不是 PDF，无需转换。";
+      // 默认流式（可编辑）：字体字号与分栏不变，扩写改写后自动重排；exact 逐页固定，只适合改字词
+      const mode = args.includes("exact") ? "exact" : "flow";
       const engine = (["pdf2docx", "libreoffice"].find((e) => args.includes(e)) ?? "builtin") as "builtin" | "pdf2docx" | "libreoffice";
       const s = ctx.runtime.settings;
       if (!args.includes("new")) {

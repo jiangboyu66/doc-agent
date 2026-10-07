@@ -173,6 +173,12 @@ body:has(.workspace) { overflow: hidden; }
 .frame.white { background: #fff; }
 .docx-outer { min-height: 100%; padding: 16px 0; }
 .docx-host { margin: 0 auto; width: fit-content; }
+/* 快速预览分页：与转换结果一致（关闭孤行控制），栏底尽量排满 */
+.docx-host p { orphans: 1; widows: 1; }
+/* 每页下方的页码标注、工具栏中的当前页 */
+.docx-host .page-label { margin: -10px 0 14px; font-size: 11px; color: var(--muted); letter-spacing: 0.04em; font-variant-numeric: tabular-nums; user-select: none; text-align: center; }
+.page-indicator { margin-left: auto; font-size: 12px; color: var(--ink-2); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.page-indicator + .seg.right { margin-left: 0; }
 .docx-host .docx-wrapper { background: transparent !important; padding: 0 !important; }
 .docx-host .docx-wrapper > section.docx { box-shadow: var(--shadow) !important; margin: 0 auto 16px !important; }
 .loading { padding: 40px; text-align: center; color: var(--muted); }

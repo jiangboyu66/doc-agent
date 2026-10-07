@@ -306,8 +306,16 @@ await test("LaTeX 论文：矢量图与行间公式按原样渲染为图片贴�
   }
 });
 
-await test("公式编号与公式在同一行：右端编号用右对齐制表位，单行段落的起始位置用制表位而非缩进", async () => {
+await test("公式编号与公式在同一行：渲染为一张图（编号在图内）；不渲染时右端编号用右对齐制表位", async () => {
+  {
+    const { data } = await pdfToDocx(await fixture("equation-number.pdf"));
+    const { ZipPackage: ZP } = await import("../src/documents/docx/zip.js");
+    const xml = new ZP(data).readText("word/document.xml");
+    assert(/<wp:inline\b(?:(?!<\/wp:inline>).)*descr="[^"]*\(1\)/.test(xml), "公式与编号应渲染为同一张行内图片");
+  }
+  process.env.PDF_RASTER = "0";
   const { data, report } = await pdfToDocx(await fixture("equation-number.pdf"));
+  delete process.env.PDF_RASTER;
   eq(report.textCoverage, 1, `文字完整性，缺失：${report.missing}`);
   const { ZipPackage } = await import("../src/documents/docx/zip.js");
   const xml = new ZipPackage(data).readText("word/document.xml");
@@ -315,6 +323,155 @@ await test("公式编号与公式在同一行：右端编号用右对齐制表�
   assert(para.includes(">(1)<"), "编号 (1) 应与公式在同一段落");
   assert(/<w:tab w:val="right" w:pos="\d+"\/>/.test(para), "编号应使用右对齐制表位");
   assert(!/<w:ind [^>]*w:left="[1-9]/.test(para), "单行公式段落不应使用左缩进（预览器会把制表位算错）");
+});
+
+await test("可编辑（流式）转换：不逐页分页、不插分栏符，公式为行内图片，扩写后文档仍合法；版式模式可识别", async () => {
+  const { pdfToDocx } = await import("../src/services/pdfConvert/index.js");
+  const cols = await pdfToDocx(await fixture("columns.pdf"), { mode: "flow" });
+  eq(cols.report.textCoverage, 1, `文字完整性，缺失：${cols.report.missing}`);
+  const pkg = new ZipPackage(cols.data);
+  const xml = pkg.readText("word/document.xml");
+  assert(!xml.includes('w:val="PageStart"') && !xml.includes("<w:pageBreakBefore/>"), "流式模式不应逐页强制分页");
+  assert(!xml.includes('w:type="column"'), "流式模式不应插入分栏符（文字跨栏连续流动）");
+  assert(!/<w:br w:clear="none"\/>/.test(xml), "流式模式段落内不应有排版换行");
+  assert(xml.includes("<w:lastRenderedPageBreak/>"), "应记录原 PDF 的分页位置（浏览器预览据此分页）");
+  assert(pkg.readText("word/settings.xml").includes("<w:autoHyphenation/>"), "流式模式开启自动断词");
+  const d = new DocxDocument(cols.data);
+  eq(d.convertedLayout(), "flow", "版式模式");
+  // 扩写一段：文档仍可解析，段落数不变
+  const p = d.listBlocks().filter((b) => b.text.length > 200)[0];
+  d.replaceText({ ref: p.ref, oldText: p.text, newText: p.text + " 扩写的内容。".repeat(30) }, { track: false, author: "t", date: new Date().toISOString() } as any);
+  const d2 = new DocxDocument(d.serialize());
+  eq(d2.listBlocks().length, d.listBlocks().length, "扩写后段落数");
+
+  // 行间公式：两种模式都是行内图片（随文字流移动，不会与文字重叠）
+  for (const mode of ["flow", "exact"] as const) {
+    const m = await pdfToDocx(await fixture("math.pdf"), { mode });
+    const mx = new ZipPackage(m.data).readText("word/document.xml");
+    assert(/<wp:inline\b/.test(mx), `${mode}：公式应为行内图片`);
+    assert(!/<wp:anchor\b(?:(?!<\/wp:anchor>).)*descr=/.test(mx), `${mode}：公式/图不应按页面坐标浮动`);
+  }
+  const ex = await pdfToDocx(await fixture("columns.pdf"), { mode: "exact" });
+  eq(new DocxDocument(ex.data).convertedLayout(), "exact", "逐页一致模式可识别");
+  assert(new ZipPackage(ex.data).readText("word/document.xml").includes('<w:br w:clear="none"/>'), "逐页一致模式的排版换行带标记");
+});
+
+await test("曲线图的网格线不当作表格、组图整体成图、图题末行不被切进分栏（两种模式）", async () => {
+  const { pdfToDocx } = await import("../src/services/pdfConvert/index.js");
+  for (const mode of ["flow", "exact"] as const) {
+    const { data, report } = await pdfToDocx(await fixture("figures.pdf"), { mode });
+    eq(report.textCoverage, 1, `${mode} 文字完整性，缺失：${report.missing}`);
+    eq(report.tables, 1, `${mode}：只有一个真正的表格（曲线图网格不算表格）`);
+    eq(report.figures, 2, `${mode}：七联曲线图合成一幅、2×2 组图合成一幅`);
+    const d = new DocxDocument(data);
+    const caps = d.listBlocks().filter((b) => /^Figure \d/.test(b.text.trim()));
+    eq(caps.length, 2, `${mode}：两个图题`);
+    assert(caps.some((b) => b.text.includes("decreases smoothly")), `${mode}：图题末行应与图题在同一段`);
+    assert(!d.listBlocks().some((b) => /^(Total loss|Charbonnier|\(a\))$/.test(b.text.trim())), `${mode}：图中文字不应散落为正文`);
+  }
+});
+
+await test("学术期刊排版：通栏图表单独成节、不跨页、网格对齐、不平衡分栏；可反复运行", async () => {
+  const { pdfToDocx } = await import("../src/services/pdfConvert/index.js");
+  const { applyJournalLayout } = await import("../src/services/journalLayout.js");
+  const { data } = await pdfToDocx(await fixture("journal.pdf"), { mode: "flow" });
+  const r1 = await applyJournalLayout(data, {});
+  eq(r1.report.floats.length, 3, "两幅图 + 一张表");
+  assert(r1.report.floats.some((f) => f.wide && f.kind === "figure"), "七联曲线图应为通栏");
+  assert(r1.report.floats.some((f) => !f.wide && f.kind === "table"), "表格为栏内浮动体");
+  assert(r1.report.pitch !== null && r1.report.gridAdjusted > 0, "基线网格");
+  const pkg = new ZipPackage(r1.data);
+  const xml = pkg.readText("word/document.xml");
+  assert(pkg.readText("word/settings.xml").includes("<w:noColumnBalance/>"), "不平衡分栏");
+  assert(xml.includes("<w:cantSplit/>") && xml.includes("<w:keepNext/>"), "表格行不跨页、与题注同页");
+  // 通栏图在单栏节里：图片段落之后的第一个分节符是单栏
+  const figAt = xml.indexOf("<wp:inline");
+  const nextSect = xml.slice(figAt).match(/<w:sectPr>.*?<\/w:sectPr>/)?.[0] ?? "";
+  assert(!/w:num="2"/.test(nextSect), "通栏图所在的节应为单栏");
+  const d1 = new DocxDocument(r1.data);
+  const text1 = d1.listBlocks().map((b) => b.text).join("\n").replace(/\s+/g, " ");
+  // 再运行一次：还原后重新排，文字不变、书签不重复累积
+  const r2 = await applyJournalLayout(r1.data, {});
+  eq(r2.report.floats.length, 3, "再次运行仍识别全部图表");
+  const d2 = new DocxDocument(r2.data);
+  eq(d2.listBlocks().map((b) => b.text).join("\n").replace(/\s+/g, " "), text1, "再次运行文字不变");
+  const marks = (new ZipPackage(r2.data).readText("word/document.xml").match(/_JLanchor/g) ?? []).length;
+  eq(marks, 3, "引用标记不累积");
+  // 工具：会话内运行后文档可继续读取
+  process.env.DOC_AGENT_NO_OFFICE = "1";
+  const s = await Session.create(data, "论文.docx", { mode: "bypassPermissions", trackChanges: false, author: "测试" });
+  const { findTool } = await import("../src/tools.js");
+  const tool = findTool("doc_journal_layout")!;
+  const res = await tool.call({} as any, { session: s } as any);
+  assert(String(res.content).includes("学术期刊排版完成") && (res as any).docChange?.structural, `工具输出异常：${res.content}`);
+  assert(s.doc.listBlocks().length > 10, "排版后文档可继续读取");
+  delete process.env.DOC_AGENT_NO_OFFICE;
+  // 有 LibreOffice 时：按分页结果定位，通栏图在页顶，中间页没有大面积留白
+  const { checkExternalTools, toPdfViaOffice } = await import("../src/services/convert.js");
+  if ((await checkExternalTools()).soffice) {
+    const r3 = await applyJournalLayout(data, { render: (b) => toPdfViaOffice(b, "docx") });
+    assert(r3.report.floats.some((f) => f.wide && /页顶部/.test(f.placement)), `通栏图应放到页顶：${JSON.stringify(r3.report.floats)}`);
+    eq(r3.report.whitespacePages.join(","), "", "中间页不应有大面积留白");
+  }
+});
+
+await test("文字被转成矢量轮廓的表格整体渲染为图片（内容不丢失）；重新转换时保留之前的润色修改", async () => {
+  const { pdfToDocx } = await import("../src/services/pdfConvert/index.js");
+  const { data, report } = await pdfToDocx(await fixture("outlined-table.pdf"), { mode: "flow" });
+  assert(report.figures >= 1, `轮廓文字表格应渲染为图片：${JSON.stringify(report)}`);
+  const d = new DocxDocument(data);
+  const blocks = d.listBlocks();
+  const capIdx = blocks.findIndex((b) => /Table 1/.test(b.text));
+  assert(capIdx >= 0 && blocks.slice(capIdx + 1, capIdx + 3).some((b) => b.text.includes("⟨图片⟩")), "表题之后应是表格图片");
+
+  // 重新转换保留修改：会话内转换 → 润色一段 → 从原 PDF 重新转换
+  const s = await Session.create(await fixture("columns.pdf"), "论文.pdf", { mode: "bypassPermissions", trackChanges: false, author: "测试" });
+  const { convertPdfInPlace } = await import("../src/session/convertPdf.js");
+  const r1 = await convertPdfInPlace(s, { mode: "flow" });
+  await s.commit(r1.label, []);
+  const target = s.doc.listBlocks().find((b) => b.text.length > 120)!;
+  const words = target.text.split(" ");
+  const oldFrag = words.slice(2, 6).join(" ");
+  s.doc.replaceText({ ref: target.ref, oldText: oldFrag, newText: oldFrag + " (polished wording)" }, { track: false, author: "t", date: new Date().toISOString() } as any);
+  await s.commit("润色", [target.ref]);
+  const r2 = await convertPdfInPlace(s, { mode: "flow" });
+  await s.commit(r2.label, []);
+  assert(r2.text.includes("段落修改搬到新文档"), `报告应说明搬运了修改：${r2.text}`);
+  assert(s.doc.listBlocks().some((b) => b.text.includes("(polished wording)")), "重新转换后应保留润色修改");
+});
+
+await test("行尾连字符：排版断词去掉，复合词 / 缩写 / 多段复合词保留", async () => {
+  const { collectWords, collectHyphenated, isSoftHyphen, wordCounts } = await import("../src/documents/hyphen.js");
+  const text = "The sharpness of edges. A noise-dominated region. attention is gated by a gated unit; attention again. image-to-image";
+  const words = collectWords(text), hy = collectHyphenated(text), counts = wordCounts(text);
+  const soft = (a: string, b: string) => isSoftHyphen(a, b, words, hy, counts);
+  assert(soft("sharp", "ness"), "sharp-ness 是断词");
+  assert(soft("convolu", "tional"), "音节断词");
+  assert(!soft("noise", "dominated"), "文中出现过带连字符的写法");
+  assert(!soft("NDCT", "consistent"), "缩写 + 连字符");
+  assert(!soft("attention", "gated"), "两半都是文中的独立单词");
+  assert(!soft("image-to", "image"), "多段复合词的中间");
+  assert(!soft("CNN", "Transformer"), "大写开头的专有名词复合");
+});
+
+await test("逐页一致方式转换的 Word：提示模型先换成可编辑排版；doc_convert_to_word 可从原 PDF 重新转换", async () => {
+  const s = await Session.create(await fixture("columns.pdf"), "论文.pdf", { mode: "bypassPermissions", trackChanges: false, author: "测试" });
+  const { convertPdfInPlace } = await import("../src/session/convertPdf.js");
+  const r = await convertPdfInPlace(s, { mode: "exact" });
+  await s.commit(r.label, []);
+  const { buildTurnReminder } = await import("../src/context.js");
+  assert(buildTurnReminder(s).includes("版式提示") && buildTurnReminder(s).includes("doc_convert_to_word(layout="), "应提示先转换为可编辑排版");
+  const { findTool } = await import("../src/tools.js");
+  const tool = findTool("doc_convert_to_word")!;
+  assert(tool.isEnabled({ session: s } as any), "已转换的 Word 会话中应可重新转换");
+  const res = await tool.call({} as any, { session: s } as any);
+  assert(String(res.content).includes("100%"), `应报告文字完整性：${res.content}`);
+  await s.commit((res as any).docChange.label, []);
+  eq(s.doc.convertedLayout?.(), "flow", "默认重新转换为流式排版");
+  assert(!buildTurnReminder(s).includes("版式提示"), "流式排版不再提示");
+  eq(s.meta.filename, "论文.docx", "文件名");
+  await s.rollback(0);
+  eq(s.meta.format, "pdf", "仍可回滚到原 PDF");
 });
 
 await test("PDF 直接导出为 Word 文件（两种排版方式），导出命令与 Agent 导出工具在 PDF 会话中可用", async () => {

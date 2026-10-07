@@ -63,6 +63,12 @@ function verify(pages: PageModel[], docx: Buffer, rasterText = "") {
   const src = charCounts(pages.flatMap((p) => p.spans.map((s) => s.text)).join(""));
   // 渲染为图片的区域：文字保存在替代文字中，计为已保留
   const out = charCounts(docxText(docx) + rasterText);
+  // 并入正文字母的重音符号变成了组合字符（F + ˆ → F̂）：按原来的重音符号计数
+  const ACC: Array<[string, string[]]> = [["\u0302", ["ˆ", "^"]], ["\u0303", ["˜", "~"]], ["\u0304", ["¯"]], ["\u0307", ["˙"]], ["\u0308", ["¨"]], ["\u0301", ["´"]], ["\u0300", ["`"]], ["\u030C", ["ˇ"]], ["\u20D7", ["→", "⃗"]]];
+  for (const [comb, chars] of ACC) {
+    let n = out.get(comb) ?? 0;
+    for (const ch of chars) { if (!n) break; const need = Math.max(0, (src.get(ch) ?? 0) - (out.get(ch) ?? 0)); const k = Math.min(n, need); out.set(ch, (out.get(ch) ?? 0) + k); n -= k; }
+  }
   let total = 0, lost = 0;
   const missing: string[] = [];
   for (const [ch, n] of src) {
@@ -81,7 +87,7 @@ function verify(pages: PageModel[], docx: Buffer, rasterText = "") {
 async function runBuiltin(buf: Buffer, title: string, pages: PageModel[], mode: LayoutMode) {
   const notes: string[] = [];
   let model = buildDocModel(pages, { mode, raster: await rasterAvailable() });
-  const regions = model.blocks.flatMap((b) => (b.kind === "p" ? (b.images ?? []).filter((i) => i.render) : []));
+  const regions = model.blocks.flatMap((b) => (b.kind === "p" ? [...(b.images ?? []), ...(b.inlineImages ?? []), ...(b.floats ?? []).map((f) => f.img)].filter((i) => i.render) : []));
   if (regions.length) {
     const ok = await renderRegions(buf, regions).catch(() => 0);
     if (ok < regions.length) {

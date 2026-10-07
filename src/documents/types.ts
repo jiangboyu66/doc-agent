@@ -176,6 +176,10 @@ export interface DocumentAdapter {
 
   /** 把旧版本的临时引用换算成当前引用（段落仍在时） */
   translateRef?(ref: string): string;
+  /** 由本程序从 PDF 转换来的 Word：转换时的版式模式（exact 逐页一致、flow 流式）；其他文档为 undefined */
+  convertedLayout?(): "exact" | "flow" | undefined;
+  /** 整体替换文档内容（全局排版工具使用） */
+  reload?(buf: Buffer): void;
 
   // ---- 扩展能力（可选，由 capabilities 声明是否支持）----
   insertRaw?(p: { anchor: string; position: "before" | "after"; markup: string; label?: string }, o: EditOptions): EditResult;
