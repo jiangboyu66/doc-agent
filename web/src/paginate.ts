@@ -67,6 +67,25 @@ export async function prepareDocx(blob: Blob): Promise<{ blob: Blob; plain: Blob
   return { blob: await zip.generateAsync({ type: "blob", mimeType: mime }), plain, balance, pageStart };
 }
 
+/**
+ * "最小值"行距（w:lineRule="atLeast"）：docx-preview 把它渲染成 line-height: calc(100% + N pt)，
+ * 即字号再加 N pt——约为 Word 里实际行距的 1.9 倍，和固定行距 / 单倍行距的段落排在一起时行距忽松忽紧。
+ * Word 的语义是"至少 N pt，字体自然行高更大时取自然行高"，这里改写成 max(N pt, 1.15em)。
+ * 同时处理样式表（<style>）和段落上的内联样式。
+ */
+const AT_LEAST = /calc\(\s*100%\s*\+\s*(-?[\d.]+)(pt|px)\s*\)/g; // 内联样式经浏览器规范化后单位是 px
+const atLeastValue = (_m: string, n: string, unit: string) => `max(${n}${unit}, 1.15em)`;
+export function fixAtLeastSpacing(root: HTMLElement): void {
+  root.querySelectorAll("style").forEach((st) => {
+    const t = st.textContent ?? "";
+    if (t.includes("calc(")) st.textContent = t.replace(/line-height\s*:\s*calc\([^;}]*\)/g, (m) => m.replace(AT_LEAST, atLeastValue));
+  });
+  root.querySelectorAll<HTMLElement>('[style*="calc("]').forEach((el) => {
+    const v = el.style.lineHeight;
+    if (v && v.startsWith("calc(")) el.style.lineHeight = v.replace(AT_LEAST, atLeastValue);
+  });
+}
+
 /** 填入页眉页脚中的页码，并在每页下方加"第 n 页 / 共 N 页"标注；返回总页数 */
 export function numberPages(root: HTMLElement, start = 1): number {
   const wrapper = root.querySelector<HTMLElement>(".docx-wrapper") ?? root;
