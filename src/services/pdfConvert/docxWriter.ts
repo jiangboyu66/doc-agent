@@ -66,6 +66,17 @@ class Writer {
   }
 
   private run(r: Run): string {
+    if (r.img && !r.tab && !r.br && !r.pageMark && !r.field) {
+      // 行内公式 / 符号图片：图片底边默认落在基线上，按 imgLower 降低 / 升高（w:position，半磅）
+      if (!r.img.png.length) return "";
+      const k = r.imgScale ?? 1;
+      const { cx, cy, xml } = this.picture(k === 1 ? r.img : { ...r.img, x1: r.img.x0 + (r.img.x1 - r.img.x0) * k, y1: r.img.y0 + (r.img.y1 - r.img.y0) * k });
+      const lower = Math.round((r.imgLower ?? 0) * 2); // 半磅；正值为降低，负值为升高
+      return (
+        `<w:r><w:rPr><w:noProof/>${lower ? `<w:position w:val="${-lower}"/>` : ""}</w:rPr><w:drawing><wp:inline distT="0" distB="0" distL="0" distR="0">` +
+        `<wp:extent cx="${cx}" cy="${cy}"/><wp:effectExtent l="0" t="0" r="0" b="0"/>${xml}</wp:inline></w:drawing></w:r>`
+      );
+    }
     if (r.tab) return `<w:r>${this.rPr(r)}<w:tab/></w:r>`;
     // 逐行一致模式的排版换行：clear="none"（与普通换行等效）作为标记，编辑时可识别并去掉
     if (r.br) return `<w:r>${this.rPr(r)}<w:br w:clear="none"/></w:r>`;
@@ -214,9 +225,11 @@ class Writer {
     if (p.tabs.length) ppr.push(`<w:tabs>${p.tabs.map((t) => `<w:tab w:val="${t.align}" w:pos="${tw(t.pos)}"/>`).join("")}</w:tabs>`);
     ppr.push('<w:autoSpaceDE w:val="0"/><w:autoSpaceDN w:val="0"/><w:adjustRightInd w:val="0"/><w:snapToGrid w:val="0"/>');
     // 图片段落：单倍行距（行高自动等于图片高度；不用"最小值"——浏览器预览会把它当成行高，图片上方多出一大块空白），其余为固定行距
+    // 固定行距会裁掉比行高更高的内容（首字母、行内公式图片）：这种段落改用"最小值"，行高不变、内容不被裁
+    const tall = !p.tiny && p.runs.some((r) => (r.img ? (r.img.y1 - r.img.y0) * (r.imgScale ?? 1) > p.lineHeight : !r.tab && !r.br && !!r.text.trim() && r.size > 1.08 * p.lineHeight));
     ppr.push(p.inlineImages?.length
       ? `<w:spacing w:before="${tw(p.spaceBefore)}" w:after="0" w:line="240" w:lineRule="auto"/>`
-      : `<w:spacing w:before="${tw(p.spaceBefore)}" w:after="0" w:line="${Math.max(20, tw(p.lineHeight))}" w:lineRule="exact"/>`);
+      : `<w:spacing w:before="${tw(p.spaceBefore)}" w:after="0" w:line="${Math.max(20, tw(p.lineHeight))}" w:lineRule="${tall ? "atLeast" : "exact"}"/>`);
     const ind: string[] = [];
     if (p.indLeft) ind.push(`w:left="${tw(p.indLeft)}"`);
     if (p.indRight) ind.push(`w:right="${tw(p.indRight)}"`);

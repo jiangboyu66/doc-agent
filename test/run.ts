@@ -938,6 +938,68 @@ await test("位图切片拼成的组图（图题以 (a) 开头）合并为一张
   assert(pg.spans.some((x: any) => x.text === "FIGURE 1."), "图题仍保留为正文");
 });
 
+await test("Type 3 字形（位图蒙版 / 乱码编码）的公式与符号：行内的作为行内图片插回原行，独立的成图（含编号），不出现 Type3 字体、文字不丢", async () => {
+  const { pdfToDocx } = await import("../src/services/pdfConvert/index.js");
+  const { rasterAvailable } = await import("../src/services/pdfConvert/render.js");
+  const pdf = await fixture("type3-math.pdf");
+  const paraText = (p: string) => p.replace(/<wp:inline[\s\S]*?<\/wp:inline>/g, "[IMG]").replace(/<[^>]+>/g, "");
+  for (const mode of ["exact", "flow"] as const) {
+    const { data, report } = await pdfToDocx(pdf, { mode });
+    const xml = new ZipPackage(data).readText("word/document.xml");
+    eq(report.textCoverage, 1, `${mode}：文字完整性`);
+    assert(!/w:ascii="Type3"/.test(xml), `${mode}：Word 中没有 "Type3" 这个字体，不应写进文档`);
+    assert(report.equations >= 1, `${mode}：独立成行的位图公式应成图：${JSON.stringify(report)}`);
+    const paras = (xml.match(/<w:p [^>]*>[\s\S]*?<\/w:p>/g) ?? []).map(paraText);
+    // 行内的位图字形：图片在原来那一行的文字之间
+    assert(paras.some((t) => /loss of transaction\s*\[IMG\]\s*, which is computed below/.test(t)), `${mode}：行内位图字形应插回原行：${paras.join(" | ")}`);
+    // 公式编号并进公式图片，不单独成段
+    assert(!paras.some((t) => t.trim() === "(1)"), `${mode}：公式编号应并进公式图片`);
+    // 固定行距的行不能被行内图片撑高（逐行一致模式按页面排满，一行变高就会把栏底的行挤到下一页）
+    if (mode === "exact") assert(!/<w:p [^>]*>(?:(?!<\/w:p>)[\s\S])*w:lineRule="atLeast"(?:(?!<\/w:p>)[\s\S])*loss of transaction/.test(xml), "行内图片应放进固定行距");
+    if (await rasterAvailable()) {
+      // Type 3 矢量字形（编码为控制字符）按原样渲染成行内图片
+      assert(paras.some((t) => /equals the total loss\s*\[IMG\]\s*of the system/.test(t)), `${mode}：Type 3 矢量字形应渲染成行内图片：${paras.join(" | ")}`);
+    }
+  }
+  // 没有画布时：位图字形由蒙版直接合成，公式与符号仍以图片保留
+  const prev = process.env.PDF_RASTER;
+  process.env.PDF_RASTER = "0";
+  try {
+    const { data, report } = await pdfToDocx(pdf, { mode: "flow" });
+    const pkg = new ZipPackage(data);
+    const xml = pkg.readText("word/document.xml");
+    eq(report.textCoverage, 1, "无画布：文字完整性");
+    assert(!/w:ascii="Type3"/.test(xml), "无画布：不出现 Type3 字体");
+    const paras = (xml.match(/<w:p [^>]*>[\s\S]*?<\/w:p>/g) ?? []).map(paraText);
+    assert(paras.some((t) => /loss of transaction\s*\[IMG\]/.test(t)), "无画布：行内位图字形仍以图片插回原行");
+    assert(report.equations >= 1, "无画布：独立公式仍由蒙版合成成图");
+  } finally {
+    if (prev === undefined) delete process.env.PDF_RASTER; else process.env.PDF_RASTER = prev;
+  }
+});
+
+await test("首字下沉与正文同基线时仍识别为首字下沉；多行居中的标题不被误判为两端对齐；画成短横线的破折号还原为文字", async () => {
+  const { detectDropCaps } = await import("../src/services/pdfConvert/raster.js");
+  const sp = (text: string, x0: number, x1: number, baseline: number, size: number) => ({ text, x0, x1, top: baseline - 0.75 * size, bottom: baseline + 0.22 * size, baseline, size, font: "Times New Roman", bold: false, italic: false, color: "000000" });
+  const line = (spans: any[]) => ({ spans, x0: Math.min(...spans.map((s) => s.x0)), x1: Math.max(...spans.map((s) => s.x1)), top: Math.min(...spans.map((s) => s.top)), bottom: Math.max(...spans.map((s) => s.bottom)), baseline: spans[spans.length - 1].baseline, size: spans[spans.length - 1].size });
+  // "T" 的基线与第二行正文对齐，被并进第二行："T rapid disintegration…"
+  const l1 = line([sp("HE open access transmission regime is spearheading the", 60, 290, 410, 10)]);
+  const l2 = line([sp("T", 40, 57, 422, 30), sp("rapid disintegration of the well-entrenched vertically inte-", 60, 290, 422, 10)]);
+  const l3 = line([sp("grated structure of the electric power industry. The entry of a", 40, 290, 434, 10)]);
+  const caps = detectDropCaps([l1, l2, l3] as any, { bodySize: 10, bodyBase: "TIMES", bodyIsTeX: false });
+  eq(caps.length, 1, "应识别出首字下沉");
+  assert(caps[0].rest && caps[0].rest.spans.length === 1 && caps[0].rest.spans[0].text.startsWith("rapid"), "其余正文应放回原行");
+
+  const { pdfToDocx } = await import("../src/services/pdfConvert/index.js");
+  for (const mode of ["exact", "flow"] as const) {
+    const { data } = await pdfToDocx(await fixture("type3-math.pdf"), { mode });
+    const xml = new ZipPackage(data).readText("word/document.xml");
+    const title = (xml.match(/<w:p [^>]*>(?:(?!<\/w:p>)[\s\S])*?A Physical-Flow-Based Approach(?:(?!<\/w:p>)[\s\S])*?<\/w:p>/) ?? [""])[0];
+    assert(/<w:jc w:val="center"\/>/.test(title), `${mode}：两行居中的标题应居中（版心被页码撑宽也不影响）`);
+    assert(/\[2\]\s*(<[^>]+>)*\s*——/.test(xml.replace(/<w:tab\/>/g, " ")), `${mode}：画成短横线的破折号应还原为 "——"`);
+  }
+});
+
 // ---------------------------------------------------------------------------
 
 await fs.rm(tmp, { recursive: true, force: true });

@@ -6,7 +6,22 @@
  * 转换自动退回"不渲染"的模式（这些区域按文字处理）。
  */
 
+import { createRequire } from "node:module";
+import path from "node:path";
 import type { ImageBox } from "./extract.js";
+
+/**
+ * pdf.js 自带的标准字体与 CMap 数据：PDF 没有嵌入的 Times / Helvetica 等标准字体、CJK 编码表。
+ * 不提供时这些文字在渲染出的图片里会缺失（例如公式中的 "if"、公式编号）。
+ */
+export function pdfjsDataOptions(): Record<string, unknown> {
+  try {
+    const dir = path.dirname(createRequire(import.meta.url).resolve("pdfjs-dist/package.json"));
+    return { standardFontDataUrl: path.join(dir, "standard_fonts") + path.sep, cMapUrl: path.join(dir, "cmaps") + path.sep, cMapPacked: true };
+  } catch {
+    return {};
+  }
+}
 
 let napi: any | null | undefined;
 
@@ -55,7 +70,7 @@ export async function renderRegions(buf: Buffer, boxes: ImageBox[], dpi = 288): 
   const pdfjs: any = await import("pdfjs-dist/legacy/build/pdf.mjs");
   const doc = await pdfjs.getDocument({
     data: new Uint8Array(buf), CanvasFactory, disableFontFace: true, useSystemFonts: false,
-    isOffscreenCanvasSupported: false, verbosity: 0,
+    isOffscreenCanvasSupported: false, verbosity: 0, ...pdfjsDataOptions(),
   }).promise;
   const scale = dpi / 72;
   let done = 0;

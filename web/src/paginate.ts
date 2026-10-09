@@ -46,7 +46,7 @@ function markFields(xml: string): string {
  *   - 页眉页脚中的页码域换成占位符（两份渲染都需要），渲染后填入实际页码；
  *   - 读取"连续分节前不平衡分栏"兼容选项（期刊排版会打开）与起始页码。
  */
-export async function prepareDocx(blob: Blob): Promise<{ blob: Blob; plain: Blob; balance: boolean; pageStart: number; wraps: WrapDist[] }> {
+export async function prepareDocx(blob: Blob): Promise<{ blob: Blob; plain: Blob; balance: boolean; pageStart: number; wraps: WrapDist[]; anchors: PageAnchor[]; expandBreaks: boolean }> {
   const zip = await JSZip.loadAsync(blob);
   const settings = await zip.file("word/settings.xml")?.async("string");
   const balance = !(settings && /<\w+:noColumnBalance(\s|\/|>)/.test(settings) && !/<\w+:noColumnBalance\s+\w+:val="(0|false)"/.test(settings));
@@ -59,13 +59,213 @@ export async function prepareDocx(blob: Blob): Promise<{ blob: Blob; plain: Blob
     if (y !== x) { zip.file(name, y); changed = true; }
   }
   const f = zip.file("word/document.xml");
-  const xml = f ? await f.async("string") : "";
+  let xml = f ? await f.async("string") : "";
   const pageStart = Number(/<\w+:pgNumType\b[^>]*\w+:start="(\d+)"/.exec(xml)?.[1] ?? 1) || 1;
   const wraps = wrapDistances(xml);
+  // 手动换行结束的两端对齐行：Word 默认也会两端对齐（除非打开了 doNotExpandShiftReturn 兼容选项）
+  const expandBreaks = !(settings && /<\w+:doNotExpandShiftReturn(\s|\/|>)/.test(settings) && !/<\w+:doNotExpandShiftReturn\s+\w+:val="(0|false)"/.test(settings));
+  let anchors: PageAnchor[] = [];
+  try {
+    const r = liftPageAnchors(xml);
+    if (r.anchors.length) { xml = r.xml; anchors = r.anchors; zip.file("word/document.xml", xml); changed = true; }
+  } catch { /* 解析失败：保持原样 */ }
   const plain = changed ? await zip.generateAsync({ type: "blob", mimeType: mime }) : blob;
-  if (!xml.includes("lastRenderedPageBreak")) return { blob: plain, plain, balance, pageStart, wraps };
+  if (!xml.includes("lastRenderedPageBreak")) return { blob: plain, plain, balance, pageStart, wraps, anchors, expandBreaks };
   zip.file("word/document.xml", xml.replace(/<w:lastRenderedPageBreak\s*\/>/g, ""));
-  return { blob: await zip.generateAsync({ type: "blob", mimeType: mime }), plain, balance, pageStart, wraps };
+  return { blob: await zip.generateAsync({ type: "blob", mimeType: mime }), plain, balance, pageStart, wraps, anchors, expandBreaks };
+}
+
+// ---------------------------------------------------------------------------
+// 按页面坐标定位的图片 / 文本框 / 图形
+// ---------------------------------------------------------------------------
+
+/**
+ * 不环绕文字、相对页面（或页边距）定位的对象。docx-preview 不支持这种定位（图片画在所在行内、文本框和图形根本不画），
+ * 逐页保留原排版的文档里首字下沉、页眉页脚文字、插图、分隔线都是这样放的。
+ * 渲染前把它们换成 docx-preview 能渲染的形式（图片 → 行内图片，文本框 → 普通段落），前面放书签作标记；
+ * 渲染后由 placePageAnchors() 按原坐标绝对定位到所在页面上。
+ */
+export interface PageAnchor {
+  k: number;
+  kind: "pic" | "text" | "shape";
+  /** 相对页面 / 页边距的位置与尺寸（pt） */
+  x: number; y: number; w: number; h: number;
+  relH: "page" | "margin"; relV: "page" | "margin";
+  behind: boolean;
+  /** 文本框的段落数 */
+  paras?: number;
+  /** 图形：直线 / 矩形的线色、填充色、线宽 */
+  shape?: { prst: string; fill?: string; line?: string; lw: number; flipV: boolean };
+}
+
+const NS_W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+const NS_WP = "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing";
+
+function liftPageAnchors(xml: string): { xml: string; anchors: PageAnchor[] } {
+  if (!xml.includes("wp:anchor") && !xml.includes(":anchor")) return { xml, anchors: [] };
+  const doc = new DOMParser().parseFromString(xml, "application/xml");
+  if (doc.getElementsByTagName("parsererror").length) return { xml, anchors: [] };
+  const kids = (e: Element, local: string) => Array.from(e.children).filter((c) => c.localName === local);
+  const kid = (e: Element | undefined, local: string) => (e ? kids(e, local)[0] : undefined);
+  const desc = (e: Element, local: string) => Array.from(e.getElementsByTagName("*")).filter((c) => c.localName === local);
+  const up = (e: Element, local: string) => { let c: Element | null = e.parentElement; while (c && c.localName !== local) c = c.parentElement; return c; };
+  const emu = (v: string | null | undefined) => (Number(v) || 0) / 12700;
+  const anchors: PageAnchor[] = [];
+  let bmId = 900000;
+  const bookmark = (name: string) => {
+    const s = doc.createElementNS(NS_W, "w:bookmarkStart");
+    s.setAttributeNS(NS_W, "w:id", String(++bmId)); s.setAttributeNS(NS_W, "w:name", name);
+    const e = doc.createElementNS(NS_W, "w:bookmarkEnd");
+    e.setAttributeNS(NS_W, "w:id", String(bmId));
+    return [s, e];
+  };
+  for (const a of Array.from(doc.getElementsByTagNameNS(NS_WP, "anchor"))) {
+    if (!kid(a, "wrapNone")) continue; // 环绕文字的浮动对象交给 docx-preview 的浮动排版
+    if (up(a, "txbxContent") || up(a, "AlternateContent")) continue;
+    const ph = kid(a, "positionH"), pv = kid(a, "positionV");
+    const relH = ph?.getAttribute("relativeFrom"), relV = pv?.getAttribute("relativeFrom");
+    const offH = kid(ph, "posOffset"), offV = kid(pv, "posOffset");
+    if (!offH || !offV || !(relH === "page" || relH === "margin") || !(relV === "page" || relV === "margin")) continue;
+    const run = up(a, "r"), para = up(a, "p");
+    if (!run || !para || !run.parentNode) continue;
+    const ext = kid(a, "extent");
+    const item: PageAnchor = {
+      k: anchors.length, kind: "pic", x: emu(offH.textContent), y: emu(offV.textContent), w: emu(ext?.getAttribute("cx")), h: emu(ext?.getAttribute("cy")),
+      relH, relV, behind: a.getAttribute("behindDoc") === "1",
+    };
+    const graphic = desc(a, "graphic")[0];
+    const gd = graphic ? kid(graphic, "graphicData") : undefined;
+    const txbx = desc(a, "txbxContent")[0];
+    const drawing = up(a, "drawing");
+    if (gd && kid(gd, "pic")) {
+      // 图片 → 行内图片（同样的尺寸与图片数据）
+      const inline = doc.createElementNS(NS_WP, "wp:inline");
+      for (const at of ["distT", "distB", "distL", "distR"]) inline.setAttribute(at, "0");
+      for (const local of ["extent", "effectExtent", "docPr", "cNvGraphicFramePr"]) { const c = kid(a, local); if (c) inline.appendChild(c); }
+      inline.appendChild(graphic!);
+      a.replaceWith(inline);
+      const [s, e] = bookmark(`_pva_${item.k}`);
+      run.parentNode.insertBefore(s, run); run.parentNode.insertBefore(e, run);
+    } else if (txbx) {
+      // 文本框 → 紧跟在所在段落之后的普通段落（各带标记），渲染后再移到原位置
+      const ps = kids(txbx, "p");
+      let at: Node = para;
+      ps.forEach((p, i) => {
+        const [s, e] = bookmark(`_pvt_${item.k}_${i}`);
+        const ppr = kid(p, "pPr");
+        p.insertBefore(e, ppr ? ppr.nextSibling : p.firstChild); p.insertBefore(s, e);
+        para.parentNode!.insertBefore(p, at.nextSibling); at = p;
+      });
+      item.kind = "text"; item.paras = ps.length;
+      drawing?.remove();
+    } else if (gd && desc(gd, "wsp").length) {
+      // 直线、矩形等图形
+      const geom = desc(gd, "prstGeom")[0]?.getAttribute("prst") ?? "rect";
+      const spPr = desc(gd, "spPr")[0];
+      const fillClr = spPr && kid(spPr, "solidFill") ? desc(kid(spPr, "solidFill")!, "srgbClr")[0]?.getAttribute("val") ?? undefined : undefined;
+      const ln = spPr ? kid(spPr, "ln") : undefined;
+      const lineClr = ln && !kid(ln, "noFill") ? desc(ln, "srgbClr")[0]?.getAttribute("val") ?? "000000" : undefined;
+      const xfrm = spPr ? kid(spPr, "xfrm") : undefined;
+      item.kind = "shape";
+      item.shape = { prst: geom, fill: fillClr, line: lineClr, lw: emu(ln?.getAttribute("w")) || 0.75, flipV: xfrm?.getAttribute("flipV") === "1" };
+      const [s, e] = bookmark(`_pvs_${item.k}`);
+      run.parentNode.insertBefore(s, run); run.parentNode.insertBefore(e, run);
+      drawing?.remove();
+    } else continue;
+    anchors.push(item);
+  }
+  return { xml: new XMLSerializer().serializeToString(doc), anchors };
+}
+
+/** 把 liftPageAnchors() 标记过的对象按原坐标绝对定位到所在页面上（放在页面元素下，不参与正文排版和分页） */
+export function placePageAnchors(root: HTMLElement, anchors: PageAnchor[]): void {
+  for (const it of anchors) {
+    const marker = root.querySelector<HTMLElement>(it.kind === "text" ? `[id="_pvt_${it.k}_0"]` : it.kind === "pic" ? `[id="_pva_${it.k}"]` : `[id="_pvs_${it.k}"]`);
+    const sec = marker?.closest<HTMLElement>("section.docx");
+    if (!marker || !sec) continue;
+    const cs = getComputedStyle(sec);
+    const px2pt = 0.75;
+    const dx = it.relH === "margin" ? parseFloat(cs.paddingLeft) * px2pt : 0;
+    const dy = it.relV === "margin" ? parseFloat(cs.paddingTop) * px2pt : 0;
+    const box = document.createElement("div");
+    box.className = "pv-abs";
+    box.style.cssText = `position:absolute;left:${it.x + dx}pt;top:${it.y + dy}pt;width:${it.w}pt;min-height:${it.h}pt;z-index:${it.behind ? 0 : 2};pointer-events:none;`;
+    if (it.kind === "pic") {
+      const run = marker.nextElementSibling;
+      if (!run) continue;
+      box.appendChild(run);
+    } else if (it.kind === "text") {
+      for (let i = 0; i < (it.paras ?? 1); i++) {
+        const p = root.querySelector<HTMLElement>(`[id="_pvt_${it.k}_${i}"]`)?.closest<HTMLElement>("p");
+        if (!p) continue;
+        p.style.margin = "0";
+        box.appendChild(p);
+      }
+    } else if (it.shape) {
+      const sh = it.shape;
+      if (sh.prst === "line") {
+        // 直线：外框的对角线；水平 / 竖直线最常见
+        const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="100%" height="100%" viewBox="0 0 ${Math.max(it.w, 0.01)} ${Math.max(it.h, 0.01)}" preserveAspectRatio="none" style="overflow:visible;position:absolute;left:0;top:0">` +
+          `<line x1="0" y1="${sh.flipV ? it.h : 0}" x2="${it.w}" y2="${sh.flipV ? 0 : it.h}" stroke="#${sh.line ?? "000000"}" stroke-width="${sh.lw}" vector-effect="non-scaling-stroke"/></svg>`;
+        box.innerHTML = svg;
+        box.style.height = `${it.h}pt`;
+      } else {
+        box.style.height = `${it.h}pt`;
+        if (sh.fill) box.style.background = `#${sh.fill}`;
+        if (sh.line) box.style.border = `${sh.lw}pt solid #${sh.line}`;
+        box.style.boxSizing = "border-box";
+      }
+    }
+    sec.appendChild(box);
+  }
+}
+
+/**
+ * 固定行距的段落：Word 中每行高度固定，CSS 却会被撑高——
+ *   - 段落自身字号形成的"支柱"与大字号文字按基线对齐时，行框高于行距（标题、大字号的行）；
+ *   - 上标 / 下标的升降也会撑高行框。
+ * 逐行累积下来，正文越往下越比 PDF 低，按页面坐标放置的首字下沉、插图就和文字对不上。
+ * 做法：段落字号设为段内最大的字号（各段文字先固定自己的字号），上下标的行高设为 0。
+ */
+export function fixExactLineBoxes(root: HTMLElement): void {
+  root.querySelectorAll<HTMLElement>("p").forEach((p) => {
+    const lh = p.style.lineHeight;
+    if (!lh || !/(pt|px)$/.test(lh) || p.style.minHeight !== lh) return; // docx-preview 对固定行距同时设置 line-height 与 min-height
+    let max = 0;
+    const texts = Array.from(p.querySelectorAll<HTMLElement>("span")).filter((sp) => Array.from(sp.childNodes).some((n) => n.nodeType === 3 && n.textContent!.trim()));
+    for (const sp of texts) {
+      const cs = getComputedStyle(sp);
+      const fs = parseFloat(cs.fontSize);
+      sp.style.fontSize = cs.fontSize;
+      const va = cs.verticalAlign;
+      if (va !== "baseline" && !/^-?0(px)?$/.test(va)) sp.style.lineHeight = "0";
+      else if (fs > max) max = fs;
+    }
+    p.querySelectorAll<HTMLElement>("sup, sub").forEach((x) => { x.style.lineHeight = "0"; });
+    if (max > 0) p.style.fontSize = `${max}px`;
+  });
+}
+
+/**
+ * 以手动换行结束的两端对齐行：浏览器不对齐（text-align: justify 不作用于强制换行之前的行），Word 默认会对齐。
+ * 逐页保留原排版的文档每一行都以换行结束，不处理的话整页行尾参差不齐。
+ * 做法：text-align-last: justify 让这些行对齐；段落真正的最后一行包进一个行内块，保持左对齐。
+ */
+export function justifyForcedBreaks(root: HTMLElement): void {
+  root.querySelectorAll<HTMLElement>("p").forEach((p) => {
+    const brs = p.querySelectorAll("br");
+    if (!brs.length || getComputedStyle(p).textAlign !== "justify") return;
+    p.style.textAlignLast = "justify";
+    let top: Node = brs[brs.length - 1];
+    while (top.parentNode && top.parentNode !== p) top = top.parentNode;
+    const tail: Node[] = [];
+    for (let n = top.nextSibling; n; n = n.nextSibling) tail.push(n);
+    if (!tail.some((n) => (n.textContent ?? "").trim() || (n instanceof Element && n.querySelector("img")))) return;
+    const box = document.createElement("span");
+    box.style.cssText = "display:inline-block;text-align:left;text-align-last:auto;text-indent:0;";
+    p.insertBefore(box, tail[0]);
+    for (const n of tail) box.appendChild(n);
+  });
 }
 
 /**
@@ -261,7 +461,10 @@ export function paginate(content: HTMLElement, hf: HTMLElement | null, opts: { b
       return [head, tail];
     };
 
-    const children = Array.from(src.children).filter((x): x is HTMLElement => x instanceof HTMLElement && x.tagName !== "HEADER" && x.tagName !== "FOOTER");
+    // 按页面坐标定位的对象（placePageAnchors）不参与排版，放到这一节分出的第一页上
+    const absolutes = Array.from(src.children).filter((x): x is HTMLElement => x instanceof HTMLElement && x.classList.contains("pv-abs"));
+    const firstPage = page;
+    const children = Array.from(src.children).filter((x): x is HTMLElement => x instanceof HTMLElement && x.tagName !== "HEADER" && x.tagName !== "FOOTER" && !x.classList.contains("pv-abs"));
     let last: HTMLElement | null = null; // 本页最后一个容器
     let lastCols = 0;
     /** 推迟到下一页顶部的通栏图表（与 LaTeX 的页顶浮动体一致：文字继续排满本页，不留空白） */
@@ -357,8 +560,9 @@ export function paginate(content: HTMLElement, hf: HTMLElement | null, opts: { b
     }
     // 文末还有推迟的图表：放得下就放在本页，否则下一页
     flushDeferred();
+    for (const a of absolutes) firstPage.appendChild(a);
     // 空的末页（恰好排满时）去掉
-    if (body && !body.textContent?.trim() && !body.querySelector("img,svg,table")) page.remove();
+    if (body && !body.textContent?.trim() && !body.querySelector("img,svg,table") && page !== firstPage) page.remove();
     src.remove();
   }
   return pageNo;

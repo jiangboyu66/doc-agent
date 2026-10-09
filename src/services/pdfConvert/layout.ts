@@ -12,7 +12,7 @@
 
 import type { FillRect, ImageBox, PageModel, Seg, Span } from "./extract.js";
 import { collectHyphenated, collectWords, isSoftHyphen, wordCounts } from "../../documents/hyphen.js";
-import { detectDropCaps, detectEquations, detectFigures, detectImageGrids, rawBase, rasterBox, removeInside, spansText, type Box, type MathCtx } from "./raster.js";
+import { detectDropCaps, detectEquations, detectFigures, detectImageGrids, detectMaskInk, rawBase, rasterBox, removeInside, spansText, type Box, type MathCtx } from "./raster.js";
 
 export interface Run {
   text: string;
@@ -37,6 +37,12 @@ export interface Run {
   field?: "PAGE";
   /** 原 PDF 的分页位置（写成 lastRenderedPageBreak，浏览器预览据此分页） */
   pageMark?: boolean;
+  /** 行内图片（没有文字编码的公式 / 符号）：text 为占位符 U+FFFC */
+  img?: ImageBox;
+  /** 行内图片底边在基线以下的距离（pt），写成字符位置（降低） */
+  imgLower?: number;
+  /** 行内图片的缩放比例（比行距略高的图缩小到正好放进一行，不撑高行距、不被固定行距裁掉） */
+  imgScale?: number;
 }
 
 export interface TabStop { pos: number; align: "left" | "right" }
@@ -124,7 +130,7 @@ export interface DocModel {
   finalSection: SectionProps;
   bodyFont: string;
   bodySize: number;
-  stats: { pages: number; paragraphs: number; tables: number; images: number; vectorShapes: number; rotatedText: number; columnPages: number; figures: number; equations: number };
+  stats: { pages: number; paragraphs: number; tables: number; images: number; vectorShapes: number; rotatedText: number; columnPages: number; figures: number; equations: number; inlineMath?: number };
   /** 渲染为图片的区域中的文字（计入完整性校验） */
   rasterText: string;
   mode: LayoutMode;
@@ -547,6 +553,29 @@ function groupParagraphs(lines: Line[], r: Region): Array<{ lines: Line[]; edge:
   return paras.map((lines, i) => ({ lines, edge: paraEdge[i] }));
 }
 
+/**
+ * 行内公式图片放进固定行距的一行：Word 的固定行距中基线以上约"行距 − 下沉"、以下约下沉（≈0.21 字号），
+ * 超出的部分会被裁掉，改"最小值"又会撑高行、把栏挤出页面。
+ *   - 总高度不超过行距：只调整升降（偏移通常不到 1pt），整图落进行框；
+ *   - 略高于行距（≤1.6 倍，如带上下限的求和号）：等比缩小到正好放下；
+ *   - 更高的：可编辑排版保持原尺寸（段落改用"最小值"行距）；逐行一致模式也缩放（不能撑高行）。
+ */
+function fitInline(img: ImageBox, l: Line, lineHeight: number, mode: LayoutMode): { imgLower: number; imgScale?: number } {
+  const h = img.y1 - img.y0, lower = img.y1 - l.baseline;
+  const d = 0.21 * l.size, L = lineHeight;
+  const place = (hh: number, low: number) => Math.min(Math.max(low, hh - (L - d) + 0.15), d - 0.15);
+  if (h <= L - 0.3) return { imgLower: place(h, lower) };
+  // 逐行一致模式：行、栏、页与原文一一对应，任何一行被撑高都会把栏底的行挤到下一栏 / 下一页，一律缩放
+  if (h <= 1.6 * L || mode === "exact") {
+    const k = (L - 0.3) / h;
+    return { imgLower: place(h * k, lower * k), imgScale: k };
+  }
+  return { imgLower: lower };
+}
+
+/** 换行、制表符等控制 run 的格式：不带行内图片 */
+const plainFmt = (f: Omit<Run, "text" | "tab">): Omit<Run, "text" | "tab"> => { const { img: _i, imgLower: _l, imgScale: _s, ...rest } = f; return rest; };
+
 function spanFormat(s: Span, lineSize: number, lineBaseline: number): Omit<Run, "text" | "tab"> {
   let vertAlign: Run["vertAlign"];
   let size = s.size;
@@ -555,13 +584,21 @@ function spanFormat(s: Span, lineSize: number, lineBaseline: number): Omit<Run, 
     else if (s.baseline > lineBaseline + 0.08 * lineSize) vertAlign = "subscript";
     if (vertAlign) size = Math.max(s.size / 0.66, s.size);
   }
+  if (s.img) return { font: s.font, size: lineSize, bold: false, italic: false, color: s.color, img: s.img, imgLower: s.img.y1 - lineBaseline };
   return { font: s.font, size, bold: s.bold, italic: s.italic, color: s.color, underline: s.underline, strike: s.strike, vertAlign };
 }
 
 const sameFmt = (a: Run, b: Omit<Run, "text" | "tab">) =>
-  !a.tab && !a.br && a.font === b.font && a.size === b.size && a.bold === b.bold && a.italic === b.italic && a.color === b.color && !!a.underline === !!b.underline && !!a.strike === !!b.strike && a.vertAlign === b.vertAlign;
+  !a.tab && !a.br && !a.img && !b.img && a.font === b.font && a.size === b.size && a.bold === b.bold && a.italic === b.italic && a.color === b.color && !!a.underline === !!b.underline && !!a.strike === !!b.strike && a.vertAlign === b.vertAlign;
 
 function pushText(runs: Run[], text: string, fmt: Omit<Run, "text" | "tab">) {
+  if (fmt.img) {
+    // 行内图片：前面的空格单独成一段文字，图片自成一个 run
+    const lead = /^\s+/.exec(text)?.[0];
+    if (lead) pushText(runs, lead, plainFmt(fmt));
+    runs.push({ text: "\uFFFC", ...fmt });
+    return;
+  }
   const last = runs[runs.length - 1];
   if (last && sameFmt(last, fmt)) last.text += text;
   else runs.push({ text, ...fmt });
@@ -643,7 +680,13 @@ function buildPara(lines: Line[], r: Region, blockEdge: number, ctx: Ctx): Para 
   // 顺序：居中 → 两端对齐 → 右对齐。图片旁边的两端对齐文字左边齐、右边也齐，不能误判成右对齐；
   // 真正的右对齐多行文字左边参差不齐
   const leftSpread = Math.max(...lines.map((l) => l.x0)) - Math.min(...lines.map((l) => l.x0));
-  if (lines.every((l) => isCentered(l, r)) && !lines.some(hasBigGap)) align = "center";
+  // 多行居中（论文标题等）：各行中心重合、起点各不相同。不依赖版心——版心可能被页码等撑宽，标题是相对正文居中的；
+  // 两端对齐的段落各行起点相同（首行缩进的那一行中心偏开），左对齐的参差段落起点也相同
+  const centers = lines.map((l) => (l.x0 + l.x1) / 2);
+  const cMean = centers.reduce((a, b) => a + b, 0) / Math.max(1, centers.length);
+  const centeredBlock = lines.length >= 2 && centers.every((c) => Math.abs(c - cMean) <= 2) &&
+    Math.max(...lines.map((l) => l.x0)) - Math.min(...lines.map((l) => l.x0)) > 3;
+  if ((lines.every((l) => isCentered(l, r)) || centeredBlock) && !lines.some(hasBigGap)) align = "center";
   else if (lines.length >= 2 && isJustified(lines, paraRight)) align = "both";
   else if (lines.every((l) => isRight(l, r)) && !lines.some(hasBigGap) && (lines.length === 1 || leftSpread > 3)) align = "right";
 
@@ -675,7 +718,7 @@ function buildPara(lines: Line[], r: Region, blockEdge: number, ctx: Ctx): Para 
       const prev = runs[runs.length - 1];
       if (ctx.mode === "exact") {
         if (prev && !prev.tab) prev.text = prev.text.replace(/\s+$/, "");
-        runs.push({ text: "", br: true, ...spanFormat(lines[li - 1].spans[lines[li - 1].spans.length - 1], lines[li - 1].size, lines[li - 1].baseline) });
+        runs.push({ text: "", br: true, ...plainFmt(spanFormat(lines[li - 1].spans[lines[li - 1].spans.length - 1], lines[li - 1].size, lines[li - 1].baseline)) });
       } else {
         if (prev && !prev.tab) prev.text = prev.text.replace(/\s+$/, "");
         const prevCh = prev?.text.slice(-1) ?? "";
@@ -702,6 +745,7 @@ function buildPara(lines: Line[], r: Region, blockEdge: number, ctx: Ctx): Para 
     const lineStart = runs.length;
     l.spans.forEach((s, si) => {
       const fmt = spanFormat(s, l.size, l.baseline);
+      if (s.img) Object.assign(fmt, fitInline(s.img, l, lineHeight, ctx.mode));
       let text = li === 0 && si === 0 ? s.text.replace(/^\s+/, "") : s.text;
       if (si > 0) {
         const p = l.spans[si - 1];
@@ -718,7 +762,7 @@ function buildPara(lines: Line[], r: Region, blockEdge: number, ctx: Ctx): Para 
           if (!tabs.some((t) => Math.abs(t.pos - tab.pos) < 1)) tabs.push(tab);
           const last = runs[runs.length - 1];
           if (last) last.text = last.text.replace(/\s+$/, "");
-          runs.push({ text: "", tab: true, ...fmt });
+          runs.push({ text: "", tab: true, ...plainFmt(fmt) });
           text = text.replace(/^\s+/, "");
         } else if (gap > 0.18 * l.size && !/\s$/.test(runs[runs.length - 1]?.text ?? "") && !/^\s/.test(text)) {
           const pc = p.text.slice(-1), nc = text[0] ?? "";
@@ -777,7 +821,7 @@ function buildPara(lines: Line[], r: Region, blockEdge: number, ctx: Ctx): Para 
     const lead = Math.round((indLeft + firstLine) * 20) / 20;
     if (!tabs.some((t) => Math.abs(t.pos - lead) < 1) && tabs.every((t) => t.pos > lead)) {
       tabs.push({ pos: lead, align: "left" });
-      runs.unshift({ text: "", tab: true, ...spanFormat(first.spans[0], first.size, first.baseline) });
+      runs.unshift({ text: "", tab: true, ...plainFmt(spanFormat(first.spans[0], first.size, first.baseline)) });
       lineFits.forEach((f) => { f.start++; f.end++; });
       indLeft = 0; firstLine = 0;
     }
@@ -787,7 +831,8 @@ function buildPara(lines: Line[], r: Region, blockEdge: number, ctx: Ctx): Para 
   const remap = (k: number) => kept.slice(0, k).filter(Boolean).length;
   const lastLine = lines[lines.length - 1];
   return {
-    lastFull: r.x1 - lastLine.x1 <= Math.max(3, 0.04 * W),
+    // 末行排满到右边界：以文字块自己的右边缘为准（版心可能被页码等撑宽，比正文的右边缘更靠右）
+    lastFull: Math.min(r.x1, blockEdge > r.x0 ? blockEdge : r.x1) - lastLine.x1 <= Math.max(3, 0.04 * W),
     kind: "p", runs: runs.filter((_, k) => kept[k]), align, indLeft, indRight, firstLine,
     spaceBefore: 0, lineHeight, tabs: tabs.sort((a, b) => a.pos - b.pos), size,
     lineFits: lineFits.map((f) => ({ ...f, start: remap(f.start), end: remap(f.end) })),
@@ -1011,9 +1056,31 @@ export function detectGutter(lines: Line[], r: Region): { g0: number; g1: number
 // 整体
 // ---------------------------------------------------------------------------
 
+/**
+ * 画成短横线的破折号（参考文献里表示"同上作者"的 "——"、排版软件画的长破折号）：
+ * 位于某行文字的字身中部（基线上 0.15–0.65 字号）、处在两段文字之间的空隙里、长度 1–6 个字号 → 还原成 "—" 字符。
+ * 否则它既不是文字的下划线 / 删除线，也不构成表格，会被丢掉
+ */
+function dashRules(pg: PageModel): void {
+  const keep: typeof pg.segs = [];
+  const added: Span[] = [];
+  for (const g of pg.segs) {
+    const y = (g.y0 + g.y1) / 2, len = g.x1 - g.x0;
+    const row = g.horizontal && g.width <= 1.5 ? pg.spans.filter((s) => s.text.trim() && !s.img && y > s.baseline - 0.65 * s.size && y < s.baseline - 0.15 * s.size) : [];
+    const near = row.filter((s) => s.x1 > g.x0 - 2.5 * s.size && s.x0 < g.x1 + 2.5 * s.size);
+    const ref = near[0];
+    const overlapped = row.some((s) => Math.min(s.x1, g.x1) - Math.max(s.x0, g.x0) > 0.5);
+    if (!ref || overlapped || len < 0.8 * ref.size || len > 6 * ref.size) { keep.push(g); continue; }
+    const n = Math.max(1, Math.round(len / ref.size)); // 长破折号宽 1 个字号
+    added.push({ ...ref, text: "\u2014".repeat(n), x0: g.x0, x1: g.x1, bold: false, italic: false, natural: n * ref.size, wordW: n * ref.size, img: undefined, type3: undefined });
+  }
+  if (added.length) { pg.segs = keep; pg.spans = [...pg.spans, ...added]; }
+}
+
 export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; raster?: boolean } = {}): DocModel {
   // 识别渲染区域时会从页面中移除元素：在副本上进行，原始提取结果保持不变（用于完整性校验、失败时回退）
-  const pages = opts.raster ? pages0.map((p) => ({ ...p })) : pages0;
+  // 识别时会从页面中移除元素、插入行内公式：总在副本上进行，失败回退时原始结果不受影响
+  const pages = pages0.map((p) => ({ ...p }));
   const allText = pages0.map((p) => p.spans.map((s) => s.text).join(" ")).join("\n");
   const ctx: Ctx = { mode: opts.mode ?? "exact", spacing: new Map(), words: collectWords(allText), hyphenated: new Set(), counts: wordCounts(allText), softHyphens: 0 };
   // 行尾断开的写法不算"本身带连字符"：只收集行中间出现的
@@ -1032,7 +1099,7 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
   const bodyBase = top1(baseN) ?? "";
   const mathCtx: MathCtx = { bodySize: top1(sizeN) ?? 10, bodyBase, bodyIsTeX: /^(CM|SF|LM|EC)/.test(bodyBase) };
   const rasterText: string[] = [];
-  let figureCount = 0, equationCount = 0;
+  let figureCount = 0, equationCount = 0, inlineMathCount = 0;
 
   // 预处理：矢量图（渲染为图片）、表格、装饰线
   const pre = pages.map((pg) => {
@@ -1058,6 +1125,16 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
       for (const f of figures) if (f.alt) rasterText.push(f.alt);
       figureCount += figures.length;
     }
+    // 没有可靠文字编码的字形（Type 3 字体画的公式、符号）：独立的公式成图，行内的作为行内图片插回正文行
+    if (pg.masks?.length || pg.spans.some((sp) => sp.type3)) {
+      const ink = detectMaskInk(pg, mathCtx.bodySize, !!opts.raster);
+      figures.push(...ink.display);
+      if (ink.inline.length) pg.spans = [...pg.spans, ...ink.inline];
+      rasterText.push(...ink.alt);
+      equationCount += ink.display.length;
+      inlineMathCount += ink.inline.length;
+    }
+    dashRules(pg);
     const { tables, used } = detectTables(pg);
     const inTable = new Set(tables.flatMap((t) => t.spans));
     tables.push(...detectRuledTables(pg, used, inTable));
@@ -1358,7 +1435,7 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
         if (!sideLines.length) continue;
         const found = [
           ...detectEquations(sideLines, reg, mathCtx, extra).map((e) => ({ ...e, kind: "equation" as const })),
-          ...detectDropCaps(sideLines, mathCtx).map((d) => ({ lines: [d.line], box: d.box, kind: "dropcap" as const })),
+          ...detectDropCaps(sideLines, mathCtx).map((d) => ({ lines: [d.line], box: d.box, kind: "dropcap" as const, rest: d.rest })),
         ];
         for (const f of found) {
           const gone = new Set(f.lines);
@@ -1366,7 +1443,11 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
             const it = items[k];
             if (it.kind === "line" && gone.has(it.line)) items.splice(k, 1);
           }
-          const alt = spansText(f.lines.flatMap((l) => l.spans));
+          // 首字母与正文并在同一行时，只取首字母成图，其余正文放回
+          const rest = "rest" in f ? f.rest : undefined;
+          if (rest) items.push({ kind: "line", line: rest, side, top: rest.top });
+          const capSpans = f.lines.flatMap((l) => l.spans).filter((sp) => !rest || !rest.spans.includes(sp));
+          const alt = spansText(capSpans);
           if (alt) rasterText.push(alt);
           const box = rasterBox(f.box, pg.index, f.kind, alt);
           if (f.kind === "equation") {
@@ -1618,7 +1699,7 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
     blocks,
     finalSection: curSection,
     bodyFont, bodySize,
-    stats: { ...stats, figures: figureCount, equations: equationCount },
+    stats: { ...stats, figures: figureCount, equations: equationCount, inlineMath: inlineMathCount },
     rasterText: rasterText.join("\n"),
     mode: ctx.mode,
     ...(hfOut ? { headers: hfOut.headers, footers: hfOut.footers, pageNumStart: hfOut.pageNumStart, headerDist, footerDist } : {}),

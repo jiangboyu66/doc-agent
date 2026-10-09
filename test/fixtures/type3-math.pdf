@@ -1,0 +1,73 @@
+%PDF-1.4
+1 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Times-Roman >>
+endobj
+2 0 obj
+<< /Length 37 >>
+stream
+600 0 0 0 500 700 d1 0 0 500 700 re f
+endstream
+endobj
+3 0 obj
+<< /Type /Font /Subtype /Type3 /FontBBox [0 0 600 700] /FontMatrix [0.001 0 0 0.001 0 0] /CharProcs << /g1 2 0 R >> /Encoding << /Type /Encoding /Differences [1 /g1] >> /FirstChar 1 /LastChar 1 /Widths [600] /Resources << >> >>
+endobj
+4 0 obj
+<< /Length 2706 >>
+stream
+BT /F1 8 Tf 560.00 765.00 Td (631) Tj ET
+BT /F1 16 Tf 167.20 742.00 Td (A Physical-Flow-Based Approach to Allocating) Tj ET
+BT /F1 16 Tf 156.00 724.00 Td (Transmission Losses in a Transaction Framework) Tj ET
+BT /F1 10 Tf 72.00 700.00 Td (The proposed allocation scheme assigns the total system losses to every) Tj ET
+BT /F1 10 Tf 72.00 688.00 Td (transaction in proportion to its flow; the loss of transaction) Tj ET
+q 6.00 0 0 8.00 340.00 686.00 cm BI /IM true /W 8 /H 10 /BPC 1 /F /AHx ID 007e3e5e6e76767a7c7e> EI Q
+q 6.00 0 0 8.00 347.00 686.00 cm BI /IM true /W 8 /H 10 /BPC 1 /F /AHx ID 007e7e3e5e6e6e767a7c> EI Q
+q 6.00 0 0 8.00 354.00 686.00 cm BI /IM true /W 8 /H 10 /BPC 1 /F /AHx ID 007c7e7e3e5e5e6e767a> EI Q
+BT /F1 10 Tf 366.00 688.00 Td (, which is computed below, is always) Tj ET
+BT /F1 10 Tf 72.00 676.00 Td (nonnegative and the sum over all transactions equals the total loss) Tj ET
+BT /F2 10 Tf 368 676 Td <01> Tj ET
+BT /F1 10 Tf 376.00 676.00 Td (of the system as a whole.) Tj ET
+q 7.00 0 0 9.00 250.00 640.00 cm BI /IM true /W 8 /H 10 /BPC 1 /F /AHx ID 007a7c7e7e3e3e5e6e76> EI Q
+q 7.00 0 0 9.00 258.00 640.00 cm BI /IM true /W 8 /H 10 /BPC 1 /F /AHx ID 00767a7c7e7e7e3e5e6e> EI Q
+q 7.00 0 0 9.00 266.00 640.00 cm BI /IM true /W 8 /H 10 /BPC 1 /F /AHx ID 006e767a7c7e7e7e3e5e> EI Q
+q 7.00 0 0 9.00 280.00 640.00 cm BI /IM true /W 8 /H 10 /BPC 1 /F /AHx ID 005e6e767a7c7c7e7e3e> EI Q
+q 7.00 0 0 9.00 288.00 640.00 cm BI /IM true /W 8 /H 10 /BPC 1 /F /AHx ID 003e5e6e767a7a7c7e7e> EI Q
+q 7.00 0 0 9.00 296.00 640.00 cm BI /IM true /W 8 /H 10 /BPC 1 /F /AHx ID 007e3e5e6e76767a7c7e> EI Q
+q 7.00 0 0 9.00 304.00 640.00 cm BI /IM true /W 8 /H 10 /BPC 1 /F /AHx ID 007e7e3e5e6e6e767a7c> EI Q
+0 g 312 643 m 340 643 l 340 643.6 l 312 643.6 l f
+q 6.00 0 0 7.00 316.00 646.00 cm BI /IM true /W 8 /H 10 /BPC 1 /F /AHx ID 006e767a7c7e7e7e3e5e> EI Q
+q 6.00 0 0 7.00 324.00 646.00 cm BI /IM true /W 8 /H 10 /BPC 1 /F /AHx ID 005e6e767a7c7c7e7e3e> EI Q
+q 6.00 0 0 7.00 316.00 634.00 cm BI /IM true /W 8 /H 10 /BPC 1 /F /AHx ID 003e5e6e767a7a7c7e7e> EI Q
+q 6.00 0 0 7.00 324.00 634.00 cm BI /IM true /W 8 /H 10 /BPC 1 /F /AHx ID 007e3e5e6e76767a7c7e> EI Q
+BT /F1 10 Tf 520.00 640.00 Td (\(1\)) Tj ET
+BT /F1 10 Tf 72.00 610.00 Td (After the equation the text continues as a normal paragraph of body) Tj ET
+BT /F1 10 Tf 72.00 598.00 Td (text so that the layout has more than one paragraph on the page.) Tj ET
+BT /F1 8 Tf 72.00 560.00 Td ([1] R. Nadira et al., Bulk Transmission System Loss Analysis, 1993.) Tj ET
+BT /F1 8 Tf 72.00 550.00 Td ([2]) Tj ET
+0 g 86 552.6 m 102 552.6 l 102 553.0 l 86 553.0 l f
+BT /F1 8 Tf 104.00 550.00 Td (, Bulk Transmission System Loss Analysis, EPRI Report, 1990.) Tj ET
+endstream
+endobj
+5 0 obj
+<< /Type /Page /Parent 6 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 1 0 R /F2 3 0 R >> >> >>
+endobj
+6 0 obj
+<< /Type /Pages /Kids [5 0 R] /Count 1 >>
+endobj
+7 0 obj
+<< /Type /Catalog /Pages 6 0 R >>
+endobj
+xref
+0 8
+0000000000 65535 f 
+0000000009 00000 n 
+0000000081 00000 n 
+0000000168 00000 n 
+0000000411 00000 n 
+0000003168 00000 n 
+0000003304 00000 n 
+0000003361 00000 n 
+trailer
+<< /Size 8 /Root 7 0 R >>
+startxref
+3410
+%%EOF

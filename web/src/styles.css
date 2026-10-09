@@ -181,6 +181,8 @@ body:has(.workspace) { overflow: hidden; }
 .page-indicator + .seg.right { margin-left: 0; }
 .docx-host .docx-wrapper { background: transparent !important; padding: 0 !important; }
 .docx-host .docx-wrapper > section.docx { box-shadow: var(--shadow) !important; margin: 0 auto 16px !important; }
+/* 按页面坐标定位的图片 / 文本框 / 图形（placePageAnchors）以页面为基准 */
+.docx-host section.docx { position: relative; }
 .loading { padding: 40px; text-align: center; color: var(--muted); }
 .source { margin: 0; padding: 16px 20px; font: 12.5px/1.6 var(--mono); white-space: pre-wrap; word-break: break-word; background: var(--panel); color: var(--ink); min-height: 100%; }
 .paper { max-width: 820px; margin: 16px auto; background: #fff; color: #1a1a1a; padding: 48px 56px; box-shadow: var(--shadow); }

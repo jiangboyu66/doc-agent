@@ -5,6 +5,7 @@
  * 填充矩形（底纹）、位图（编码为 PNG）。坐标统一为"页面左上角为原点、单位 pt、y 向下"。
  */
 
+import { pdfjsDataOptions } from "./render.js";
 import zlib from "node:zlib";
 import { crc32 } from "../../documents/docx/zip.js";
 import { symbolChar } from "../../documents/docx/symbolFont.js";
@@ -35,6 +36,26 @@ export interface Span {
   wordSpaceW?: number;
   underline?: boolean;
   strike?: boolean;
+  /** 没有文字编码的墨迹（Type 3 位图字形组成的行内公式 / 符号）：作为行内图片随文字排版，text 为占位符 U+FFFC */
+  img?: ImageBox;
+  /** Type 3 字体（字形由 PDF 自己描述，字符编码常不可靠；Word 中也没有这个字体） */
+  type3?: boolean;
+}
+
+/**
+ * 图像蒙版（stencil mask）：Type 3 位图字体的字形（老式 TeX/DVI 生成的 PDF 中公式、符号常用这种字体）、模板图像。
+ * 它们没有文字编码，也不在路径里——不单独收集的话，公式和行内符号会整片消失。
+ */
+export interface MaskBox {
+  x0: number; y0: number; x1: number; y1: number;
+  color: string;
+  /** 1 位位图，按行打包（每行 ceil(w/8) 字节），0 = 墨迹；纯色蒙版（填满整个单位方块）为 null */
+  bits: Uint8Array | null;
+  w: number; h: number;
+  /** 页面坐标 → 位图像素坐标：u = a(X−ox) + b(Y−oy)，v = c(X−ox) + d(Y−oy)；px = u·w，py = (1−v)·h */
+  inv: { ox: number; oy: number; a: number; b: number; c: number; d: number };
+  /** 没有位图的字形（Type 3 字体的矢量字形）：只能由画布渲染 */
+  vector?: boolean;
 }
 
 export interface Seg { x0: number; y0: number; x1: number; y1: number; width: number; color: string; horizontal: boolean }
@@ -75,6 +96,8 @@ export interface PageModel {
   vectorShapes: number;
   /** 全部已绘制的路径（含曲线、斜线） */
   paths: PathBox[];
+  /** 图像蒙版（Type 3 位图字形等） */
+  masks: MaskBox[];
   rotatedText: number;
 }
 
@@ -173,7 +196,7 @@ const getObj = (store: any, id: string): Promise<any> =>
 export async function extractPdf(buf: Buffer, opts: { maxPages?: number } = {}): Promise<PageModel[]> {
   const pdfjs = await loadPdfjs();
   const { OPS, Util } = pdfjs;
-  const doc = await pdfjs.getDocument({ data: new Uint8Array(buf), isOffscreenCanvasSupported: false, disableFontFace: true, useSystemFonts: false, verbosity: 0 }).promise;
+  const doc = await pdfjs.getDocument({ data: new Uint8Array(buf), isOffscreenCanvasSupported: false, disableFontFace: true, useSystemFonts: false, verbosity: 0, ...pdfjsDataOptions() }).promise;
   const pages: PageModel[] = [];
   const n = Math.min(doc.numPages, opts.maxPages ?? 500);
   try {
@@ -188,7 +211,7 @@ async function extractPage(page: any, index: number, OPS: any, Util: any): Promi
   const vp = page.getViewport({ scale: 1 });
   const VT = vp.transform as M;
   const ops = await page.getOperatorList();
-  const model: PageModel = { index, width: vp.width, height: vp.height, spans: [], segs: [], fills: [], images: [], vectorShapes: 0, rotatedText: 0, paths: [] };
+  const model: PageModel = { index, width: vp.width, height: vp.height, spans: [], segs: [], fills: [], images: [], vectorShapes: 0, rotatedText: 0, paths: [], masks: [] };
 
   // ---------- 操作符遍历：图形、图片、文字颜色 ----------
   interface GState { ctm: M; fill: string; stroke: string; lw: number; trm: number }
@@ -250,6 +273,23 @@ async function extractPage(page: any, index: number, OPS: any, Util: any): Promi
     }
     pendingPath = [];
   };
+
+  // 图像蒙版：单位方块经 ctm、视口变换映射到页面；记下外接框与反向映射，供合成图片
+  const addMask = (ctm: M, img: any) => {
+    const F = (u: number, v: number) => apply(VT, ...apply(ctm, u, v));
+    const [ox, oy] = F(0, 0), [ux, uy] = F(1, 0), [vx, vy] = F(0, 1), [qx, qy] = F(1, 1);
+    const det = (ux - ox) * (vy - oy) - (vx - ox) * (uy - oy);
+    if (Math.abs(det) < 1e-9) return;
+    const x0 = Math.min(ox, ux, vx, qx), x1 = Math.max(ox, ux, vx, qx), y0 = Math.min(oy, uy, vy, qy), y1 = Math.max(oy, uy, vy, qy);
+    if (x1 - x0 < 0.05 && y1 - y0 < 0.05) return;
+    const w = img?.width | 0, h = img?.height | 0;
+    const bits = img?.data instanceof Uint8Array && w > 0 && h > 0 && img.data.length >= Math.ceil(w / 8) * h ? img.data : null;
+    model.masks.push({
+      x0, y0, x1, y1, color: gs.fill, bits, w: bits ? w : 1, h: bits ? h : 1,
+      inv: { ox, oy, a: (vy - oy) / det, b: -(vx - ox) / det, c: -(uy - oy) / det, d: (ux - ox) / det },
+    });
+  };
+  const maskData = async (a: any) => (a && typeof a.data === "string" ? await getObj(String(a.data).startsWith("g_") ? page.commonObjs : page.objs, a.data) : a);
 
   for (let i = 0; i < ops.fnArray.length; i++) {
     const fn = ops.fnArray[i];
@@ -321,6 +361,25 @@ async function extractPage(page: any, index: number, OPS: any, Util: any): Promi
       case OPS.fill: case OPS.eoFill: paint(false, true); break;
       case OPS.fillStroke: case OPS.eoFillStroke: case OPS.closeFillStroke: case OPS.closeEOFillStroke: paint(true, true); break;
       case OPS.endPath: pendingPath = []; break;
+      case OPS.paintImageMaskXObject: {
+        try { addMask(gs.ctm, await maskData(args[0])); } catch { /* 忽略损坏的蒙版 */ }
+        break;
+      }
+      case OPS.paintImageMaskXObjectGroup: {
+        for (const im of (args[0] ?? []) as any[]) {
+          try { addMask(im?.transform ? mul(gs.ctm, im.transform as M) : gs.ctm, await maskData(im)); } catch { /* 忽略 */ }
+        }
+        break;
+      }
+      case OPS.paintImageMaskXObjectRepeat: {
+        const [im, sx, kx, ky, sy, pos] = args as [any, number, number, number, number, number[]];
+        try {
+          const data = await maskData(im);
+          for (let k = 0; k + 1 < (pos?.length ?? 0); k += 2) addMask(mul(gs.ctm, [sx, kx, ky, sy, pos[k], pos[k + 1]]), data);
+        } catch { /* 忽略 */ }
+        break;
+      }
+      case OPS.paintSolidColorImageMask: addMask(gs.ctm, null); break;
       case OPS.paintImageXObject:
       case OPS.paintInlineImageXObject: {
         const img = fn === OPS.paintInlineImageXObject ? args[0] : await getObj(String(args[0]).startsWith("g_") ? page.commonObjs : page.objs, args[0]);
@@ -340,6 +399,15 @@ async function extractPage(page: any, index: number, OPS: any, Util: any): Promi
   const tc = await page.getTextContent({ includeMarkedContent: false, disableNormalization: true });
   const fontInfo = new Map<string, FontInfo>();
   const rawNames = new Map<string, string>();
+  const type3 = new Map<string, boolean>();
+  const isType3 = (fontName: string) => {
+    if (!type3.has(fontName)) {
+      let t = false;
+      try { t = page.commonObjs.has(fontName) && !!page.commonObjs.get(fontName)?.isType3Font; } catch { /* 忽略 */ }
+      type3.set(fontName, t);
+    }
+    return type3.get(fontName)!;
+  };
   const infoOf = (fontName: string): FontInfo => {
     if (!fontInfo.has(fontName)) {
       let raw: string | undefined;
@@ -432,6 +500,7 @@ async function extractPage(page: any, index: number, OPS: any, Util: any): Promi
       spaceW: (spaceEm.get(it.fontName) ?? 0.25) * size,
       rawFont: rawNames.get(it.fontName),
       math: fi.math,
+      type3: isType3(it.fontName) || undefined,
       wordW: measureWord(sym.text, sym.font, fi.bold || fakeBold, fi.italic, Math.round(size * 2) / 2) ?? undefined,
       wordSpaceW: measureWord(" ", sym.font, fi.bold || fakeBold, fi.italic, Math.round(size * 2) / 2) ?? undefined,
     });

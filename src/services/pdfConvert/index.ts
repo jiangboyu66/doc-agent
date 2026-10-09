@@ -15,8 +15,8 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import { extractPdf, type PageModel } from "./extract.js";
-import { buildDocModel, type LayoutMode } from "./layout.js";
+import { extractPdf, type ImageBox, type PageModel } from "./extract.js";
+import { buildDocModel, type Block, type DocModel, type LayoutMode, type Para } from "./layout.js";
 import { writeDocx } from "./docxWriter.js";
 import { rasterAvailable, renderRegions } from "./render.js";
 import { DocxDocument } from "../../documents/docx/DocxDocument.js";
@@ -49,7 +49,8 @@ const ENGINE_LABEL: Record<PdfEngine, string> = { builtin: "内置引擎", pdf2d
 
 function charCounts(s: string): Map<string, number> {
   const m = new Map<string, number>();
-  for (const ch of s) if (ch.trim()) m.set(ch, (m.get(ch) ?? 0) + 1);
+  // 控制字符不是文字（Type 3 字体的乱码编码）：不计
+  for (const ch of s) if (ch.trim() && !/[\u0000-\u001f\u007f-\u009f]/.test(ch)) m.set(ch, (m.get(ch) ?? 0) + 1);
   return m;
 }
 
@@ -60,7 +61,7 @@ function docxText(buf: Buffer): string {
 }
 
 function verify(pages: PageModel[], docx: Buffer, rasterText = "") {
-  const src = charCounts(pages.flatMap((p) => p.spans.map((s) => s.text)).join(""));
+  const src = charCounts(pages.flatMap((p) => p.spans.filter((s) => !s.img).map((s) => s.text)).join(""));
   // 渲染为图片的区域：文字保存在替代文字中，计为已保留
   const out = charCounts(docxText(docx) + rasterText);
   // 并入正文字母的重音符号变成了组合字符（F + ˆ → F̂）：按原来的重音符号计数
@@ -84,10 +85,29 @@ function verify(pages: PageModel[], docx: Buffer, rasterText = "") {
 
 // ---------------------------------------------------------------------------
 
+/** 文档模型中所有待渲染的图片区域（含表格单元格、文本框、页眉页脚中的段落，以及段内的行内公式图片） */
+function renderBoxes(model: DocModel): ImageBox[] {
+  const out: ImageBox[] = [];
+  const seen = new Set<ImageBox>();
+  const add = (im?: ImageBox) => { if (im?.render && !seen.has(im)) { seen.add(im); out.push(im); } };
+  const para = (b: Para) => {
+    for (const im of [...(b.images ?? []), ...(b.inlineImages ?? []), ...(b.hfImages ?? []).map((f) => f.img), ...(b.floats ?? []).map((f) => f.img)]) add(im);
+    for (const r of b.runs) add(r.img);
+    for (const t of b.textBoxes ?? []) para(t.para);
+  };
+  const block = (b: Block) => {
+    if (b.kind === "p") para(b);
+    else for (const row of b.rows) for (const c of row.cells) for (const x of c.blocks) block(x as Block);
+  };
+  model.blocks.forEach(block);
+  for (const set of [model.headers, model.footers]) for (const k of ["default", "first", "even"] as const) for (const p of (set as any)?.[k] ?? []) para(p);
+  return out;
+}
+
 async function runBuiltin(buf: Buffer, title: string, pages: PageModel[], mode: LayoutMode) {
   const notes: string[] = [];
   let model = buildDocModel(pages, { mode, raster: await rasterAvailable() });
-  const regions = model.blocks.flatMap((b) => (b.kind === "p" ? [...(b.images ?? []), ...(b.inlineImages ?? []), ...(b.floats ?? []).map((f) => f.img)].filter((i) => i.render) : []));
+  const regions = renderBoxes(model);
   if (regions.length) {
     const ok = await renderRegions(buf, regions).catch(() => 0);
     if (ok < regions.length) {
@@ -96,11 +116,13 @@ async function runBuiltin(buf: Buffer, title: string, pages: PageModel[], mode: 
       notes.push("矢量图 / 公式渲染失败，已按文字方式重建（公式与流程图的版式可能有偏差）。");
     } else {
       const parts = [model.stats.figures ? `${model.stats.figures} 幅矢量图（流程图、曲线图等）` : "", model.stats.equations ? `${model.stats.equations} 个行间公式` : ""].filter(Boolean);
+      if (!parts.length && !regions.some((r) => r.render!.kind === "dropcap")) parts.push(`${regions.length} 处图形区域`);
       const dc = regions.filter((r) => r.render!.kind === "dropcap").length;
       if (dc) parts.push(`${dc} 个首字下沉`);
       notes.push(`${parts.join("、")}按原样渲染为 288 dpi 高清图片（透明背景）贴回原位；其中的文字保存在图片的替代文字里。`);
     }
   }
+  if (model.stats.inlineMath) notes.push(`${model.stats.inlineMath} 处没有文字编码的行内公式 / 符号（Type 3 位图字体）以图片形式插回原文行内。`);
   const data = writeDocx(model, title);
   if (model.stats.vectorShapes) notes.push(`${model.stats.vectorShapes} 处零散的矢量图形（不构成完整的图）未能转换。`);
   if (model.stats.rotatedText) notes.push(`${model.stats.rotatedText} 段旋转文字未转换。`);
