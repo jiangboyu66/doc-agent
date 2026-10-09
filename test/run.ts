@@ -916,6 +916,28 @@ await test("思考模式开关：会话级设置覆盖全局，关闭后请求�
   assert(t.some((x) => x.kind === "assistant" && (x as any).reasoning), "对话记录应保留思考过程（刷新后可展开）");
 });
 
+await test("位图切片拼成的组图（图题以 (a) 开头）合并为一张图，图题仍是正文", async () => {
+  const { detectImageGrids } = await import("../src/services/pdfConvert/raster.js");
+  const png = Buffer.alloc(0);
+  const tile = (x0: number, y0: number, x1: number, y1: number) => ({ x0, y0, x1, y1, png, pxW: 10, pxH: 10 });
+  const span = (text: string, x0: number, x1: number, top: number) => ({ text, x0, x1, top, bottom: top + 8, baseline: top + 6.5, size: 8, font: "Arial", bold: false, italic: false, color: "000000" });
+  const pg: any = {
+    index: 0, width: 576, height: 783, segs: [], fills: [], paths: [], vectorShapes: 0, rotatedText: 0,
+    // Figure 1：7 张相邻的位图切片，另有页眉里的 logo
+    images: [tile(461, 18, 538, 32), tile(36, 66, 144, 135), tile(144, 66, 251, 135), tile(251, 66, 359, 135), tile(359, 66, 467, 135), tile(467, 66, 538, 170), tile(36, 135, 287, 170), tile(287, 135, 467, 170)],
+    spans: [
+      // 图题第一行里就有 "(a)"：不能把它当成子图编号，否则范围会扩进图题
+      span("FIGURE 1.", 36, 80, 176), span("The proposed convolution-free network for 3D medical image segmentation. Left: An overall schematic of the method:", 82, 480, 176),
+      span("(a)", 482, 494, 176), span("an", 496, 536, 176),
+      span("image block is divided into patches, (b) each patch is reshaped into a vector and embedded into a lower dimension, (c) positional", 36, 536, 187),
+    ],
+  };
+  const grids = detectImageGrids(pg, 10);
+  eq(grids.length, 1, "7 张切片应合并成一张图");
+  assert(grids[0].y0 > 60 && grids[0].y1 < 175 && grids[0].x0 < 40 && grids[0].x1 > 534, `组图范围应是切片的外接矩形，不含图题：${JSON.stringify([grids[0].x0, grids[0].y0, grids[0].x1, grids[0].y1])}`);
+  assert(pg.spans.some((x: any) => x.text === "FIGURE 1."), "图题仍保留为正文");
+});
+
 // ---------------------------------------------------------------------------
 
 await fs.rm(tmp, { recursive: true, force: true });

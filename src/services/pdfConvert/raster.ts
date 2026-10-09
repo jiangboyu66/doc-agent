@@ -334,12 +334,16 @@ export function detectImageGrids(pg: PageModel, bodySize: number): ImageBox[] {
   const out: ImageBox[] = [];
   for (const g of groups) {
     if (g.length < 2) continue;
-    let r = bb(g);
-    // 子图编号：图内或紧贴图下方的短标注
+    const r0 = bb(g);
+    let r = r0;
+    // 子图编号：图内或紧贴图下方的短标注。
+    // 紧贴图下方的标注以原图边界为准（不随扩展逐行级联），并且那一行里只能有编号：
+    // 图题第一行常以 "(a) …" 开头，若把它当成子图编号，范围会一路扩进图题，整组图被"夹着正文"否决
+    const labelLine = (s: Span) => pg.spans.every((o) => !o.text.trim() || LABEL.test(o.text.trim()) || Math.abs((o.top + o.bottom) / 2 - (s.top + s.bottom) / 2) > 0.4 * (s.bottom - s.top + 1));
     for (const s of pg.spans) {
       const t = s.text.trim();
       if (!t) continue;
-      if (centerIn(s, r, 0.5) || (LABEL.test(t) && s.x0 >= r.x0 - 2 && s.x1 <= r.x1 + 2 && s.top >= r.y1 - 2 && s.top - r.y1 < 1.6 * bodySize)) r = union(r, spanBox(s));
+      if (centerIn(s, r, 0.5) || (LABEL.test(t) && s.x0 >= r0.x0 - 2 && s.x1 <= r0.x1 + 2 && s.top >= r0.y1 - 2 && s.top - r0.y1 < 1.6 * bodySize && labelLine(s))) r = union(r, spanBox(s));
     }
     const inner = pg.spans.filter((s) => centerIn(s, r));
     if (inner.filter((s) => !LABEL.test(s.text.trim())).reduce((a, s) => a + s.text.trim().length, 0) > 80) continue; // 照片之间夹着正文：不是组图
