@@ -97,7 +97,7 @@ function DocxView({ url, zoom, onPages }: { url: string; zoom: number | "fit"; o
     setState("loading");
     (async () => {
       try {
-        const [{ renderAsync }, { paginate, prepareDocx, numberPages, fixAtLeastSpacing }, res] = await Promise.all([import("docx-preview"), import("../paginate"), fetch(url)]);
+        const [{ renderAsync }, { paginate, prepareDocx, numberPages, fixAtLeastSpacing, applyWrapDistances }, res] = await Promise.all([import("docx-preview"), import("../paginate"), fetch(url)]);
         if (!res.ok) throw new Error(`加载失败（${res.status}）`);
         const blob = await res.blob();
         if (!alive || !host.current) return;
@@ -122,11 +122,13 @@ function DocxView({ url, zoom, onPages }: { url: string; zoom: number | "fit"; o
         const plain = stage.cloneNode() as HTMLDivElement;
         document.body.append(stage, plain);
         try {
-          const prep = await prepareDocx(blob).catch(() => ({ blob, plain: blob, balance: true, pageStart: 1 }));
+          const prep = await prepareDocx(blob).catch(() => ({ blob, plain: blob, balance: true, pageStart: 1, wraps: [] }));
           await renderAsync(prep.blob, stage, undefined, opts);
           await renderAsync(prep.plain, plain, undefined, opts);
           fixAtLeastSpacing(stage);
           fixAtLeastSpacing(plain);
+          applyWrapDistances(stage, prep.wraps);
+          applyWrapDistances(plain, prep.wraps);
           let out: HTMLElement = stage;
           try {
             await (document as any).fonts?.ready;

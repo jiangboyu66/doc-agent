@@ -46,7 +46,7 @@ function markFields(xml: string): string {
  *   - 页眉页脚中的页码域换成占位符（两份渲染都需要），渲染后填入实际页码；
  *   - 读取"连续分节前不平衡分栏"兼容选项（期刊排版会打开）与起始页码。
  */
-export async function prepareDocx(blob: Blob): Promise<{ blob: Blob; plain: Blob; balance: boolean; pageStart: number }> {
+export async function prepareDocx(blob: Blob): Promise<{ blob: Blob; plain: Blob; balance: boolean; pageStart: number; wraps: WrapDist[] }> {
   const zip = await JSZip.loadAsync(blob);
   const settings = await zip.file("word/settings.xml")?.async("string");
   const balance = !(settings && /<\w+:noColumnBalance(\s|\/|>)/.test(settings) && !/<\w+:noColumnBalance\s+\w+:val="(0|false)"/.test(settings));
@@ -61,10 +61,11 @@ export async function prepareDocx(blob: Blob): Promise<{ blob: Blob; plain: Blob
   const f = zip.file("word/document.xml");
   const xml = f ? await f.async("string") : "";
   const pageStart = Number(/<\w+:pgNumType\b[^>]*\w+:start="(\d+)"/.exec(xml)?.[1] ?? 1) || 1;
+  const wraps = wrapDistances(xml);
   const plain = changed ? await zip.generateAsync({ type: "blob", mimeType: mime }) : blob;
-  if (!xml.includes("lastRenderedPageBreak")) return { blob: plain, plain, balance, pageStart };
+  if (!xml.includes("lastRenderedPageBreak")) return { blob: plain, plain, balance, pageStart, wraps };
   zip.file("word/document.xml", xml.replace(/<w:lastRenderedPageBreak\s*\/>/g, ""));
-  return { blob: await zip.generateAsync({ type: "blob", mimeType: mime }), plain, balance, pageStart };
+  return { blob: await zip.generateAsync({ type: "blob", mimeType: mime }), plain, balance, pageStart, wraps };
 }
 
 /**
@@ -83,6 +84,44 @@ export function fixAtLeastSpacing(root: HTMLElement): void {
   root.querySelectorAll<HTMLElement>('[style*="calc("]').forEach((el) => {
     const v = el.style.lineHeight;
     if (v && v.startsWith("calc(")) el.style.lineHeight = v.replace(AT_LEAST, atLeastValue);
+  });
+}
+
+/** 文字环绕图片与文字的间距（pt） */
+export interface WrapDist { t: number; b: number; l: number; r: number }
+
+/**
+ * 文字环绕（四周型 / 紧密型 / 穿越型）图片的环绕间距，按在正文中出现的顺序。
+ * docx-preview 把这类图片渲染成 float: left，却忽略 distT/distB/distL/distR，文字会紧贴图片边缘。
+ */
+function wrapDistances(xml: string): WrapDist[] {
+  const out: WrapDist[] = [];
+  const emuToPt = (v: string | undefined) => (v ? Number(v) / 12700 : 0) || 0;
+  for (const m of xml.matchAll(/<wp:anchor\b([^>]*)>([\s\S]*?)<\/wp:anchor>/g)) {
+    if (!/<wp:wrap(Square|Tight|Through)\b/.test(m[2])) continue; // 与 docx-preview 浮动的条件一致：不是 wrapNone / wrapTopAndBottom
+    const a = (n: string) => new RegExp(`\\b${n}="(\\d+)"`).exec(m[1])?.[1];
+    out.push({ t: emuToPt(a("distT")), b: emuToPt(a("distB")), l: emuToPt(a("distL")), r: emuToPt(a("distR")) });
+  }
+  return out;
+}
+
+/**
+ * 把环绕间距加到 docx-preview 渲染出的浮动图片上（按出现顺序一一对应；数量对不上就不处理，避免错位）。
+ * 图片靠左浮动：文字在它右边和下边，留右边距、下边距；左边距不加，以免图片偏离栏边界。
+ */
+export function applyWrapDistances(root: HTMLElement, wraps: WrapDist[]): void {
+  if (!wraps.length) return;
+  const floats = Array.from(root.querySelectorAll<HTMLElement>("div")).filter((d) => {
+    const f = d.style.float;
+    return (f === "left" || f === "right") && d.style.display === "inline-block" && !d.closest("header, footer") && !!d.querySelector("img, svg");
+  });
+  if (floats.length !== wraps.length) return;
+  // 以前转换出的文档只写了 Word 默认的 2pt，文字贴着图片；这种情况下预览至少留 6pt
+  const side = (v: number) => (v <= 2.5 ? 6 : v);
+  floats.forEach((d, i) => {
+    const w = wraps[i];
+    if (d.style.float === "right") d.style.margin = `${w.t}pt 0 ${w.b}pt ${side(w.l)}pt`;
+    else d.style.margin = `${w.t}pt ${side(w.r)}pt ${w.b}pt 0`;
   });
 }
 

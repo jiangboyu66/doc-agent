@@ -47,6 +47,8 @@ export interface ImageBox {
   render?: { page: number; kind: "figure" | "equation" | "dropcap" };
   /** 图片中包含的文字（替代文字，供屏幕阅读器与 Agent 理解） */
   alt?: string;
+  /** 文字环绕时与旁边文字的间距（pt），按原 PDF 中图片与文字的实测距离；Word 默认只留 2pt，文字几乎贴着图片 */
+  wrap?: { l: number; r: number; b: number };
 }
 
 /** 一条已绘制的路径（用于识别矢量图） */

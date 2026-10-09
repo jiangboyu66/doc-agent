@@ -134,7 +134,7 @@ class Writer {
   private floatImage(f: NonNullable<Para["floats"]>[number]): string {
     const { id, cx, cy, xml } = this.picture(f.img);
     return (
-      `<w:r><w:drawing><wp:anchor distT="0" distB="0" distL="25400" distR="25400" simplePos="0" relativeHeight="${251658240 + id}" behindDoc="0" locked="0" layoutInCell="1" allowOverlap="0">` +
+      `<w:r><w:drawing><wp:anchor distT="0" distB="${emu(f.img.wrap?.b ?? 2)}" distL="${emu(f.img.wrap?.l ?? 2)}" distR="${emu(f.img.wrap?.r ?? 2)}" simplePos="0" relativeHeight="${251658240 + id}" behindDoc="0" locked="0" layoutInCell="1" allowOverlap="0">` +
       `<wp:simplePos x="0" y="0"/><wp:positionH relativeFrom="column"><wp:posOffset>${emu(f.dx)}</wp:posOffset></wp:positionH>` +
       `<wp:positionV relativeFrom="paragraph"><wp:posOffset>${emu(f.dy)}</wp:posOffset></wp:positionV>` +
       `<wp:extent cx="${cx}" cy="${cy}"/><wp:effectExtent l="0" t="0" r="0" b="0"/><wp:wrapSquare wrapText="bothSides"/>` +

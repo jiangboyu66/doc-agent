@@ -1321,6 +1321,23 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
     // 旁边有文字的图片（流式模式）：挂在段落上、文字环绕；旁边那几行的缩进由环绕产生，行本身改为从栏边界起排
     const floatBeside = (img: ImageBox, side: "full" | "L" | "R", besideLines: Array<Extract<Item, { kind: "line" }> & { top: number }>) => {
       const reg = regionOf(side);
+      // 环绕间距：改写行边界之前，量图片与旁边文字行、下方文字行的实测距离
+      const clamp = (v: number, hi: number) => Math.min(hi, Math.max(2, v));
+      let gapR = Infinity, gapL = Infinity, gapB = Infinity;
+      for (const it of besideLines) {
+        if (it.line.x0 >= img.x1 - 6) gapR = Math.min(gapR, it.line.x0 - img.x1);
+        else gapL = Math.min(gapL, img.x0 - it.line.x1);
+      }
+      for (const it of items) {
+        if (it.kind !== "line" || besideLines.includes(it as any) || !(side === "full" || it.side === side || it.side === "full")) continue;
+        if (it.line.top >= img.y1 - 1 && it.line.x0 < img.x1 + 1) gapB = Math.min(gapB, it.line.top - img.y1);
+      }
+      img.wrap = {
+        r: Number.isFinite(gapR) ? clamp(gapR, 30) : 2,
+        l: Number.isFinite(gapL) ? clamp(gapL, 30) : 2,
+        // 下方文字行的 top 含字体上方留白，只取一半，避免整行文字被多推下去
+        b: gapB < 20 ? clamp(gapB * 0.5, 8) : 2,
+      };
       for (const it of besideLines) it.line = it.line.x0 >= img.x1 - 6 ? { ...it.line, x0: reg.x0 } : { ...it.line, x1: reg.x1 };
       items.push({ kind: "float", img, side, top: img.y0 - 0.01 });
     };
