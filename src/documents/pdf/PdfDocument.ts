@@ -7,6 +7,7 @@
  * 模型看不到这些工具，也就不会尝试做做不到的事。需要编辑时，应让用户提供原始 Word 文件。
  */
 
+import { pdfjsDataOptions } from "../../services/pdfConvert/render.js";
 import {
   DocError, type DocumentAdapter, type DocumentCapabilities, type BlockInfo, type SearchHit, type DocumentSummary,
   type EditResult, type FidelityReport,
@@ -26,7 +27,7 @@ export class PdfDocument implements DocumentAdapter {
 
   static async load(buf: Buffer): Promise<PdfDocument> {
     const pdfjs: any = await import("pdfjs-dist/legacy/build/pdf.mjs");
-    const doc = await pdfjs.getDocument({ data: new Uint8Array(buf), isEvalSupported: false, useSystemFonts: false }).promise;
+    const doc = await pdfjs.getDocument({ data: new Uint8Array(buf), isEvalSupported: false, useSystemFonts: false, verbosity: 0, ...pdfjsDataOptions() }).promise;
     const blocks: PBlock[] = [];
     for (let n = 1; n <= doc.numPages; n++) {
       const page = await doc.getPage(n);

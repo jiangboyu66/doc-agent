@@ -64,6 +64,10 @@ export async function prepareDocx(blob: Blob): Promise<{ blob: Blob; plain: Blob
   const wraps = wrapDistances(xml);
   // 手动换行结束的两端对齐行：Word 默认也会两端对齐（除非打开了 doNotExpandShiftReturn 兼容选项）
   const expandBreaks = !(settings && /<\w+:doNotExpandShiftReturn(\s|\/|>)/.test(settings) && !/<\w+:doNotExpandShiftReturn\s+\w+:val="(0|false)"/.test(settings));
+  try {
+    const marked = markKeepFlags(xml, await zip.file("word/styles.xml")?.async("string") ?? "");
+    if (marked !== xml) { xml = marked; zip.file("word/document.xml", xml); changed = true; }
+  } catch { /* 解析失败：保持原样 */ }
   let anchors: PageAnchor[] = [];
   try {
     const r = liftPageAnchors(xml);
@@ -74,6 +78,86 @@ export async function prepareDocx(blob: Blob): Promise<{ blob: Blob; plain: Blob
   zip.file("word/document.xml", xml.replace(/<w:lastRenderedPageBreak\s*\/>/g, ""));
   return { blob: await zip.generateAsync({ type: "blob", mimeType: mime }), plain, balance, pageStart, wraps, anchors, expandBreaks };
 }
+
+// ---------------------------------------------------------------------------
+// 段前分页 / 与下段同页 / 段中不分页
+// ---------------------------------------------------------------------------
+
+/**
+ * docx-preview 只认段落样式里的"段前分页"，段落上直接设置的 w:pageBreakBefore 被忽略；
+ * "与下段同页"（keepNext）、"段中不分页"（keepLines）完全不支持。Agent 调整分页时改的正是这些属性，
+ * 不处理的话快速预览与 Word / 精确版式对不上。
+ * 渲染前在这类段落开头放一个书签（名字带上标志 B / N / L），paginate() 据此按 Word 的规则分页。
+ * 段落属性优先于样式（含 basedOn 继承链），w:val="0" / "false" 表示关闭。
+ */
+function markKeepFlags(xml: string, stylesXml: string): string {
+  if (!/(pageBreakBefore|keepNext|keepLines)/.test(xml + stylesXml)) return xml;
+  const W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+  const parse = (x: string) => { const d = new DOMParser().parseFromString(x, "application/xml"); return d.getElementsByTagName("parsererror").length ? null : d; };
+  const doc = parse(xml);
+  if (!doc) return xml;
+  const kid = (e: Element | null | undefined, local: string) => (e ? Array.from(e.children).find((c) => c.localName === local) : undefined);
+  const on = (e: Element | undefined): boolean | undefined => {
+    if (!e) return undefined;
+    const v = e.getAttributeNS(W, "val") ?? e.getAttribute("w:val");
+    return !(v === "0" || v === "false" || v === "off");
+  };
+  type Flags = { B?: boolean; N?: boolean; L?: boolean };
+  const read = (pPr: Element | undefined): Flags => ({ B: on(kid(pPr, "pageBreakBefore")), N: on(kid(pPr, "keepNext")), L: on(kid(pPr, "keepLines")) });
+  // 样式（含继承）
+  const styles = new Map<string, { flags: Flags; basedOn?: string }>();
+  let defaultPara: string | undefined;
+  const sdoc = stylesXml ? parse(stylesXml) : null;
+  if (sdoc) {
+    for (const st of Array.from(sdoc.getElementsByTagNameNS(W, "style"))) {
+      if (st.getAttributeNS(W, "type") !== "paragraph") continue;
+      const id = st.getAttributeNS(W, "styleId") ?? "";
+      styles.set(id, { flags: read(kid(st, "pPr")), basedOn: kid(st, "basedOn")?.getAttributeNS(W, "val") ?? undefined });
+      if (st.getAttributeNS(W, "default") === "1") defaultPara = id;
+    }
+  }
+  const styleFlags = (id: string | undefined): Flags => {
+    const out: Flags = {};
+    const seen = new Set<string>();
+    for (let cur = id ?? defaultPara; cur && !seen.has(cur); cur = styles.get(cur)?.basedOn) {
+      seen.add(cur);
+      const f = styles.get(cur)?.flags;
+      if (!f) break;
+      for (const k of ["B", "N", "L"] as const) if (out[k] === undefined && f[k] !== undefined) out[k] = f[k];
+    }
+    return out;
+  };
+  let n = 0;
+  for (const p of Array.from(doc.getElementsByTagNameNS(W, "p"))) {
+    // 表格单元格、文本框里的段落不参与分页
+    let anc = p.parentElement, nested = false;
+    while (anc) { if (anc.localName === "tc" || anc.localName === "txbxContent") { nested = true; break; } anc = anc.parentElement; }
+    if (nested) continue;
+    const pPr = kid(p, "pPr");
+    const own = read(pPr), sty = styleFlags(kid(pPr, "pStyle")?.getAttributeNS(W, "val") ?? undefined);
+    const f = (k: keyof Flags) => (own[k] ?? sty[k]) === true;
+    const tag = (f("B") ? "B" : "") + (f("N") ? "N" : "") + (f("L") ? "L" : "");
+    if (!tag) continue;
+    const bs = doc.createElementNS(W, "w:bookmarkStart");
+    bs.setAttributeNS(W, "w:id", String(800000 + n)); bs.setAttributeNS(W, "w:name", `_pvk_${tag}_${n}`);
+    const be = doc.createElementNS(W, "w:bookmarkEnd");
+    be.setAttributeNS(W, "w:id", String(800000 + n));
+    p.insertBefore(be, pPr ? pPr.nextSibling : p.firstChild);
+    p.insertBefore(bs, be);
+    n++;
+  }
+  return n ? new XMLSerializer().serializeToString(doc) : xml;
+}
+
+/** 渲染后：把书签标志写到所在段落的 data-pvk 上（拆段时随段落一起复制） */
+function tagKeepFlags(root: HTMLElement): void {
+  root.querySelectorAll<HTMLElement>('[id^="_pvk_"]').forEach((m) => {
+    const p = m.closest<HTMLElement>("p");
+    const tag = /^_pvk_([BNL]+)_/.exec(m.id)?.[1];
+    if (p && tag) p.dataset.pvk = tag;
+  });
+}
+const hasKeep = (el: Element | null | undefined, flag: "B" | "N" | "L") => !!el && el instanceof HTMLElement && (el.dataset.pvk ?? "").includes(flag);
 
 // ---------------------------------------------------------------------------
 // 按页面坐标定位的图片 / 文本框 / 图形
@@ -388,13 +472,16 @@ export function paginate(content: HTMLElement, hf: HTMLElement | null, opts: { b
     return same[same.length - 1] ?? hfPages[hfPages.length - 1];
   };
   let pageNo = 0, made = 0;
+  tagKeepFlags(wrapper);
 
   for (const src of groups) {
     const pageH = pxHeight(src);
     // 本来就是一页的内容不动。文档自己逐页分页时（逐页保留原排版的转换结果、手动分页的文档），
     // 每一段在浏览器里可能因字宽差异略长于一页，只有明显超过两页的才重新分页
     const limit = groups.length > 1 ? 2 : 1.02;
-    if (src.scrollHeight <= pageH * limit + 2) { pageNo++; continue; }
+    // 节中间有段前分页的段落（docx-preview 不认段落上直接设置的段前分页）时也要重新分页
+    const forced = Array.from(src.querySelectorAll<HTMLElement>("p[data-pvk*='B']")).some((p) => p !== src.querySelector("p"));
+    if (src.scrollHeight <= pageH * limit + 2 && !forced) { pageNo++; continue; }
 
     let page!: HTMLElement, body!: HTMLElement;
     const remaining = (after: HTMLElement | null) =>
@@ -434,7 +521,7 @@ export function paginate(content: HTMLElement, hf: HTMLElement | null, opts: { b
 
     // 按行拆段落：二分查找放得下的最长前缀（只在词边界处断开）
     const split = (el: HTMLElement, c: HTMLElement, cols: number): [HTMLElement, HTMLElement] | null => {
-      if (el.tagName !== "P") return null;
+      if (el.tagName !== "P" || hasKeep(el, "L")) return null; // 段中不分页
       const text = el.textContent ?? "";
       if (text.trim().length < 2) return null;
       const cuts: number[] = [];
@@ -458,6 +545,9 @@ export function paginate(content: HTMLElement, hf: HTMLElement | null, opts: { b
       head.style.marginBottom = "0";
       tail.style.textIndent = "0";
       tail.style.marginTop = "0";
+      // 段前分页只作用于段落的第一部分；前半段的"与下段同页"由后半段自然满足
+      if (tail.dataset.pvk) tail.dataset.pvk = tail.dataset.pvk.replace("B", "");
+      head.dataset.pvHead = "1";
       return [head, tail];
     };
 
@@ -524,6 +614,19 @@ export function paginate(content: HTMLElement, hf: HTMLElement | null, opts: { b
       const queue: HTMLElement[] = isArticle ? Array.from(child.children) as HTMLElement[] : [child];
       while (queue.length) {
         const item = queue.shift()!;
+        // 段前分页：本页已有内容时从新页开始（只处理一次）
+        const pageHasContent = !!c.childElementCount || !!last || !!body.querySelector("p,table,img,svg");
+        if (hasKeep(item, "B") && !item.dataset.pvBroke && pageHasContent) {
+          item.dataset.pvBroke = "1";
+          queue.unshift(item);
+          close(c, true);
+          newPage();
+          last = null;
+          lastCols = 0;
+          flushDeferred();
+          c = open();
+          continue;
+        }
         c.appendChild(item);
         if (fits(c, cols)) continue;
         c.removeChild(item);
@@ -531,6 +634,16 @@ export function paginate(content: HTMLElement, hf: HTMLElement | null, opts: { b
         if (parts) {
           c.appendChild(parts[0]);
           queue.unshift(parts[1]);
+        } else if (c.childElementCount || last) {
+          // 整段移到下一页：前面紧挨着的"与下段同页"段落随它一起走（整页都是这样的段落时不移，与 Word 一致）
+          const moved: HTMLElement[] = [];
+          while (c.lastElementChild instanceof HTMLElement && hasKeep(c.lastElementChild, "N") && !c.lastElementChild.dataset.pvHead) {
+            const el = c.lastElementChild;
+            if (c.childElementCount === 1 && !last) break;
+            moved.unshift(el);
+            c.removeChild(el);
+          }
+          queue.unshift(...moved, item);
         } else if (!c.childElementCount && !last) {
           // 一整页都放不下（大表格、大图）：单独占一页，页面随之变长
           c.appendChild(item);
@@ -538,8 +651,6 @@ export function paginate(content: HTMLElement, hf: HTMLElement | null, opts: { b
           c.style.overflow = "visible";
           page.style.height = "";
           body.style.overflow = "visible";
-        } else {
-          queue.unshift(item);
         }
         close(c, true);
         newPage();
