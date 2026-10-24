@@ -1228,9 +1228,16 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
         if (known.length >= 2 && Math.abs(g.x - docG.x) <= 12) gutters[i] = { ...docG };
         return;
       }
-      if (ls.length < 4) return;
       const cross = ls.filter((l) => classify(l, docG.x) === "cross").length;
-      if (cross <= 0.3 * ls.length) gutters[i] = { ...docG };
+      if (ls.length >= 4 && cross <= 0.3 * ls.length) { gutters[i] = { ...docG }; return; }
+      // 图页：通栏大图、通栏图题之后页面下方只剩几行双栏正文，行太少、又被通栏的图题拉高了"跨栏"比例。
+      // 只要有 ≥ 2 行两侧都有文字、且左半止于全文的栏边界、右半起于全文的栏边界（两端对齐的双栏正文），就沿用全文的分栏
+      const aligned = ls.filter((l) => {
+        if (classify(l, docG.x) !== "two") return false;
+        const L = l.spans.filter((sp) => (sp.x0 + sp.x1) / 2 < docG.x), R = l.spans.filter((sp) => (sp.x0 + sp.x1) / 2 >= docG.x);
+        return Math.abs(Math.max(...L.map((sp) => sp.x1)) - docG.g0) <= 4 && Math.abs(Math.min(...R.map((sp) => sp.x0)) - docG.g1) <= 4;
+      }).length;
+      if (aligned >= 2) gutters[i] = { ...docG };
     });
   }
 
