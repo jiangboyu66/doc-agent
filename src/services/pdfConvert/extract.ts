@@ -40,6 +40,10 @@ export interface Span {
   img?: ImageBox;
   /** Type 3 字体（字形由 PDF 自己描述，字符编码常不可靠；Word 中也没有这个字体） */
   type3?: boolean;
+  /** 小型大写字母（小写字母用的是比普通小写字形更宽的小型大写字形，如 Elsevier 的 "ARTICLE INFO"） */
+  smallCaps?: boolean;
+  /** 字距加宽的文字（"A R T I C L E"）每个字符之后的额外间距（pt） */
+  tracking?: number;
 }
 
 /**
@@ -225,9 +229,24 @@ async function extractPage(page: any, index: number, OPS: any, Util: any): Promi
   interface GState { ctm: M; fill: string; stroke: string; lw: number; trm: number; clip?: { x0: number; y0: number; x1: number; y1: number } }
   let gs: GState = { ctm: [1, 0, 0, 1, 0, 0], fill: "000000", stroke: "000000", lw: 1, trm: 0 };
   const stack: GState[] = [];
-  const textColors: Array<{ ch: string; color: string; fakeBold: boolean; adv: number; spaceBefore: number }> = [];
+  const textColors: Array<{ ch: string; color: string; fakeBold: boolean; adv: number; spaceBefore: number; font: string }> = [];
   const spaceEm = new Map<string, number>(); // 各字体空格的字宽（em）
   let curFont = "";
+  // 字形宽度的单位由字体矩阵决定：多数字体是 1/1000 em，但也有 1/2048（Elsevier 排版的 Charis SIL 等）、
+  // Type 3 字体任意。按 1/1000 计会把字宽算成 2 倍，进而把字符间距压成每字 −3 磅，文字挤成一团
+  const scaleOf = new Map<string, number>();
+  const advScale = (name: string) => {
+    if (!scaleOf.has(name)) {
+      let k = 0.001;
+      try {
+        const fm = page.commonObjs.has(name) ? page.commonObjs.get(name)?.fontMatrix : undefined;
+        if (Array.isArray(fm) && typeof fm[0] === "number" && fm[0] > 0 && Math.abs(fm[1] ?? 0) < 1e-9) k = fm[0];
+      } catch { /* 取不到字体矩阵时按 1/1000 */ }
+      scaleOf.set(name, k);
+    }
+    return scaleOf.get(name)!;
+  };
+  let curScale = 0.001;
   let pendingPath: Array<{ kind: "rect"; pts: Array<[number, number]> } | { kind: "poly"; pts: Array<[number, number]>; ctrl: Array<[number, number]>; curved: boolean; closed: boolean }> = [];
 
   const toPage = (x: number, y: number) => apply(VT, ...apply(gs.ctm, x, y));
@@ -312,14 +331,14 @@ async function extractPage(page: any, index: number, OPS: any, Util: any): Promi
       case OPS.setStrokeGray: gs.stroke = hex([args[0] * 255, args[0] * 255, args[0] * 255]); break;
       case OPS.setLineWidth: gs.lw = args[0]; break;
       case OPS.setTextRenderingMode: gs.trm = args[0]; break;
-      case OPS.setFont: curFont = String(args[0]); break;
+      case OPS.setFont: curFont = String(args[0]); curScale = advScale(curFont); break;
       case OPS.showText:
       case OPS.showSpacedText: {
         const glyphs = args[0] ?? [];
         let pendingSpace = 0;
         for (const g of glyphs) {
           if (!g || typeof g !== "object") continue;
-          const w = typeof g.width === "number" ? g.width / 1000 : 0;
+          const w = typeof g.width === "number" ? g.width * curScale : 0;
           // 注意：pdf.js 把字符码 32 一律标为 isSpace，但子集字体里码 32 可能是任意字母（如 m、A），只能以 Unicode 判断
           const uni = String(g.unicode ?? "");
           if (!uni.trim()) {
@@ -330,7 +349,7 @@ async function extractPage(page: any, index: number, OPS: any, Util: any): Promi
           const u = uni;
           for (let k = 0; k < u.length; k++) {
             if (!u[k].trim()) continue;
-            textColors.push({ ch: u[k], color: gs.trm === 1 ? gs.stroke : gs.fill, fakeBold: gs.trm === 2, adv: k === 0 ? w : 0, spaceBefore: k === 0 ? pendingSpace : 0 });
+            textColors.push({ ch: u[k], color: gs.trm === 1 ? gs.stroke : gs.fill, fakeBold: gs.trm === 2, adv: k === 0 ? w : 0, spaceBefore: k === 0 ? pendingSpace : 0, font: curFont });
           }
           pendingSpace = 0;
         }
@@ -463,6 +482,21 @@ async function extractPage(page: any, index: number, OPS: any, Util: any): Promi
   };
 
 
+  // 每个字体（按原字体名，跨子集）里每个小写字母最常见的字宽：小型大写字形的字宽明显不同
+  const advMode = new Map<string, number>();
+  {
+    const counts = new Map<string, Map<number, number>>();
+    for (const t of textColors) {
+      if (!/^[a-z]$/.test(t.ch) || !t.adv) continue;
+      infoOf(t.font);
+      const k = `${rawNames.get(t.font) ?? t.font}|${t.ch}`;
+      const a = Math.round(t.adv * 1000);
+      if (!counts.has(k)) counts.set(k, new Map());
+      counts.get(k)!.set(a, (counts.get(k)!.get(a) ?? 0) + 1);
+    }
+    for (const [k, m] of counts) advMode.set(k, [...m.entries()].sort((a, b) => b[1] - a[1])[0][0] / 1000);
+  }
+
   let ci = 0; // textColors 游标
   const opText = textColors.map((t) => t.ch).join("");
   for (const it of tc.items as any[]) {
@@ -483,8 +517,10 @@ async function extractPage(page: any, index: number, OPS: any, Util: any): Promi
     const fi = infoOf(it.fontName);
 
     // 与操作符流中的字符对齐，取得颜色与"伪粗体"（描边加粗）：用前几个字符在操作符字符流里定位
-    let color = "000000", fakeBold = false;
+    let color = "000000", fakeBold = false, smallCaps = false;
     let natural: number | undefined;
+    // 字距加宽的文字（"a r t i c l e"）：pdf.js 按间距在每个字母之间插入了空格，还原成一个词，加宽由字符间距体现
+    const spaced = /^(?:\S ){3,}\S$/u.test(it.str);
     const chars = [...it.str].filter((c) => c.trim());
     if (chars.length) {
       const joined = chars.join("");
@@ -508,9 +544,14 @@ async function extractPage(page: any, index: number, OPS: any, Util: any): Promi
         color = textColors[at].color;
         fakeBold = textColors[at].fakeBold;
         // 逐字核对并累计自然字宽
-        let pos = at, em = 0, spaces = 0, matched = 0;
+        let pos = at, em = 0, spaces = 0, matched = 0, lower = 0, wide = 0;
         for (const ch of joined) {
           if (opText[pos] !== ch) break;
+          if (/^[a-z]$/.test(ch) && textColors[pos].adv) {
+            const mode = advMode.get(`${rawNames.get(textColors[pos].font) ?? textColors[pos].font}|${ch}`);
+            lower++;
+            if (mode && textColors[pos].adv > 1.06 * mode) wide++;
+          }
           em += textColors[pos].adv + (pos > at ? textColors[pos].spaceBefore : 0);
           if (pos > at && textColors[pos].spaceBefore > 0) spaces++;
           pos++;
@@ -519,16 +560,18 @@ async function extractPage(page: any, index: number, OPS: any, Util: any): Promi
         ci = pos;
         if (matched === joined.length && em > 0) {
           // 用 TJ 位移代替空格字形的 PDF：按字体空格宽度补上词间空格
-          const inner = (it.str.trim().match(/\s+/g) ?? []).length;
+          const inner = spaced ? 0 : (it.str.trim().match(/\s+/g) ?? []).length;
           if (spaces < inner) em += (inner - spaces) * (spaceEm.get(it.fontName) ?? 0.25);
           natural = em * size;
+          // 同一字形的字宽总是相同，普通文字不会出现偏差；有一半以上的小写字母变宽即为小型大写
+          smallCaps = lower >= 3 && wide >= Math.max(2, 0.6 * lower);
         }
       } else if (textColors[ci]) {
         color = textColors[ci].color;
       }
     }
 
-    const sym = mapSymbolFont(expandLigatures(it.str.replace(/\u00ad/g, "")), fi.family);
+    const sym = mapSymbolFont(expandLigatures((spaced ? it.str.replace(/ /g, "") : it.str).replace(/\u00ad/g, "")), fi.family);
     model.spans.push({
       text: sym.text,
       x0, x1: x0 + width,
@@ -547,6 +590,10 @@ async function extractPage(page: any, index: number, OPS: any, Util: any): Promi
       type3: isType3(it.fontName) || undefined,
       wordW: measureWord(sym.text, sym.font, fi.bold || fakeBold, fi.italic, Math.round(size * 2) / 2) ?? undefined,
       wordSpaceW: measureWord(" ", sym.font, fi.bold || fakeBold, fi.italic, Math.round(size * 2) / 2) ?? undefined,
+      smallCaps: smallCaps || undefined,
+      // 字距加宽 / 紧缩：pdf.js 插了空格的逐字母排列，或单个词（不受两端对齐的词间距影响）的实际宽度明显偏离自然宽度
+      tracking: natural && (spaced || (!/\s/.test(sym.text) && sym.text.length >= 3 && Math.abs(width / natural - 1) > 0.12))
+        ? (width - natural) / Math.max(1, sym.text.length) : undefined,
     });
   }
   return model;

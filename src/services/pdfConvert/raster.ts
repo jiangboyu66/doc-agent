@@ -261,7 +261,9 @@ function lineInfo(l: Line, r: { x0: number; x1: number }, ctx: MathCtx) {
   // 分式的分子/分母、上下标等碎片：很短、没有单词、缩进
   const fragment = !strong && !onlyNumber && total <= 12 && words === 0 && indented;
   const big = l.spans.some(isBigOp);
-  return { strong, fragment, onlyNumber, numbered, indented, big, text };
+  // 正文字体排的公式行（变量用斜体、有关系符号、没有英文单词）：单独不足以认定，配合分式等结构时成立
+  const weak = !strong && !onlyNumber && rel && engWords === 0 && vars >= 1 && words === 0;
+  return { strong, fragment, onlyNumber, numbered, indented, big, text, weak };
 }
 
 /**
@@ -274,11 +276,19 @@ export function detectEquations(lines: Line[], r: { x0: number; x1: number }, ct
   const info = ls.map((l) => lineInfo(l, r, ctx));
   const blocks: Array<{ lines: Line[]; box: Box }> = [];
   for (let i = 0; i < ls.length; ) {
-    if (!(info[i].strong || info[i].fragment || info[i].onlyNumber)) { i++; continue; }
+    const cand = (k: number) => info[k].strong || info[k].fragment || info[k].onlyNumber || info[k].weak;
+    if (!cand(i)) { i++; continue; }
     let j = i + 1;
-    while (j < ls.length && (info[j].strong || info[j].fragment || info[j].onlyNumber) && ls[j].top - Math.max(...ls.slice(i, j).map((l) => l.bottom)) < 1.2 * ls[j].size) j++;
+    while (j < ls.length && cand(j) && ls[j].top - Math.max(...ls.slice(i, j).map((l) => l.bottom)) < 1.2 * ls[j].size) j++;
     const bl = ls.slice(i, j), bi = info.slice(i, j);
-    const ok = bi.some((x) => x.strong) && bi.some((x) => x.numbered || x.onlyNumber || x.big || (x.strong && x.indented));
+    // 分式（分数线上下都有字，且都落在这几行里）：没有编号、也不缩进的独立公式（"x = i − ⌊W/2⌋"）也要整体成图，
+    // 否则分子分母会被拆成上下错开的几段文字
+    const ss = bl.flatMap((l) => l.spans);
+    const fraction = extra.some((e) => e.y1 - e.y0 < 1.5 && e.x1 - e.x0 > 2 &&
+      ss.some((sp) => sp.bottom <= e.y0 + 2 && sp.baseline > e.y0 - 1.2 * sp.size && sp.x1 > e.x0 && sp.x0 < e.x1) &&
+      ss.some((sp) => sp.top >= e.y1 - 2 && sp.top < e.y1 + 1.2 * sp.size && sp.x1 > e.x0 && sp.x0 < e.x1));
+    const ok = (bi.some((x) => x.strong) && (fraction || bi.some((x) => x.numbered || x.onlyNumber || x.big || (x.strong && x.indented))))
+      || (fraction && bi.some((x) => x.weak));
     if (ok) {
       let box: Box = { x0: Infinity, y0: Infinity, x1: -Infinity, y1: -Infinity };
       for (const l of bl) for (const s of l.spans) {

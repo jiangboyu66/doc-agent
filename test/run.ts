@@ -974,6 +974,52 @@ await test("图页：通栏大图与图题之后页面下方只剩几行双栏�
   }
 });
 
+await test("字形单位为 1/2048 em 的字体（Elsevier 的 Charis SIL）：按字体矩阵计算字宽，不把字符间距压成负值、文字不挤在一起", async () => {
+  const { extractPdf } = await import("../src/services/pdfConvert/extract.js");
+  const { pdfToDocx } = await import("../src/services/pdfConvert/index.js");
+  const pdf = await fixture("fontmatrix.pdf");
+  const [pg] = await extractPdf(pdf);
+  eq(pg.spans.length, 3, "3 行文字");
+  for (const sp of pg.spans) assert(sp.natural && Math.abs(sp.natural / (sp.x1 - sp.x0) - 1) < 0.03, `自然字宽应与实际宽度一致：${sp.text} ${sp.natural} / ${sp.x1 - sp.x0}`);
+  for (const mode of ["exact", "flow"] as const) {
+    const { data } = await pdfToDocx(pdf, { mode });
+    const xml = new ZipPackage(data).readText("word/document.xml");
+    const tight = [...xml.matchAll(/<w:spacing w:val="(-?\d+)"\/>/g)].map((m) => +m[1]).filter((v) => v < -10);
+    eq(tight.length, 0, `${mode}：不应出现每字紧缩超过 0.5 磅的字符间距：${tight.join(",")}`);
+  }
+});
+
+await test("期刊首页：文章信息 / 摘要左右并排、字距加宽的标题、作者名后的小图标、上下相邻的两张三线表、页码上方带分式的公式", async () => {
+  const { pdfToDocx } = await import("../src/services/pdfConvert/index.js");
+  const pdf = await fixture("journal-front.pdf");
+  for (const mode of ["exact", "flow"] as const) {
+    const { data, report } = await pdfToDocx(pdf, { mode });
+    eq(report.textCoverage, 1, `${mode}：文字完整性`);
+    const xml = new ZipPackage(data).readText("word/document.xml");
+    const tables = xml.match(/<w:tbl>[\s\S]*?<\/w:tbl>/g) ?? [];
+    const textOf = (x: string) => x.replace(/<[^>]+>/g, "");
+    // 并排的两块各成一格，摘要不被关键词的行切碎
+    const side = tables.find((t) => textOf(t).includes("Keywords:"));
+    assert(side && /tomography reduces/.test(textOf(side)), `${mode}：关键词与摘要应在同一张无边框表格的两格里`);
+    const cells = side!.match(/<w:tc>[\s\S]*?<\/w:tc>/g) ?? [];
+    assert(!cells.some((c) => textOf(c).includes("Keywords:") && textOf(c).includes("tomography")), `${mode}：关键词与摘要不应在同一格`);
+    // 两张三线表分开识别，不退回成散落的文字
+    eq(tables.filter((t) => textOf(t).includes("SSIM")).length, 2, `${mode}：两张表都应识别成表格`);
+    // 字距加宽：字符间距写进 Word
+    assert(/<w:spacing w:val="([4-9]\d)"\/>(?:(?!<\/w:rPr>).)*<\/w:rPr><w:t[^>]*>ARTICLE/.test(xml), `${mode}：加宽的字距应写成字符间距`);
+    assert(/<w:spacing w:val="([4-9]\d)"\/>(?:(?!<\/w:rPr>).)*<\/w:rPr><w:t[^>]*>ABSTRACT/.test(xml), `${mode}：逐字母定位的标题应合成一个词并带字符间距`);
+    // 作者名后的小图标是该行的行内图片，不单独成段
+    const authors = (xml.match(/<w:p [^>]*>(?:(?!<\/w:p>)[\s\S])*Zihui Zhao[\s\S]*?<\/w:p>/) ?? [""])[0];
+    eq((authors.match(/<wp:inline/g) ?? []).length, 4, `${mode}：4 个图标都应在作者行里`);
+    eq(report.images, 4, `${mode}：图标计入图片数`);
+    // 分数线不被当成破折号；带分式的公式整体成图；页码上方的正文与公式不被卷进页脚
+    assert(!textOf(xml).includes("\u2014"), `${mode}：分数线不应变成破折号`);
+    assert(report.equations >= 1, `${mode}：带分式的公式应整体成图`);
+    const boxes = (xml.match(/<w:txbxContent>[\s\S]*?<\/w:txbxContent>/g) ?? []).map(textOf);
+    assert(!boxes.some((t) => /radiation|frequency/.test(t)), `${mode}：正文不应被当成页脚放进文本框：${boxes.join(" | ")}`);
+  }
+});
+
 await test("Type 3 字形（位图蒙版 / 乱码编码）的公式与符号：行内的作为行内图片插回原行，独立的成图（含编号），不出现 Type3 字体、文字不丢", async () => {
   const { pdfToDocx } = await import("../src/services/pdfConvert/index.js");
   const { rasterAvailable } = await import("../src/services/pdfConvert/render.js");
