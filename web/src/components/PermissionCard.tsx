@@ -28,7 +28,6 @@ export function PermissionCard({ request, status, onDecide }: { request: Permiss
           <div className="perm-title">{isPlan ? "修改计划待确认" : request.title}</div>
           <div className="muted small">
             {request.reason}
-            {request.agentId !== "main" && <> · 来自子代理 {request.agentId}</>}
           </div>
         </div>
       </div>
@@ -45,7 +44,7 @@ export function PermissionCard({ request, status, onDecide }: { request: Permiss
             <textarea
               autoFocus
               rows={2}
-              placeholder="告诉 Agent 你希望怎么改（可留空）"
+              placeholder="补充修改意见（可留空）"
               value={feedback}
               onChange={(e) => setFeedback(e.target.value)}
               onKeyDown={(e) => {

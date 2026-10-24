@@ -34,7 +34,7 @@ export function Workspace({ id, runtime, onBack, onOpen }: { id: string; runtime
     setAttaching(true);
     try {
       const r = await api.uploadAssets(id, files);
-      setItems((x) => [...x, { kind: "notice", key: `as${Date.now()}`, tone: "success", text: `已上传图片：${r.assets.join("、")}。可以告诉我插到哪里，例如"把 ${r.assets[0]} 插到第二节末尾，图题为……"。` }]);
+      setItems((x) => [...x, { kind: "notice", key: `as${Date.now()}`, tone: "success", text: `已上传图片：${r.assets.join("、")}。` }]);
       refresh().catch(() => {});
     } catch (e: any) {
       setErr(`上传失败：${e.message}`);
@@ -63,7 +63,7 @@ export function Workspace({ id, runtime, onBack, onOpen }: { id: string; runtime
         }
         setItems(restored);
         setViewing(d.meta.currentVersion);
-        if (d.busy) setItems((x) => [...x, { kind: "notice", key: "busy", tone: "warn", text: "这个会话正在另一个窗口中运行。" }]);
+        if (d.busy) setItems((x) => [...x, { kind: "notice", key: "busy", tone: "warn", text: "这份文档正在另一个窗口中处理。" }]);
       })
       .catch((e) => setErr(e.message));
   }, [refresh]);
@@ -240,7 +240,7 @@ export function Workspace({ id, runtime, onBack, onOpen }: { id: string; runtime
                 onDone={(text) => {
                   followLatest.current = true;
                   refresh().catch(() => {});
-                  setItems((x) => [...x, { kind: "notice", key: `cv${Date.now()}`, tone: "success", text: `已在当前会话内转换为 Word，可以直接告诉我要怎么修改。原 PDF 保留为 v0，可随时回滚。\n${text}` }]);
+                  setItems((x) => [...x, { kind: "notice", key: `cv${Date.now()}`, tone: "success", text: `已转换为 Word，可以继续修改。原 PDF 保留为 v0，可随时回滚。\n${text}` }]);
                 }}
               />
             )}

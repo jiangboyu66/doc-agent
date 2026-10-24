@@ -938,6 +938,28 @@ await test("位图切片拼成的组图（图题以 (a) 开头）合并为一张
   assert(pg.spans.some((x: any) => x.text === "FIGURE 1."), "图题仍保留为正文");
 });
 
+await test("作者简介页：方形照片被取景框裁成竖幅，只取可见部分；相邻两位作者的照片不合并，正文不被盖住", async () => {
+  const { extractPdf } = await import("../src/services/pdfConvert/extract.js");
+  const { pdfToDocx } = await import("../src/services/pdfConvert/index.js");
+  const pdf = await fixture("bios.pdf");
+  const [pg] = await extractPdf(pdf);
+  const photos = pg.images.filter((im) => im.y0 > 50);
+  eq(photos.length, 5, "5 位作者的照片");
+  for (const im of photos) {
+    assert(Math.abs(im.x1 - im.x0 - 72) < 1.5 && Math.abs(im.y1 - im.y0 - 90) < 1.5, `照片应是取景框内的 72 × 90：${JSON.stringify([im.x0, im.y0, im.x1, im.y1])}`);
+    assert(Math.abs(im.pxW / im.pxH - 72 / 90) < 0.05, `像素也应按取景框裁剪：${im.pxW}×${im.pxH}`);
+  }
+  for (const mode of ["exact", "flow"] as const) {
+    const { data, report } = await pdfToDocx(pdf, { mode });
+    eq(report.figures, 0, `${mode}：两张相邻的照片不应被合并成一张图`);
+    eq(report.textCoverage, 1, `${mode}：文字完整性`);
+    const xml = new ZipPackage(data).readText("word/document.xml");
+    const sizes = [...xml.matchAll(/<wp:extent cx="(\d+)" cy="(\d+)"\/>/g)].map((m) => [+m[1] / 12700, +m[2] / 12700]).filter(([w, h]) => w > 50 && h > 50 && h < 200);
+    eq(sizes.length, 5, `${mode}：5 张照片`);
+    for (const [w, h] of sizes) assert(Math.abs(w - 72) < 1.5 && Math.abs(h - 90) < 1.5, `${mode}：照片应是 72 × 90 pt：${w} × ${h}`);
+  }
+});
+
 await test("Type 3 字形（位图蒙版 / 乱码编码）的公式与符号：行内的作为行内图片插回原行，独立的成图（含编号），不出现 Type3 字体、文字不丢", async () => {
   const { pdfToDocx } = await import("../src/services/pdfConvert/index.js");
   const { rasterAvailable } = await import("../src/services/pdfConvert/render.js");

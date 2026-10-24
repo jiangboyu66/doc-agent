@@ -201,6 +201,9 @@ export function detectFigures(pg: PageModel, bodySize: number, tableBoxes: Box[]
     const bodyChars = inner.filter((s) => s.size >= 0.95 * bodySize).reduce((a, s) => a + s.text.trim().length, 0);
     if (bodyChars > 160) continue;
     const box = { x0: r.x0 - PAD, y0: r.y0 - PAD, x1: r.x1 + PAD, y1: r.y1 + PAD };
+    // 成行的文字横跨在合并框的边缘（作者简介：照片在左、正文紧挨在右，上下两位作者的照片相距很近）：
+    // 这是各带文字的独立照片，不是组图；合并会把半行文字画进图里、另外半行留在正文里
+    if (pg.spans.some((s) => s.text.trim().length >= 4 && !inside(spanBox(s), box, 0.5) && overlapArea(spanBox(s), box) > 0.2 * area(spanBox(s)))) continue;
     const alt = spansText(inner);
     removeInside(pg, box);
     out.push(rasterBox(box, pg.index, "figure", alt));
@@ -377,6 +380,9 @@ export function detectImageGrids(pg: PageModel, bodySize: number): ImageBox[] {
     const inner = pg.spans.filter((s) => centerIn(s, r));
     if (inner.filter((s) => !LABEL.test(s.text.trim())).reduce((a, s) => a + s.text.trim().length, 0) > 80) continue; // 照片之间夹着正文：不是组图
     const box = { x0: r.x0 - PAD, y0: r.y0 - PAD, x1: r.x1 + PAD, y1: r.y1 + PAD };
+    // 成行的文字横跨在合并框的边缘（作者简介：照片在左、正文紧挨在右，上下两位作者的照片相距很近）：
+    // 这是各带文字的独立照片，不是组图；合并会把半行文字画进图里、另外半行留在正文里
+    if (pg.spans.some((s) => s.text.trim().length >= 4 && !inside(spanBox(s), box, 0.5) && overlapArea(spanBox(s), box) > 0.2 * area(spanBox(s)))) continue;
     const alt = spansText(inner);
     removeInside(pg, box);
     out.push(rasterBox(box, pg.index, "figure", alt));

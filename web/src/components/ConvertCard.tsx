@@ -26,7 +26,7 @@ const readCollapsed = () => {
 /**
  * PDF 会话顶部：PDF → Word（可折叠，折叠状态记在浏览器里）
  *  - 下载 Word 文件：直接得到 .docx（不改变当前会话）
- *  - 转换并继续编辑：在当前会话内转换为 Word，对话保留，之后可以直接让 Agent 修改
+ *  - 转换并继续编辑：在当前文档内转换为 Word，之后可以直接修改
  */
 export function ConvertCard({ sessionId, runtime, onDone }: { sessionId: string; runtime: RuntimeInfo | null; onDone: (text: string) => void }) {
   const [collapsed, setCollapsedState] = useState(readCollapsed);
@@ -73,7 +73,7 @@ export function ConvertCard({ sessionId, runtime, onDone }: { sessionId: string;
   const actions = (
     <div className="convert-actions">
       <button className={`btn primary ${collapsed ? "small" : ""}`} onClick={download} disabled={!!busy}>{busy === "download" ? "正在生成…" : "下载 Word 文件"}</button>
-      <button className={`btn ${collapsed ? "small" : ""}`} onClick={edit} disabled={!!busy} title="在当前会话内转换为 Word，对话保留，可以直接让 Agent 修改">{busy === "edit" ? "正在转换…" : "转换并继续编辑"}</button>
+      <button className={`btn ${collapsed ? "small" : ""}`} onClick={edit} disabled={!!busy} title="转换为 Word 后继续编辑">{busy === "edit" ? "正在转换…" : "转换并继续编辑"}</button>
     </div>
   );
 
@@ -98,7 +98,7 @@ export function ConvertCard({ sessionId, runtime, onDone }: { sessionId: string;
           <span className="chev" aria-hidden>▾</span>
           <span>
             <span className="convert-title">PDF → Word</span>
-            <span className="muted small convert-desc">把这份 PDF 导出为可编辑的 Word 文件（.docx）。原 PDF 保持不变，完成后会报告文字完整性。</span>
+            <span className="muted small convert-desc">导出为可编辑的 Word 文件，原 PDF 不变。</span>
           </span>
         </button>
         {actions}
@@ -108,21 +108,21 @@ export function ConvertCard({ sessionId, runtime, onDone }: { sessionId: string;
           <input type="radio" name="mode" checked={mode === "auto"} onChange={() => setMode("auto")} />
           <span>
             <b>自动（推荐）</b>
-            <span className="muted small">下载 Word 文件时逐页保留原排版；转换并继续编辑时用可编辑排版，扩写、改写后版面自动重排。</span>
+            <span className="muted small">下载时保持原版面；继续编辑时用可编辑排版。</span>
           </span>
         </label>
         <label className={`opt ${mode === "exact" ? "on" : ""}`}>
           <input type="radio" name="mode" checked={mode === "exact"} onChange={() => setMode("exact")} />
           <span>
             <b>逐页保留原排版</b>
-            <span className="muted small">每一行、每一页都与 PDF 一致（每行硬换行、逐页固定）。只适合改个别字词，增加文字会挤乱版面。</span>
+            <span className="muted small">与 PDF 逐行逐页一致，适合只改个别字词。</span>
           </span>
         </label>
         <label className={`opt ${mode === "flow" ? "on" : ""}`}>
           <input type="radio" name="mode" checked={mode === "flow"} onChange={() => setMode("flow")} />
           <span>
             <b>可编辑排版</b>
-            <span className="muted small">字体、字号、分栏、页眉页脚、公式与图片都与原文一致；段落自动换行、跨栏跨页连续，扩写改写不乱版。</span>
+            <span className="muted small">字体、分栏、公式、图片与原文一致，段落自动换行，适合扩写改写。</span>
           </span>
         </label>
       </div>
