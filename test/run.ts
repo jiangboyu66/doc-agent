@@ -960,6 +960,20 @@ await test("作者简介页：方形照片被取景框裁成竖幅，只取可�
   }
 });
 
+await test("图页：通栏大图与图题之后页面下方只剩几行双栏正文，沿用全文的分栏，不把左右两栏拼成一行", async () => {
+  const { pdfToDocx } = await import("../src/services/pdfConvert/index.js");
+  const pdf = await fixture("colstart.pdf");
+  for (const mode of ["exact", "flow"] as const) {
+    const { data, report } = await pdfToDocx(pdf, { mode });
+    eq(report.textCoverage, 1, `${mode}：文字完整性`);
+    const xml = new ZipPackage(data).readText("word/document.xml");
+    const paras = (xml.match(/<w:p [^>]*>[\s\S]*?<\/w:p>/g) ?? []).map((p) => p.replace(/<w:tab\/>/g, "\t").replace(/<[^>]+>/g, ""));
+    const joined = paras.filter((t) => t.includes("medical images with transformer") && t.includes("\t"));
+    eq(joined.length, 0, `${mode}：左右两栏不应被制表符拼成一行：${JSON.stringify(joined)}`);
+    assert(!paras.some((t) => /size of\s+transformer encoders reduces/.test(t)), `${mode}：左栏末与右栏首不应在同一段`);
+  }
+});
+
 await test("Type 3 字形（位图蒙版 / 乱码编码）的公式与符号：行内的作为行内图片插回原行，独立的成图（含编号），不出现 Type3 字体、文字不丢", async () => {
   const { pdfToDocx } = await import("../src/services/pdfConvert/index.js");
   const { rasterAvailable } = await import("../src/services/pdfConvert/render.js");
