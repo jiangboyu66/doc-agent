@@ -162,19 +162,27 @@ export function encodePng(width: number, height: number, rgba: Uint8Array | Uint
   ]);
 }
 
-function imageToPng(img: any): { png: Buffer; w: number; h: number } | null {
+/** 位图解码为逐像素数据（1 / 3 / 4 通道）；1 位灰度展开成每像素 1 字节 */
+function decodeImage(img: any): { data: Uint8Array | Uint8ClampedArray; w: number; h: number; ch: 1 | 3 | 4 } | null {
   if (!img || !img.width || !img.height || !img.data) return null;
   const { width: w, height: h, data, kind } = img;
-  if (kind === 3 || data.length === w * h * 4) return { png: encodePng(w, h, data, 4), w, h };
-  if (kind === 2 || data.length === w * h * 3) return { png: encodePng(w, h, data, 3), w, h };
+  if (kind === 3 || data.length === w * h * 4) return { data, w, h, ch: 4 };
+  if (kind === 2 || data.length === w * h * 3) return { data, w, h, ch: 3 };
   if (kind === 1) {
     // 1 位灰度，按行打包
     const rowBytes = Math.ceil(w / 8);
     const out = new Uint8Array(w * h);
     for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) out[y * w + x] = data[y * rowBytes + (x >> 3)] & (0x80 >> (x & 7)) ? 255 : 0;
-    return { png: encodePng(w, h, out, 1), w, h };
+    return { data: out, w, h, ch: 1 };
   }
   return null;
+}
+
+/** 取像素区域 [c0,c1) × [r0,r1)（图像行从上到下） */
+function cropPixels(d: { data: Uint8Array | Uint8ClampedArray; w: number; h: number; ch: 1 | 3 | 4 }, c0: number, r0: number, c1: number, r1: number) {
+  const w = c1 - c0, h = r1 - r0, out = new Uint8Array(w * h * d.ch);
+  for (let y = 0; y < h; y++) out.set(d.data.subarray(((r0 + y) * d.w + c0) * d.ch, ((r0 + y) * d.w + c1) * d.ch), y * w * d.ch);
+  return { data: out, w, h, ch: d.ch };
 }
 
 // ---------------------------------------------------------------------------
@@ -214,7 +222,7 @@ async function extractPage(page: any, index: number, OPS: any, Util: any): Promi
   const model: PageModel = { index, width: vp.width, height: vp.height, spans: [], segs: [], fills: [], images: [], vectorShapes: 0, rotatedText: 0, paths: [], masks: [] };
 
   // ---------- 操作符遍历：图形、图片、文字颜色 ----------
-  interface GState { ctm: M; fill: string; stroke: string; lw: number; trm: number }
+  interface GState { ctm: M; fill: string; stroke: string; lw: number; trm: number; clip?: { x0: number; y0: number; x1: number; y1: number } }
   let gs: GState = { ctm: [1, 0, 0, 1, 0, 0], fill: "000000", stroke: "000000", lw: 1, trm: 0 };
   const stack: GState[] = [];
   const textColors: Array<{ ch: string; color: string; fakeBold: boolean; adv: number; spaceBefore: number }> = [];
@@ -361,6 +369,20 @@ async function extractPage(page: any, index: number, OPS: any, Util: any): Promi
       case OPS.fill: case OPS.eoFill: paint(false, true); break;
       case OPS.fillStroke: case OPS.eoFillStroke: case OPS.closeFillStroke: case OPS.closeEOFillStroke: paint(true, true); break;
       case OPS.endPath: pendingPath = []; break;
+      case OPS.clip: case OPS.eoClip: {
+        // 裁剪区域只取水平 / 竖直的矩形（照片的取景框）；其他形状的裁剪不处理
+        const pts = pendingPath.flatMap((sp) => sp.pts);
+        const rectLike = pendingPath.length > 0 && pendingPath.every((sp) => sp.kind === "rect" || (!sp.curved && sp.pts.length >= 4 && sp.pts.every((pt, i) => {
+          const q = sp.pts[(i + 1) % sp.pts.length];
+          return Math.abs(pt[0] - q[0]) < 0.05 || Math.abs(pt[1] - q[1]) < 0.05;
+        })));
+        if (rectLike && pts.length) {
+          const c = { x0: Math.min(...pts.map((p) => p[0])), y0: Math.min(...pts.map((p) => p[1])), x1: Math.max(...pts.map((p) => p[0])), y1: Math.max(...pts.map((p) => p[1])) };
+          const o = gs.clip;
+          gs = { ...gs, clip: o ? { x0: Math.max(o.x0, c.x0), y0: Math.max(o.y0, c.y0), x1: Math.min(o.x1, c.x1), y1: Math.min(o.y1, c.y1) } : c };
+        }
+        break;
+      }
       case OPS.paintImageMaskXObject: {
         try { addMask(gs.ctm, await maskData(args[0])); } catch { /* 忽略损坏的蒙版 */ }
         break;
@@ -383,10 +405,32 @@ async function extractPage(page: any, index: number, OPS: any, Util: any): Promi
       case OPS.paintImageXObject:
       case OPS.paintInlineImageXObject: {
         const img = fn === OPS.paintInlineImageXObject ? args[0] : await getObj(String(args[0]).startsWith("g_") ? page.commonObjs : page.objs, args[0]);
-        const png = imageToPng(img);
+        let dec = decodeImage(img);
         const corners = [toPage(0, 0), toPage(1, 0), toPage(0, 1), toPage(1, 1)];
         const xs = corners.map((c) => c[0]), ys = corners.map((c) => c[1]);
-        const box = { x0: Math.min(...xs), y0: Math.min(...ys), x1: Math.max(...xs), y1: Math.max(...ys) };
+        let box = { x0: Math.min(...xs), y0: Math.min(...ys), x1: Math.max(...xs), y1: Math.max(...ys) };
+        // 照片常以更大的尺寸放置、再用取景框裁剪（IEEE 作者照片：方形原图裁成 1 × 1.25 英寸的竖幅）。
+        // 只取取景框内可见的部分，否则图片比实际显示的大，会盖住旁边的文字、与相邻照片被误并
+        const cl = gs.clip;
+        if (dec && cl && box.x1 - box.x0 > 2 && box.y1 - box.y0 > 2) {
+          const vis = { x0: Math.max(box.x0, cl.x0), y0: Math.max(box.y0, cl.y0), x1: Math.min(box.x1, cl.x1), y1: Math.min(box.y1, cl.y1) };
+          if (vis.x1 - vis.x0 <= 2 || vis.y1 - vis.y0 <= 2) { dec = null; break; } // 完全被裁掉
+          const axisAligned = Math.abs(corners[1][1] - corners[0][1]) < 0.05 && Math.abs(corners[2][0] - corners[0][0]) < 0.05;
+          const cut = vis.x0 - box.x0 > 0.5 || box.x1 - vis.x1 > 0.5 || vis.y0 - box.y0 > 0.5 || box.y1 - vis.y1 > 0.5;
+          if (axisAligned && cut) {
+            // 页面坐标 → 图像单位方块：u 向右、v 向上；像素行从上到下
+            const [ox, oy] = corners[0], du = corners[1][0] - ox, dv = corners[2][1] - oy;
+            const us = [(vis.x0 - ox) / du, (vis.x1 - ox) / du].sort((a, b) => a - b);
+            const vs = [(vis.y0 - oy) / dv, (vis.y1 - oy) / dv].sort((a, b) => a - b);
+            const c0 = Math.max(0, Math.floor(us[0] * dec.w + 1e-6)), c1 = Math.min(dec.w, Math.ceil(us[1] * dec.w - 1e-6));
+            const r0 = Math.max(0, Math.floor((1 - vs[1]) * dec.h + 1e-6)), r1 = Math.min(dec.h, Math.ceil((1 - vs[0]) * dec.h - 1e-6));
+            if (c1 - c0 >= 1 && r1 - r0 >= 1) {
+              dec = cropPixels(dec, c0, r0, c1, r1);
+              box = vis;
+            }
+          }
+        }
+        const png = dec && { png: encodePng(dec.w, dec.h, dec.data, dec.ch), w: dec.w, h: dec.h };
         if (png && box.x1 - box.x0 > 2 && box.y1 - box.y0 > 2) model.images.push({ ...box, png: png.png, pxW: png.w, pxH: png.h });
         else if (!png) model.vectorShapes++;
         break;

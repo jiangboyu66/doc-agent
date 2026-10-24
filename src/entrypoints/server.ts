@@ -314,7 +314,7 @@ async function main() {
   runtime = await bootstrap();
   const port = Number(process.env.PORT || 3939);
   app.listen(port, () => {
-    console.log(`\n  文案 Agent 已启动：http://localhost:${port}`);
+    console.log(`\n  科研文档助手已启动：http://localhost:${port}`);
     console.log(`  模型 ${runtime.settings.model}（思考模式 ${runtime.settings.thinking}）｜技能 ${runtime.skills.list().length} 个｜子代理 ${runtime.agents.length} 个｜插件 ${runtime.plugins.length} 个｜启动 ${runtime.startupMs} ms`);
     if (!process.env.DEEPSEEK_API_KEY) console.warn("  ⚠ 未配置 DEEPSEEK_API_KEY，请在 .env 中填写后重启");
     if (!runtime.external.soffice) console.warn("  ⚠ 未找到 LibreOffice（soffice），PDF 导出与版式预览不可用");

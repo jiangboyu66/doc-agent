@@ -53,7 +53,7 @@ async function askPermission(req: PermissionRequest, headless: boolean): Promise
   });
   if (choice === "allow") return { decision: "allow" };
   if (choice === "session" || choice === "project") return { decision: "allow", remember: choice };
-  const { feedback } = await prompts({ type: "text", name: "feedback", message: "告诉 Agent 你希望怎么做（可留空）" });
+  const { feedback } = await prompts({ type: "text", name: "feedback", message: "补充修改意见（可留空）" });
   return { decision: "deny", feedback: feedback || undefined };
 }
 
@@ -140,7 +140,7 @@ async function main() {
   const program = new Command();
   program
     .name("doc-agent")
-    .description("文案 Agent：保真的文档编辑助手（DeepSeek）")
+    .description("科研文档助手")
     .argument("[file]", "要编辑的文档（.docx / .md / .html / .pdf）")
     .option("--resume <id>", "恢复已有会话")
     .option("-p, --print <prompt>", "无人值守模式：执行这条指令后退出")
@@ -202,7 +202,7 @@ async function main() {
   }
 
   const s = session.doc.summary();
-  console.log(chalk.bold(`\n文案 Agent · ${session.meta.filename}`) + chalk.dim(`（${s.format}，${s.blockCount} 段，约 ${s.charCount} 字）`));
+  console.log(chalk.bold(`\n科研文档助手 · ${session.meta.filename}`) + chalk.dim(`（${s.format}，${s.blockCount} 段，约 ${s.charCount} 字）`));
   console.log(chalk.dim(`会话 ${session.id}｜模型 ${runtime.settings.model}｜模式 ${session.meta.mode}｜修订 ${session.meta.trackChanges ? "开" : "关"}｜输入 /help 查看命令`));
   if (s.template) console.log(chalk.cyan(`检测到模板：${s.template.name}`));
 

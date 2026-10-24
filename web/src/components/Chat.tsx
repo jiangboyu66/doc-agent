@@ -99,7 +99,7 @@ export function Chat(props: {
   /** 思考模式：当前状态与切换（不可用时为 undefined，不显示按钮） */
   thinking?: boolean;
   onToggleThinking?: () => void;
-  /** 上传图片等素材（供 Agent 插入文档） */
+  /** 上传图片等素材（供助手插入文档） */
   onAttach?: (files: File[]) => void;
   attaching?: boolean;
   format?: string;
@@ -162,7 +162,7 @@ export function Chat(props: {
       >
         {!items.length && (
           <div className="chat-empty">
-            <p className="serif">告诉我你想怎么改这份文档。</p>
+            <p className="serif">想怎么改这份文档？</p>
             <div className="chips">
               {(props.format === "pdf"
                 ? ["转换成 Word 后帮我润色摘要", "总结这篇文档的要点", "检查参考文献格式", "/review"]
@@ -173,7 +173,6 @@ export function Chat(props: {
                 <button key={s} className="chip" onClick={() => onSend(s)}>{s}</button>
               ))}
             </div>
-            <p className="muted small">所有修改都直接作用在原文件上：未改动的内容逐字节保持不变，每次修改都会生成可回滚的版本。</p>
           </div>
         )}
         {grouped.map(({ item, children }) => {
@@ -202,7 +201,7 @@ export function Chat(props: {
               return <pre key={item.key} className="command-output">{item.text}</pre>;
           }
         })}
-        {busy && !pending && <div className="working"><span className="spinner" aria-hidden /> Agent 正在处理…</div>}
+        {busy && !pending && <div className="working"><span className="spinner" aria-hidden /> 处理中…</div>}
       </div>
 
       <Todos todos={props.todos} />
@@ -214,14 +213,14 @@ export function Chat(props: {
               type="button"
               className={`pill ${props.thinking ? "on" : ""}`}
               aria-pressed={!!props.thinking}
-              title={props.thinking ? "已开启：模型先思考再回答，复杂修改更可靠，但更慢、消耗更多 tokens" : "已关闭：直接回答，更快更省"}
+              title={props.thinking ? "已开启：更仔细，但更慢" : "已关闭：更快"}
               onClick={props.onToggleThinking}
             >
               <span aria-hidden>{props.thinking ? "●" : "○"}</span> 深度思考
             </button>
           )}
           {props.onAttach && (
-            <label className={`pill ${props.attaching ? "busy" : ""}`} title="上传图片（PNG/JPG/GIF/SVG），之后可以让 Agent 把它插入文档">
+            <label className={`pill ${props.attaching ? "busy" : ""}`} title="上传图片（PNG/JPG/GIF/SVG）">
               <input
                 type="file"
                 accept="image/png,image/jpeg,image/gif,image/svg+xml,image/bmp,image/webp"
@@ -258,7 +257,7 @@ export function Chat(props: {
         <textarea
           rows={3}
           value={text}
-          placeholder={busy ? "Agent 正在处理，可点击“中断”…" : "输入修改要求，Enter 发送，Shift+Enter 换行；输入 / 查看命令"}
+          placeholder={busy ? "处理中，可点击“中断”…" : "输入修改要求，Enter 发送，Shift+Enter 换行"}
           onChange={(e) => {
             setText(e.target.value);
             setSel(0);

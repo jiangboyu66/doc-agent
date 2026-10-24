@@ -31,8 +31,8 @@ export function Home({ runtime, onOpen }: { runtime: RuntimeInfo | null; onOpen:
   return (
     <main className="home">
       <header className="home-head">
-        <h1 className="serif">文案 Agent</h1>
-        <p className="lede">面向 Word、Markdown、HTML、PDF 的保真编辑助手。只改你要改的，其余每一个字节保持原样。</p>
+        <h1 className="serif">科研文档助手</h1>
+        <p className="lede">论文的润色、校对与排版。</p>
       </header>
 
       {runtime && (!runtime.apiKey || !runtime.external.soffice) && (
@@ -55,17 +55,17 @@ export function Home({ runtime, onOpen }: { runtime: RuntimeInfo | null; onOpen:
       >
         <input ref={input} type="file" hidden accept=".docx,.md,.markdown,.html,.htm,.pdf" onChange={(e) => upload(e.target.files?.[0])} />
         <div className="drop-icon" aria-hidden>⬆</div>
-        <div className="drop-title">{uploading ? "正在解析文档…" : "拖入文档，或点击选择文件"}</div>
-        <div className="muted small">支持 .docx · .md · .html · .pdf（PDF 可一键转换为 Word 后编辑）</div>
+        <div className="drop-title">{uploading ? "正在打开…" : "拖入文档，或点击选择文件"}</div>
+        <div className="muted small">Word · Markdown · HTML · PDF</div>
       </div>
       {err && <div className="notice error">{err}</div>}
 
       <section className="recent">
-        <h2>最近的会话</h2>
+        <h2>最近的文档</h2>
         {sessions === null ? (
           <div className="muted">加载中…</div>
         ) : sessions.length === 0 ? (
-          <div className="muted">还没有会话。上传一份文档开始。</div>
+          <div className="muted">还没有文档。</div>
         ) : (
           <ul>
             {sessions.map((s) => (
@@ -78,7 +78,7 @@ export function Home({ runtime, onOpen }: { runtime: RuntimeInfo | null; onOpen:
                 <button
                   className="btn small ghost"
                   onClick={async () => {
-                    if (!confirm(`删除会话“${s.filename}”？所有版本都会被删除。`)) return;
+                    if (!confirm(`删除“${s.filename}”？所有版本都会被删除。`)) return;
                     await api.remove(s.id).catch((e) => setErr(e.message));
                     load();
                   }}
@@ -91,11 +91,6 @@ export function Home({ runtime, onOpen }: { runtime: RuntimeInfo | null; onOpen:
         )}
       </section>
 
-      {runtime && (
-        <footer className="home-foot muted small">
-          模型 {runtime.model}（思考模式 {runtime.thinking}）· 技能 {runtime.skills.length} · 子代理 {runtime.agents.length}
-        </footer>
-      )}
     </main>
   );
 }

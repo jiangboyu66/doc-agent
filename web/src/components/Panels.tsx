@@ -39,14 +39,14 @@ export function OutlinePanel({ summary, onAsk }: { summary: DocumentSummary; onA
         {summary.format === "docx" && <div><b>{summary.comments}</b><span>批注</span></div>}
       </div>
       {summary.template && (
-        <div className="notice info">检测到模板：{summary.template.name}。Agent 会自动加载相应的写作与排版规范。</div>
+        <div className="notice info">检测到模板：{summary.template.name}</div>
       )}
       {summary.notes.map((n, i) => <div key={i} className="notice warn">{n}</div>)}
       {summary.headings.length === 0 && <div className="muted small pad">未识别到标题</div>}
       <ul className="outline">
         {summary.headings.map((h) => (
           <li key={h.ref} style={{ paddingLeft: (h.level - 1) * 14 }}>
-            <button onClick={() => onAsk(`请阅读“${h.text}”这一节（${h.ref}），指出可以改进的地方`)} title="让 Agent 审阅这一节">
+            <button onClick={() => onAsk(`请阅读“${h.text}”这一节（${h.ref}），指出可以改进的地方`)} title="审阅这一节">
               {h.text || "（空标题）"}
             </button>
           </li>
