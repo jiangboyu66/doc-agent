@@ -12,7 +12,7 @@
 
 import type { FillRect, ImageBox, PageModel, Seg, Span } from "./extract.js";
 import { collectHyphenated, collectWords, isSoftHyphen, wordCounts } from "../../documents/hyphen.js";
-import { detectDropCaps, detectEquations, detectFigures, detectImageGrids, detectMaskInk, rawBase, rasterBox, removeInside, spansText, type Box, type MathCtx } from "./raster.js";
+import { detectDropCaps, detectEquations, detectIconPaths, detectFigures, detectImageGrids, detectMaskInk, rawBase, rasterBox, removeInside, spansText, type Box, type MathCtx } from "./raster.js";
 
 export interface Run {
   text: string;
@@ -246,7 +246,10 @@ export function buildLines(spans: Span[]): Line[] {
   return groups.map((g) => finishLine(g.spans)).sort((a, b) => a.baseline - b.baseline || a.x0 - b.x0);
 }
 
-const ACCENT_ONLY = /^[ˆ^˜~¯˙¨´`ˇ→⃗\s]+$/;
+// 重音符号：独立的修饰字符，或组合用重音（BLEX 等大型定界符字体里的 ̂ ̃，U+0300–U+036F）
+const ACCENT_ONLY = /^[ˆ^˜~¯˙¨´`ˇ→⃗\u0300-\u036f\s]+$/;
+/** 根号（BLEX 的 √，字号与正文相同、垂直位置略高）：与重音一样要并回它所在的正文行 */
+const RADICAL = /^[√∛∜]$/;
 
 /** 同一行里叠在字母上方的重音符号（单独的文字项）并入它下面的字母：ȳ、F̂ */
 function foldAccents(spans: Span[]): Span[] {
@@ -257,7 +260,8 @@ function foldAccents(spans: Span[]): Span[] {
   for (const ac of accents) {
     const cx = (ac.x0 + ac.x1) / 2;
     const k = out.findIndex((o) => o !== ac && !ACCENT_ONLY.test(o.text) && !o.img && o.text.trim() && o.x0 - 0.5 <= cx && o.x1 + 0.5 >= cx);
-    const ch = COMBINING[ac.text.trim()[0]];
+    const first = ac.text.trim()[0];
+    const ch = /[\u0300-\u036f]/.test(first) ? first : COMBINING[first];
     if (k < 0 || !ch) continue;
     const o = out[k], n = o.text.length;
     const idx = Math.min(n - 1, Math.max(0, Math.floor(((cx - o.x0) / Math.max(0.1, o.x1 - o.x0)) * n)));
@@ -277,7 +281,8 @@ const COMBINING: Record<string, string> = { "ˆ": "\u0302", "^": "\u0302", "˜":
  */
 function attachMarks(groups: Array<{ spans: Span[]; top: number; bottom: number; baseline: number }>) {
   const sizeOf = (g: { spans: Span[] }) => Math.max(...g.spans.map((x) => x.size));
-  const isAccent = (t: string) => /^[ˆ^˜~¯˙¨´`ˇ→⃗\s]+$/.test(t);
+  const isAccent = (t: string) => ACCENT_ONLY.test(t);
+  const isRadical = (t: string) => RADICAL.test(t.trim());
   for (let i = groups.length - 1; i >= 0; i--) {
     const g = groups[i];
     const text = g.spans.map((x) => x.text).join("").trim();
@@ -290,7 +295,7 @@ function attachMarks(groups: Array<{ spans: Span[]; top: number; bottom: number;
     for (const h of groups) {
       if (h === g) continue;
       const hs = sizeOf(h);
-      const allAccent = g.spans.every((x) => isAccent(x.text));
+      const allAccent = g.spans.every((x) => isAccent(x.text) || isRadical(x.text));
       if (!allAccent && gs > 0.85 * hs) continue;
       const hx0 = Math.min(...h.spans.map((x) => x.x0)), hx1 = Math.max(...h.spans.map((x) => x.x1));
       const gx0 = Math.min(...g.spans.map((x) => x.x0)), gx1 = Math.max(...g.spans.map((x) => x.x1));
@@ -303,7 +308,8 @@ function attachMarks(groups: Array<{ spans: Span[]; top: number; bottom: number;
     if (!host) continue;
     for (const sp of g.spans) {
       if (isAccent(sp.text)) {
-        const ch = COMBINING[sp.text.trim()[0]];
+        const first0 = sp.text.trim()[0];
+        const ch = /[\u0300-\u036f]/.test(first0) ? first0 : COMBINING[first0];
         const cx = (sp.x0 + sp.x1) / 2;
         const k = host.spans.findIndex((o) => o.x0 - 0.5 <= cx && o.x1 + 0.5 >= cx && o.text.trim());
         if (ch && k >= 0) {
@@ -524,7 +530,7 @@ function inlineIcons(pg: PageModel): number {
     const row = pg.spans.filter((sp) => sp.text.trim() && !sp.img && Math.abs(sp.baseline - im.y1) <= 0.35 * sp.size + 1 && h <= 1.6 * sp.size && w <= 3 * sp.size);
     const near = row.filter((sp) => Math.min(Math.abs(sp.x1 - im.x0), Math.abs(sp.x0 - im.x1)) < 1.5 * sp.size);
     const over = row.some((sp) => Math.min(sp.x1, im.x1) - Math.max(sp.x0, im.x0) > 0.5 * Math.min(w, sp.x1 - sp.x0));
-    if (im.render || im.behind || !near.length || over) { keep.push(im); continue; }
+    if (im.behind || !near.length || over) { keep.push(im); continue; }
     const ref = near.reduce((a, b) => (b.size > a.size ? b : a));
     const size = Math.max(...row.map((sp) => sp.size));
     pg.spans.push({
@@ -593,8 +599,14 @@ function detectSideBySide(page: PageModel, used: Set<Seg>, taken: Set<Span>): Ta
         const rules = mergeH(page.segs.filter((sg) => !used.has(sg))).filter((h) => h.y > y0 && h.y < y1 && h.x1 - h.x0 > 30 && (isL(h) || isR(h)));
         const ys = [y0];
         const hs: HSeg[] = [];
-        const ry = rules.length >= 2 && rules.some(isL) && rules.some(isR) ? rules[0].y : null;
-        if (ry !== null && rules.every((h) => Math.abs(h.y - ry) <= 1.5) && !spans.some((sp) => sp.top < ry && sp.bottom > ry)) {
+        // 必要条件：两侧标题下各有一条同高的横线（"ARTICLE INFO / ABSTRACT"）。没有它，文字间的竖向空白多半只是
+        // 公式内部的空隙、居中的图题、两栏正文本身——把这些并排的行拆成两格表格会打乱整页版式
+        const ry = rules.length >= 1 ? rules[0].y : null;
+        const bothRules = rules.length >= 2 && rules.some(isL) && rules.some(isR) && rules.every((h) => Math.abs(h.y - rules[0].y) <= 1.5);
+        // 首页上半部的前置信息块（≥ 8 行，各自成段）：标题下的横线可只有一侧有（左侧的 ARTICLE INFO 有、右侧的 ABSTRACT 没有）
+        const frontMatter = page.index === 0 && y0 < 0.5 * page.height && run.length >= 8 && nL >= 4 && nR >= 4;
+        if (!(bothRules || frontMatter) || (ry !== null && spans.some((sp) => sp.top < ry && sp.bottom > ry))) { i = j; continue; }
+        if (ry !== null && (bothRules || rules.every((h) => Math.abs(h.y - ry) <= 1.5))) {
           ys.push(ry);
           for (const h of rules) {
             hs.push({ ...h, y: ry, x0: isL(h) ? x0 : gx, x1: isL(h) ? gx : x1 });
@@ -1287,6 +1299,11 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
       inlineMathCount += ink.inline.length;
     }
     dashRules(pg);
+    // 作者名后的矢量小图标（ORCID）：渲染成图后作为行内图片
+    if (opts.raster) {
+      const t1 = detectTables(pg).tables.map((t) => ({ x0: t.x0, y0: t.y0, x1: t.x1, y1: t.y1 }));
+      for (const box of detectIconPaths(pg, t1)) { removeInside(pg, box); pg.images.push(box); }
+    }
     iconCount += inlineIcons(pg);
     const { tables, used } = detectTables(pg);
     const inTable = new Set(tables.flatMap((t) => t.spans));

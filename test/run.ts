@@ -1051,6 +1051,63 @@ await test("期刊刊头灰底（粗描边线）、自定义字体回退、逐�
   }
 });
 
+await test("上下叠放的两幅图（各由左右两张位图拼成）：图题夹在中间时不并成一组；矢量小图标嵌回作者行；多行公式续行带编号", async () => {
+  const { detectImageGrids, detectIconPaths } = await import("../src/services/pdfConvert/raster.js");
+  const { extractPdf } = await import("../src/services/pdfConvert/extract.js");
+  const { pdfToDocx } = await import("../src/services/pdfConvert/index.js");
+  const pdf = await fixture("journal-fig.pdf");
+  const pages = await extractPdf(pdf);
+  // 第 2 页：4 张位图一行两张，上下两幅；图题夹在两幅之间 → 两个组，且组的范围不含任何一幅图的图题
+  const grids = detectImageGrids({ ...pages[1], images: [...pages[1].images], spans: [...pages[1].spans] } as any, 10);
+  eq(grids.length, 2, `两幅图各自成组：${JSON.stringify(grids.map((g) => [g.y0, g.y1]))}`);
+  assert(grids[0].y1 < grids[1].y0, "两组上下分开，不重叠");
+  // 第 1 页：矢量小图标（4 个）
+  const icons = detectIconPaths({ ...pages[0] } as any, []);
+  eq(icons.length, 4, `作者名后的矢量小图标：${icons.length}`);
+  for (const mode of ["exact", "flow"] as const) {
+    const { data, report } = await pdfToDocx(pdf, { mode });
+    eq(report.textCoverage, 1, `${mode}：文字完整性`);
+    const xml = new ZipPackage(data).readText("word/document.xml");
+    const author = (xml.match(/<w:p [^>]*>(?:(?!<\/w:p>)[\s\S])*Bo Su[\s\S]*?<\/w:p>/) ?? [""])[0];
+    eq((author.match(/<wp:inline/g) ?? []).length, 4, `${mode}：4 个小图标都应在作者行里`);
+    eq(report.figures >= 2, true, `${mode}：两幅图整体成图：${report.figures}`);
+    // 第 3 页：带编号的续行并进公式图片，不单独留下一行 "(10)"
+    const text = xml.replace(/<wp:inline[\s\S]*?<\/wp:inline>/g, "[IMG]").replace(/<[^>]+>/g, "");
+    assert(!/(^|\s)\(10\)(\s|$)/.test(text), `${mode}：公式编号应并进公式图片：${text.match(/.{20}\(10\).{20}/)?.[0]}`);
+  }
+});
+
+await test("所有夹具 PDF：两种排版方式都不报错、文字完整；LibreOffice 渲染的页数与原 PDF 一致（不出现留白 / 溢页）", async () => {
+  const { pdfToDocx } = await import("../src/services/pdfConvert/index.js");
+  const { extractPdf } = await import("../src/services/pdfConvert/extract.js");
+  const { execFile } = await import("node:child_process");
+  const { promisify } = await import("node:util");
+  const run = promisify(execFile);
+  const soffice = process.env.SOFFICE_PATH || "soffice";
+  const hasSoffice = await run(soffice, ["--version"]).then(() => true, () => false);
+  const names = ["columns", "journal", "figures", "math", "journal-front", "journal-eq", "journal-fig", "bios", "colstart"];
+  const dir = await fs.mkdtemp(path.join(tmp, "pages-"));
+  const bad: string[] = [];
+  for (const name of names) {
+    const pdf = await fixture(`${name}.pdf`);
+    const pdfPages = (await extractPdf(pdf)).length;
+    for (const mode of ["exact", "flow"] as const) {
+      const { data, report } = await pdfToDocx(pdf, { mode });
+      if (report.textCoverage < 1) bad.push(`${name}/${mode}：文字缺失 ${report.missing}`);
+      if (!hasSoffice) continue;
+      const f = path.join(dir, `${name}-${mode}.docx`);
+      await fs.writeFile(f, data);
+      await run(soffice, ["--headless", "--convert-to", "pdf", "--outdir", dir, f], { timeout: 120000 }).catch(() => {});
+      const out = await fs.readFile(path.join(dir, `${name}-${mode}.pdf`)).catch(() => null);
+      if (!out) continue;
+      const n = (await extractPdf(out)).length;
+      // 逐页保留方式页数必须与原件一致；可编辑排版允许多 / 少一页（重新换行）
+      if (mode === "exact" ? n !== pdfPages : Math.abs(n - pdfPages) > 1) bad.push(`${name}/${mode}：原 ${pdfPages} 页，转换后 ${n} 页`);
+    }
+  }
+  eq(bad.length, 0, bad.join("；"));
+});
+
 await test("Type 3 字形（位图蒙版 / 乱码编码）的公式与符号：行内的作为行内图片插回原行，独立的成图（含编号），不出现 Type3 字体、文字不丢", async () => {
   const { pdfToDocx } = await import("../src/services/pdfConvert/index.js");
   const { rasterAvailable } = await import("../src/services/pdfConvert/render.js");
