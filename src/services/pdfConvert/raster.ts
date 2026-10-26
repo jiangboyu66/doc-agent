@@ -69,6 +69,40 @@ export function removeInside(pg: PageModel, r: Box): Span[] {
 // ---------------------------------------------------------------------------
 
 /**
+ * 夹在文字行里的小矢量图标（作者名后的 ORCID 图标、行内的小徽标）：几条填充的曲线路径聚成一个 5–18pt 的小簇，
+ * 紧挨着同一行的文字（基线落在簇的下缘附近）。整体渲染成图，由版面模块插回该行作为行内图片；
+ * 否则这些矢量图形没有对应的文字或位图，会整个丢失。
+ */
+export function detectIconPaths(pg: PageModel, tableBoxes: Box[]): ImageBox[] {
+  const ps = pg.paths.filter((p) => (p.curved || p.diagonal || p.filled) && p.x1 - p.x0 < 20 && p.y1 - p.y0 < 20 && p.x1 - p.x0 > 0.3);
+  const cl: Array<{ box: Box; n: number; curved: number; colored: number }> = [];
+  for (const p of ps) {
+    const hit = cl.find((c) => near(c.box, p, 1.2));
+    const col = p.filled && !isGray(p.fillColor) ? 1 : 0;
+    if (hit) { hit.box = union(hit.box, p); hit.n++; hit.curved += p.curved ? 1 : 0; hit.colored += col; }
+    else cl.push({ box: { x0: p.x0, y0: p.y0, x1: p.x1, y1: p.y1 }, n: 1, curved: p.curved ? 1 : 0, colored: col });
+  }
+  // 簇之间可能因逐个并入而漏并：再合并一轮
+  for (let changed = true; changed; ) {
+    changed = false;
+    outer: for (let i = 0; i < cl.length; i++) for (let j = i + 1; j < cl.length; j++) {
+      if (near(cl[i].box, cl[j].box, 1.2)) { cl[i] = { box: union(cl[i].box, cl[j].box), n: cl[i].n + cl[j].n, curved: cl[i].curved + cl[j].curved, colored: cl[i].colored + cl[j].colored }; cl.splice(j, 1); changed = true; break outer; }
+    }
+  }
+  const out: ImageBox[] = [];
+  for (const c of cl) {
+    const w = c.box.x1 - c.box.x0, h = c.box.y1 - c.box.y0;
+    if (w < 5 || h < 5 || w > 18 || h > 18 || (c.curved < 2 && c.colored < 1)) continue;
+    if (tableBoxes.some((t) => overlapArea(t, c.box) > 0)) continue;
+    // 同一行的文字：基线落在簇的下缘上下、水平距离在 2 个字号内
+    const nb = pg.spans.filter((sp) => sp.text.trim() && !sp.img && Math.abs(sp.baseline - c.box.y1) <= 0.45 * sp.size + 2 && Math.min(Math.abs(sp.x1 - c.box.x0), Math.abs(sp.x0 - c.box.x1)) < 2 * sp.size && h <= 1.6 * sp.size);
+    if (!nb.length) continue;
+    out.push(rasterBox({ x0: c.box.x0 - 0.3, y0: c.box.y0 - 0.3, x1: c.box.x1 + 0.3, y1: c.box.y1 + 0.3 }, pg.index, "figure", ""));
+  }
+  return out;
+}
+
+/**
  * 矢量图识别：把已绘制的路径与位图按邻近关系聚类；含曲线/斜线/彩色填充的簇（流程图、曲线图、示意图）即为图。
  * 表格（只有横平竖直的线、落在已识别的表格范围内）不算；包含大量正文字号文字的簇（彩色文字框）不算。
  * 图内的文字、以及紧贴图边的小字号标注一并归入图。
@@ -232,7 +266,7 @@ const OPNAME = new Set(["softmax", "concat", "argmax", "argmin", "sigmoid", "tan
 const EQ_NUM = /\(\s*\d{1,3}[a-z]?\s*\)\s*$/;
 const isBigOp = (s: Span) => /^(CMEX|LMMATHEXTENSION|EUEX)/.test(rawBase(s)) || (/[∑∏∫∮⋃⋂]/.test(s.text) && !!s.math);
 
-function lineInfo(l: Line, r: { x0: number; x1: number }, ctx: MathCtx) {
+export function lineInfo(l: Line, r: { x0: number; x1: number }, ctx: MathCtx) {
   let prose = "", math = 0;
   for (const s of l.spans) {
     // 公式字体：数学字体，或正文不是 TeX 字体时出现的 TeX 字体（CMR 的数字、运算符名等）；含中日韩文字的片段一律视为正文
@@ -262,7 +296,8 @@ function lineInfo(l: Line, r: { x0: number; x1: number }, ctx: MathCtx) {
   const fragment = !strong && !onlyNumber && total <= 12 && words === 0 && indented;
   const big = l.spans.some(isBigOp);
   // 正文字体排的公式行（变量用斜体、有关系符号、没有英文单词）：单独不足以认定，配合分式等结构时成立
-  const weak = !strong && !onlyNumber && rel && engWords === 0 && vars >= 1 && words === 0;
+  // 右端带编号、没有英文单词、数学字体占一半以上：多行公式的续行（"−λ log p(…)  (10)"，没有关系符号也不缩进到足以认定）
+  const weak = !strong && !onlyNumber && ((rel && engWords === 0 && vars >= 1 && words === 0) || (numbered && engWords === 0 && words <= 1 && math >= 3));
   return { strong, fragment, onlyNumber, numbered, indented, big, text, weak, rel, math };
 }
 
@@ -387,7 +422,11 @@ export function detectImageGrids(pg: PageModel, bodySize: number): ImageBox[] {
     outer: for (let i = 0; i < groups.length; i++) for (let j = i + 1; j < groups.length; j++) {
       const A = bb(groups[i]), B = bb(groups[j]);
       const row = Math.min(A.y1, B.y1) - Math.max(A.y0, B.y0) > 0.5 * Math.min(A.y1 - A.y0, B.y1 - B.y0) && Math.max(A.x0, B.x0) - Math.min(A.x1, B.x1) < 0.15 * pg.width;
-      if (near(A, B, 3 * bodySize) || row) { groups[i].push(...groups[j]); groups.splice(j, 1); changed = true; break outer; }
+      // 两块之间夹着成行的文字（上一幅图的图题）：是上下两幅图，不能因为相距近就并成一组——并成一组后范围里含正文，
+      // 整组被"夹着正文"否决，两幅图都按零散的位图处理、各自按所在栏拆开
+      const gy0 = Math.min(A.y1, B.y1), gy1 = Math.max(A.y0, B.y0);
+      const captionBetween = gy1 - gy0 > 4 && pg.spans.some((sp) => /^(fig\.?|figure|table|tab\.|图|表)\s*\d*/i.test(sp.text.trim()) && sp.top >= gy0 - 1 && sp.bottom <= gy1 + 1 && sp.x1 > Math.min(A.x0, B.x0) && sp.x0 < Math.max(A.x1, B.x1));
+      if ((near(A, B, 3 * bodySize) || row) && !captionBetween) { groups[i].push(...groups[j]); groups.splice(j, 1); changed = true; break outer; }
     }
   }
   const LABEL = /^\(?[a-zA-Z0-9]{1,3}[).]?$/;
