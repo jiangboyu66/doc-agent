@@ -263,7 +263,7 @@ function lineInfo(l: Line, r: { x0: number; x1: number }, ctx: MathCtx) {
   const big = l.spans.some(isBigOp);
   // 正文字体排的公式行（变量用斜体、有关系符号、没有英文单词）：单独不足以认定，配合分式等结构时成立
   const weak = !strong && !onlyNumber && rel && engWords === 0 && vars >= 1 && words === 0;
-  return { strong, fragment, onlyNumber, numbered, indented, big, text, weak };
+  return { strong, fragment, onlyNumber, numbered, indented, big, text, weak, rel, math };
 }
 
 /**
@@ -275,8 +275,26 @@ export function detectEquations(lines: Line[], r: { x0: number; x1: number }, ct
   const ls = [...lines].sort((a, b) => a.top - b.top || a.x0 - b.x0);
   const info = ls.map((l) => lineInfo(l, r, ctx));
   const blocks: Array<{ lines: Line[]; box: Box }> = [];
+  // 分式的分子 / 分母：紧挨着一条不太长的分数线上方 / 下方、横向落在分数线范围内的行（"(2μμ + c)(2σ + c)" 这样的整行变量，
+  // 既没有数学字体、也不短，单看不是公式，却是 SSIM = … 这样的分式公式的一部分）
+  const W = r.x1 - r.x0;
+  const bars = extra.filter((e) => e.y1 - e.y0 < 1.5 && e.x1 - e.x0 > 6 && e.x1 - e.x0 < 0.6 * W && e.x0 >= r.x0 - 3 && e.x1 <= r.x1 + 3);
+  // 行的中心落在分数线的横向范围内（分子可以只是一个字母）
+  const overlapX = (o: Line, e: Box) => (o.x0 + o.x1) / 2 >= e.x0 - 2 && (o.x0 + o.x1) / 2 <= e.x1 + 2;
+  const fracPart = ls.map((l, k) => bars.some((e) => {
+    // 分数线另一侧也得有行：夹在中间才是分式（单独的下划线、表头线下面的字不算）
+    const aboveOf = (o: Line) => o !== l && overlapX(o, e) && o.bottom <= e.y0 + 2 && o.baseline > e.y0 - 1.3 * o.size;
+    const belowOf = (o: Line) => o !== l && overlapX(o, e) && o.top >= e.y1 - 2 && o.top < e.y1 + 1.3 * o.size;
+    // 主行：分数线落在这一行的数学轴高度（基线上 0.1–0.6 字号）、横向落在行内（"LDCT = iradon ln (I₀ / (I₀ × exp(…)))"）
+    if (e.x0 >= l.x0 - 2 && e.x1 <= l.x1 + 2 && e.y0 < l.baseline - 0.1 * l.size && e.y0 > l.baseline - 0.7 * l.size && REL.test(l.spans.map((sp) => sp.text).join("")))
+      return ls.some(aboveOf) && ls.some(belowOf);
+    if (l.x0 < e.x0 - 4 || l.x1 > e.x1 + 4 || l.x1 - l.x0 > 0.6 * W) return false;
+    const above = l.bottom <= e.y0 + 2 && l.baseline > e.y0 - 1.3 * l.size, below = l.top >= e.y1 - 2 && l.top < e.y1 + 1.3 * l.size;
+    if (!above && !below) return false;
+    return above ? ls.some(belowOf) : ls.some(aboveOf);
+  }));
   for (let i = 0; i < ls.length; ) {
-    const cand = (k: number) => info[k].strong || info[k].fragment || info[k].onlyNumber || info[k].weak;
+    const cand = (k: number) => info[k].strong || info[k].fragment || info[k].onlyNumber || info[k].weak || fracPart[k];
     if (!cand(i)) { i++; continue; }
     let j = i + 1;
     while (j < ls.length && cand(j) && ls[j].top - Math.max(...ls.slice(i, j).map((l) => l.bottom)) < 1.2 * ls[j].size) j++;
@@ -288,7 +306,7 @@ export function detectEquations(lines: Line[], r: { x0: number; x1: number }, ct
       ss.some((sp) => sp.bottom <= e.y0 + 2 && sp.baseline > e.y0 - 1.2 * sp.size && sp.x1 > e.x0 && sp.x0 < e.x1) &&
       ss.some((sp) => sp.top >= e.y1 - 2 && sp.top < e.y1 + 1.2 * sp.size && sp.x1 > e.x0 && sp.x0 < e.x1));
     const ok = (bi.some((x) => x.strong) && (fraction || bi.some((x) => x.numbered || x.onlyNumber || x.big || (x.strong && x.indented))))
-      || (fraction && bi.some((x) => x.weak));
+      || (fraction && bi.some((x) => x.weak || (x.rel && x.math >= 1)));
     if (ok) {
       let box: Box = { x0: Infinity, y0: Infinity, x1: -Infinity, y1: -Infinity };
       for (const l of bl) for (const s of l.spans) {

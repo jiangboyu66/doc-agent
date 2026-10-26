@@ -1020,6 +1020,37 @@ await test("期刊首页：文章信息 / 摘要左右并排、字距加宽的�
   }
 });
 
+await test("期刊刊头灰底（粗描边线）、自定义字体回退、逐字母字距标题、奇偶页版心偏移、分数线公式、字母上方的重音", async () => {
+  const { extractPdf } = await import("../src/services/pdfConvert/extract.js");
+  const { pdfToDocx } = await import("../src/services/pdfConvert/index.js");
+  const { isSafeFamily } = await import("../src/services/pdfConvert/fonts.js");
+  const pdf = await fixture("journal-eq.pdf");
+  const pages = await extractPdf(pdf);
+  // 60 多磅宽的描边线是色块，不是线：不进线段（否则被识别成穿过刊名的删除线），而是底色
+  assert(!pages[0].segs.some((g) => g.horizontal && g.width > 20), "粗描边线不应作为线段");
+  assert(pages[0].fills.some((f) => f.y1 - f.y0 > 50 && f.x1 - f.x0 > 300), "粗描边线应成为底色块");
+  // 自定义字体（族名不在 Word 常见字体里）回退到同类的常见字体
+  for (const p of pages) for (const sp of p.spans) assert(sp.math || isSafeFamily(sp.font), `字体应是 Word 里常见的：${sp.font}`);
+  // 逐字母定位的标题合成一个词、带字符间距
+  assert(pages[0].spans.some((sp) => sp.text === "ARTICLE" && (sp.tracking ?? 0) > 2), `逐字母标题应合成 ARTICLE：${pages[0].spans.filter((sp) => sp.baseline > 150 && sp.baseline < 170).map((sp) => sp.text).join("|")}`);
+  // 公式里隔着上下标的同字母（R₁¹, R₂¹, …）各自独立，不能被并成加宽字距的词 "RRRR"
+  assert(!pages[2].spans.some((sp) => sp.text === "RRRR"), "隔着上下标的 R 不应被并成一个词");
+  eq(pages[2].spans.filter((sp) => /(^|\s)R$/.test(sp.text)).length, 4, "四个 R 各自独立");
+  for (const mode of ["exact", "flow"] as const) {
+    const { data, report } = await pdfToDocx(pdf, { mode });
+    eq(report.textCoverage, 1, `${mode}：文字完整性`);
+    const xml = new ZipPackage(data).readText("word/document.xml");
+    // 刊头灰底：写成底纹 / 色块，而不是画在刊名上的线
+    assert(!/<a:ln w="\d{6,}"/.test(xml), `${mode}：不应有 60 磅宽的线`);
+    // 分数线公式整体成图（page 2 两条：分式、重音在内；page 3 一条）
+    assert(report.equations >= 2, `${mode}：栏内的分式公式应整体成图：${report.equations}`);
+    const text = xml.replace(/<wp:inline[\s\S]*?<\/wp:inline>/g, "[IMG]").replace(/<[^>]+>/g, "");
+    assert(!/\u2014/.test(text), `${mode}：分数线不应变成破折号`);
+    // 公式编号并进公式图片，不单独留下一行 "(10)"、"(8)"
+    assert(!/(^|\s)\(10\)(\s|$)/.test(text) || report.equations >= 3, `${mode}：公式编号应并进公式图片`);
+  }
+});
+
 await test("Type 3 字形（位图蒙版 / 乱码编码）的公式与符号：行内的作为行内图片插回原行，独立的成图（含编号），不出现 Type3 字体、文字不丢", async () => {
   const { pdfToDocx } = await import("../src/services/pdfConvert/index.js");
   const { rasterAvailable } = await import("../src/services/pdfConvert/render.js");
