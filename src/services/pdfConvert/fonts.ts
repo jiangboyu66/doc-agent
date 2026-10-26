@@ -86,6 +86,13 @@ function texFont(name: string): FontInfo | null {
   return null;
 }
 
+/** Word / 常见系统里一定有的字体（映射表的目标字体 + 少数通用字体）；不在其中的族名在读者的电脑上多半没有，会被随意替换 */
+const SAFE_FAMILIES = new Set<string>([...Object.values(MAP), "Times New Roman", "Arial", "Courier New", "Calibri", "Cambria", "Cambria Math", "Symbol", "Wingdings", "SimSun", "SimHei", "Microsoft YaHei"]);
+export const isSafeFamily = (family: string) => SAFE_FAMILIES.has(family);
+
+/** 小型大写字体（Elsevier 的 Gulliver SCOsF、Minion SC、…SmallCaps）：文字是小写字母，字形是小型大写 */
+export const isSmallCapsFont = (raw: string | undefined) => /(SCOsF|SC[A-Z]?sF|SmallCap|[a-z]SC$|[-_]SC\b|CapsF?$)/.test((raw ?? "").replace(/^[A-Z]{6}\+/, ""));
+
 export function parseFontName(raw: string | undefined): FontInfo {
   let name = (raw ?? "").replace(/^[A-Z]{6}\+/, "").trim();
   // GBK 十六进制编码的中文字体名（如 #CB#CE#CC#E5 = 宋体）

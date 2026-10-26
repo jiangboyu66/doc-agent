@@ -217,7 +217,9 @@ export function buildLines(spans: Span[]): Line[] {
       const gSize = Math.max(...g.spans.map((x) => x.size));
       const d0 = Math.abs(g.baseline - s.baseline);
       if (Math.abs(gSize - s.size) < 0.6 ? d0 > 0.2 * s.size : d0 > 0.5 * Math.max(gSize, s.size)) continue;
-      const clash = g.spans.some((o) => Math.min(o.x1, s.x1) - Math.max(o.x0, s.x0) > 0.3 * Math.min(o.x1 - o.x0, s.x1 - s.x0));
+      // 重音符号（ȳ 的横线）与它下面的字母横向重叠，但属于同一行：不算冲突，成行后并成组合字符
+      const accentLike = (x: Span) => ACCENT_ONLY.test(x.text) && !x.img;
+      const clash = g.spans.some((o) => Math.min(o.x1, s.x1) - Math.max(o.x0, s.x0) > 0.3 * Math.min(o.x1 - o.x0, s.x1 - s.x0) && !(accentLike(o) !== accentLike(s) && Math.abs(o.baseline - s.baseline) <= 0.45 * Math.max(o.size, s.size)));
       if (clash) continue;
       // 上下标优先并入左右紧挨着它的那一行：另一栏恰好同基线的行不能把它抢走（左栏的 M_θ* 并进右栏那一行）
       const small = s.size < 0.85 * gSize;
@@ -239,8 +241,30 @@ export function buildLines(spans: Span[]): Line[] {
       }
     } else groups.push({ spans: [s], top: s.top, bottom: s.bottom, baseline: s.baseline });
   }
+  for (const g of groups) g.spans = foldAccents(g.spans);
   attachMarks(groups);
   return groups.map((g) => finishLine(g.spans)).sort((a, b) => a.baseline - b.baseline || a.x0 - b.x0);
+}
+
+const ACCENT_ONLY = /^[ˆ^˜~¯˙¨´`ˇ→⃗\s]+$/;
+
+/** 同一行里叠在字母上方的重音符号（单独的文字项）并入它下面的字母：ȳ、F̂ */
+function foldAccents(spans: Span[]): Span[] {
+  if (spans.length < 2) return spans;
+  const accents = spans.filter((x) => ACCENT_ONLY.test(x.text) && !x.img && x.text.trim());
+  if (!accents.length || accents.length === spans.length) return spans;
+  const out = [...spans];
+  for (const ac of accents) {
+    const cx = (ac.x0 + ac.x1) / 2;
+    const k = out.findIndex((o) => o !== ac && !ACCENT_ONLY.test(o.text) && !o.img && o.text.trim() && o.x0 - 0.5 <= cx && o.x1 + 0.5 >= cx);
+    const ch = COMBINING[ac.text.trim()[0]];
+    if (k < 0 || !ch) continue;
+    const o = out[k], n = o.text.length;
+    const idx = Math.min(n - 1, Math.max(0, Math.floor(((cx - o.x0) / Math.max(0.1, o.x1 - o.x0)) * n)));
+    out[k] = { ...o, text: o.text.slice(0, idx + 1) + ch + o.text.slice(idx + 1) };
+    out.splice(out.indexOf(ac), 1);
+  }
+  return out;
 }
 
 /** 重音符号 → 组合字符（F + ˆ → F̂） */
@@ -1372,6 +1396,18 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
       }).length;
       if (aligned >= 2) gutters[i] = { ...docG };
     });
+    // 全文共识的栏边界要贴合本页的实际文字：期刊奇偶页的版心左右互换（偶页右栏从 302 起、奇页从 312 起），
+    // 沿用共识值会让右栏最左的行落到"栏外"，被当成跨栏行：栏内的行间公式（整栏宽、右端带编号）被拆成零散的碎片
+    pageLines.forEach((ls, i) => {
+      const g = gutters[i];
+      if (!g) return;
+      // 每行取最靠近分栏线的那一侧的边：右栏的行首 x0 / 左栏的行尾 x1
+      const ownR = ls.filter((l) => classify(l, g.x) !== "cross" && l.spans.some((sp) => (sp.x0 + sp.x1) / 2 >= g.x)).map((l) => Math.min(...l.spans.filter((sp) => (sp.x0 + sp.x1) / 2 >= g.x).map((sp) => sp.x0)));
+      const ownL = ls.filter((l) => classify(l, g.x) !== "cross" && l.spans.some((sp) => (sp.x0 + sp.x1) / 2 < g.x)).map((l) => Math.max(...l.spans.filter((sp) => (sp.x0 + sp.x1) / 2 < g.x).map((sp) => sp.x1)));
+      const g1 = ownR.length >= 4 ? Math.min(g.g1, edgeOf(ownR, "min")) : g.g1;
+      const g0 = ownL.length >= 4 ? Math.max(g.g0, edgeOf(ownL, "max")) : g.g0;
+      if (g1 - g0 >= 6 && (g1 !== g.g1 || g0 !== g.g0)) gutters[i] = { g0, g1, x: g.x > g0 && g.x < g1 ? g.x : (g0 + g1) / 2 };
+    });
   }
 
   // 流式模式：上下边距按正文（不含页眉页脚）计算，页眉页脚写进真正的页眉页脚部件
@@ -1531,8 +1567,16 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
     // 表格、分隔线、图片：完全落在某一栏内的归入该栏，否则为通栏
     const sideOf = (x0: number, x1: number): "full" | "L" | "R" =>
       !gutter ? "full" : x1 <= gutter.x + 2 ? "L" : x0 >= gutter.x - 2 ? "R" : "full";
+    // 本页分栏正文实际的左 / 右边界（奇偶页版心左右互换，全文最左 / 最右的值对本页偏出几个点）：
+    // 判断"右端带编号的行间公式"、居中、缩进都以栏的实际边界为准
+    const colEdge = (() => {
+      if (!gutter) return { l: left, r: right };
+      const rs = lines.filter((l) => l.x0 >= gutter.g1 - 1 && l.x1 - l.x0 > 0.5 * (right - gutter.g1)).map((l) => l.x1);
+      const ls = lines.filter((l) => l.x1 <= gutter.g0 + 1 && l.x1 - l.x0 > 0.5 * (gutter.g0 - left)).map((l) => l.x0);
+      return { l: ls.length >= 4 ? Math.max(left, edgeOf(ls, "min")) : left, r: rs.length >= 4 ? Math.min(right, edgeOf(rs, "max")) : right };
+    })();
     const regionOf = (side: "full" | "L" | "R"): Region =>
-      side === "full" || !gutter ? { x0: left, x1: right } : side === "L" ? { x0: left, x1: gutter.g0 } : { x0: gutter.g1, x1: right };
+      side === "full" || !gutter ? { x0: left, x1: right } : side === "L" ? { x0: colEdge.l, x1: gutter.g0 } : { x0: gutter.g1, x1: colEdge.r };
     for (const t of tables) items.push({ kind: "table", t, side: sideOf(t.x0, t.x1), top: t.y0 });
 
     // 旁边有文字的图片（流式模式）：挂在段落上、文字环绕；旁边那几行的缩进由环绕产生，行本身改为从栏边界起排

@@ -9,7 +9,7 @@ import { pdfjsDataOptions } from "./render.js";
 import zlib from "node:zlib";
 import { crc32 } from "../../documents/docx/zip.js";
 import { symbolChar } from "../../documents/docx/symbolFont.js";
-import { parseFontName, measureWord, type FontInfo } from "./fonts.js";
+import { isSafeFamily, isSmallCapsFont, parseFontName, measureWord, type FontInfo } from "./fonts.js";
 
 export { parseFontName };
 
@@ -294,6 +294,15 @@ async function extractPage(page: any, index: number, OPS: any, Util: any): Promi
           if (!horiz && !vert) continue;
           const len = horiz ? Math.abs(bx - ax) : Math.abs(by - ay);
           if (len < 1) continue;
+          // 很粗的"线"其实是色块（出版社用一根 60 多磅宽的线画刊头的灰底）：按色块处理。
+          // 当作线会被识别成穿过刊名的删除线，也不会画出底色
+          if (lw > 4 && len > 4 * lw / 4 && !isWhite(gs.stroke)) {
+            const mx = (ax + bx) / 2, my = (ay + by) / 2;
+            model.fills.push(horiz
+              ? { x0: Math.min(ax, bx), y0: my - lw / 2, x1: Math.max(ax, bx), y1: my + lw / 2, color: gs.stroke }
+              : { x0: mx - lw / 2, y0: Math.min(ay, by), x1: mx + lw / 2, y1: Math.max(ay, by), color: gs.stroke });
+            continue;
+          }
           model.segs.push({ x0: Math.min(ax, bx), y0: Math.min(ay, by), x1: Math.max(ax, bx), y1: Math.max(ay, by), width: lw, color: gs.stroke, horizontal: horiz });
         }
       }
@@ -476,7 +485,14 @@ async function extractPage(page: any, index: number, OPS: any, Util: any): Promi
       let raw: string | undefined;
       try { raw = page.commonObjs.has(fontName) ? page.commonObjs.get(fontName)?.name : undefined; } catch { /* 忽略 */ }
       rawNames.set(fontName, (raw ?? "").replace(/^[A-Z]{6}\+/, ""));
-      fontInfo.set(fontName, parseFontName(raw ?? tc.styles[fontName]?.fontFamily));
+      const info = parseFontName(raw ?? tc.styles[fontName]?.fontFamily);
+      // 出版社的定制字体（Gulliver、Charter 变体、……）：族名不在 Word 常见字体里时，按 PDF 里字体的类别（衬线 / 无衬线 / 等宽）
+      // 回退到同类的 Word 字体，否则读者的电脑上会被随意替换成宽度完全不同的字体，整页折行错乱
+      if (!info.math && !isSafeFamily(info.family) && !isType3(fontName)) {
+        const cls = tc.styles[fontName]?.fontFamily;
+        info.family = cls === "monospace" ? "Courier New" : cls === "sans-serif" ? "Arial" : "Times New Roman";
+      }
+      fontInfo.set(fontName, info);
     }
     return fontInfo.get(fontName)!;
   };
@@ -590,11 +606,54 @@ async function extractPage(page: any, index: number, OPS: any, Util: any): Promi
       type3: isType3(it.fontName) || undefined,
       wordW: measureWord(sym.text, sym.font, fi.bold || fakeBold, fi.italic, Math.round(size * 2) / 2) ?? undefined,
       wordSpaceW: measureWord(" ", sym.font, fi.bold || fakeBold, fi.italic, Math.round(size * 2) / 2) ?? undefined,
-      smallCaps: smallCaps || undefined,
+      smallCaps: smallCaps || (isSmallCapsFont(rawNames.get(it.fontName)) && /[a-z]/.test(sym.text) && !/[A-Z]/.test(sym.text)) || undefined,
       // 字距加宽 / 紧缩：pdf.js 插了空格的逐字母排列，或单个词（不受两端对齐的词间距影响）的实际宽度明显偏离自然宽度
       tracking: natural && (spaced || (!/\s/.test(sym.text) && sym.text.length >= 3 && Math.abs(width / natural - 1) > 0.12))
         ? (width - natural) / Math.max(1, sym.text.length) : undefined,
     });
   }
+  model.spans = mergeLetterSpaced(model.spans);
   return model;
+}
+
+/**
+ * 逐字母定位的加宽字距标题（"A R T I C L E  I N F O"）：PDF 把每个字母画成独立的文字项，
+ * 字母之间的空隙就是字距。≥ 4 个同字体、同字号、同基线的单字符文字项、间隙规则 → 合成词，加宽由字符间距体现；
+ * 间隙明显更大（> 1.7 倍字母间距）处是词间空格
+ */
+function mergeLetterSpaced(spans: Span[]): Span[] {
+  const idx = spans.map((_, i) => i).filter((i) => spans[i].text.trim().length === 1 && !spans[i].img && !spans[i].math);
+  idx.sort((a, b) => spans[a].baseline - spans[b].baseline || spans[a].x0 - spans[b].x0);
+  const drop = new Set<number>(), add: Span[] = [];
+  for (let a = 0; a < idx.length; ) {
+    let b = a + 1;
+    const f = spans[idx[a]];
+    while (b < idx.length) {
+      const p = spans[idx[b - 1]], q = spans[idx[b]];
+      const gap = q.x0 - p.x1;
+      if (Math.abs(q.baseline - f.baseline) > 0.3 || q.font !== f.font || q.size !== f.size || q.bold !== f.bold || q.italic !== f.italic || q.color !== f.color || gap < 0.08 * f.size || gap > 1.2 * f.size) break;
+      // 两个字母之间夹着别的文字项（R₁¹, R₂¹ 的上下标、逗号）：是公式里各自独立的字母，不是加宽字距
+      if (spans.some((o) => o !== p && o !== q && o.text.trim() && o.x0 >= p.x1 - 0.3 && o.x1 <= q.x0 + 0.3 && Math.abs(o.baseline - f.baseline) <= 0.8 * f.size)) break;
+      b++;
+    }
+    const run = idx.slice(a, b);
+    a = b > a + 1 ? b : a + 1;
+    if (run.length < 4) continue;
+    const gaps = run.slice(1).map((k, i) => spans[k].x0 - spans[run[i]].x1);
+    const med = [...gaps].sort((x, y) => x - y)[Math.floor(gaps.length / 2)];
+    // 字母间距必须规则：绝大多数间隙与中位数相差不大（排除"每个字母恰好分开"的偶然情形）
+    if (gaps.filter((g) => g <= 1.7 * med + 0.3 && Math.abs(g - med) <= 0.35 * Math.max(med, 0.5)).length < 0.6 * gaps.length) continue;
+    const words: number[][] = [[run[0]]];
+    run.slice(1).forEach((k, i) => (gaps[i] > 1.7 * med + 0.3 ? words.push([k]) : words[words.length - 1].push(k)));
+    for (const w of words) {
+      const ss = w.map((k) => spans[k]);
+      const first = ss[0], last = ss[ss.length - 1];
+      const natural = ss.every((x) => x.natural) ? ss.reduce((n, x) => n + x.natural!, 0) : undefined;
+      add.push({ ...first, text: ss.map((x) => x.text).join(""), x1: last.x1, natural, wordW: ss.every((x) => x.wordW) ? ss.reduce((n, x) => n + x.wordW!, 0) : undefined,
+        tracking: ss.length > 1 && natural ? (last.x1 - first.x0 - natural) / ss.length : undefined, top: Math.min(...ss.map((x) => x.top)), bottom: Math.max(...ss.map((x) => x.bottom)),
+        smallCaps: ss.every((x) => x.smallCaps) || undefined });
+    }
+    for (const k of run) drop.add(k);
+  }
+  return drop.size ? [...spans.filter((_, i) => !drop.has(i)), ...add] : spans;
 }
