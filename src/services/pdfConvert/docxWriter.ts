@@ -55,6 +55,7 @@ class Writer {
     parts.push(`<w:rFonts w:ascii="${f}" w:hAnsi="${f}" w:eastAsia="${f}" w:cs="${f}"/>`);
     if (r.bold) parts.push("<w:b/><w:bCs/>");
     if (r.italic) parts.push("<w:i/><w:iCs/>");
+    if (r.smallCaps) parts.push("<w:smallCaps/>");
     if (r.strike) parts.push("<w:strike/>");
     if (r.color && r.color !== "000000") parts.push(`<w:color w:val="${r.color}"/>`);
     if (r.spacing) parts.push(`<w:spacing w:val="${Math.round(r.spacing * 20)}"/>`);

@@ -127,7 +127,7 @@ export function parseFontName(raw: string | undefined): FontInfo {
   if (!out) {
     if (/^(times|tmsrm|nimbusrom|ptmr|tirom)/.test(key)) out = "Times New Roman";
     else if (/^(helvetica|helv|arialmt|phvr|formata|frutiger|univers|myriad|futura|gillsans|optima|syntax|segoe|opensans|roboto|lato|sourcesans|sans)/.test(key) || /sans|grotesk/.test(key)) out = narrow ? "Arial Narrow" : "Arial";
-    else if (/^(minion|giovanni|utopia|charter|baskerville|caslon|sabon|stempel|bembo|janson|plantin|lucidabright|stix|mtimes|adobetimes|serif)/.test(key)) out = "Times New Roman";
+    else if (/^(minion|giovanni|utopia|charter|charis|baskerville|caslon|sabon|stempel|bembo|janson|plantin|lucidabright|stix|mtimes|adobetimes|serif)/.test(key)) out = "Times New Roman";
     else if (/^(courier|mono|lucidatypewriter|inconsolata|menlo)/.test(key) || /mono$/.test(key)) out = "Courier New";
   }
   if (out === "Arial" && narrow) out = "Arial Narrow";

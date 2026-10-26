@@ -33,6 +33,9 @@ export interface Run {
   underline?: boolean;
   strike?: boolean;
   vertAlign?: "superscript" | "subscript";
+  smallCaps?: boolean;
+  /** 字距加宽的文字实测的字符间距（pt），优先于按样式统计的间距 */
+  tracking?: number;
   /** 域（页眉页脚中的页码） */
   field?: "PAGE";
   /** 原 PDF 的分页位置（写成 lastRenderedPageBreak，浏览器预览据此分页） */
@@ -216,7 +219,10 @@ export function buildLines(spans: Span[]): Line[] {
       if (Math.abs(gSize - s.size) < 0.6 ? d0 > 0.2 * s.size : d0 > 0.5 * Math.max(gSize, s.size)) continue;
       const clash = g.spans.some((o) => Math.min(o.x1, s.x1) - Math.max(o.x0, s.x0) > 0.3 * Math.min(o.x1 - o.x0, s.x1 - s.x0));
       if (clash) continue;
-      const d = Math.abs(g.baseline - s.baseline);
+      // 上下标优先并入左右紧挨着它的那一行：另一栏恰好同基线的行不能把它抢走（左栏的 M_θ* 并进右栏那一行）
+      const small = s.size < 0.85 * gSize;
+      const adjacent = !small || g.spans.some((o) => Math.max(o.x0 - s.x1, s.x0 - o.x1) < 1.5 * gSize);
+      const d = Math.abs(g.baseline - s.baseline) + (adjacent ? 0 : 0.6 * gSize);
       if (d < bestD) { bestD = d; best = g; }
     }
     if (best) {
@@ -412,8 +418,28 @@ function detectRuledTables(page: PageModel, used: Set<Seg>, taken: Set<Span>): T
     if (g) g.push(h);
     else groups.push([h]);
   }
-  const out: TableDraft[] = [];
+  // 同一栏里上下相邻的两张三线表，横线的左右端点几乎相同，会被并成一组；
+  // 两条横线之间若夹着成行的正文或表题（"Table 2 …"），说明这是两张表的分界，从这里切开
+  const split: HSeg[][] = [];
   for (const g of groups) {
+    let cur: HSeg[] = [g[0]];
+    for (let k = 1; k < g.length; k++) {
+      const a = g[k - 1], b = g[k];
+      const gx0 = Math.min(a.x0, b.x0), gx1 = Math.max(a.x1, b.x1);
+      const between = page.spans.filter((sp) => !taken.has(sp) && sp.text.trim() && (sp.top + sp.bottom) / 2 > a.y && (sp.top + sp.bottom) / 2 < b.y && sp.x1 > gx0 - 2 && sp.x0 < gx1 + 2);
+      const boundary = buildLines(between).some((l) => {
+        const t = l.spans.map((sp) => sp.text).join(" ").trim();
+        if (/^(table|tab\.)\s*[\dIVXLC]+\b|^表\s*\d/i.test(t)) return true;
+        let maxGap = 0;
+        for (let i = 1; i < l.spans.length; i++) maxGap = Math.max(maxGap, l.spans[i].x0 - l.spans[i - 1].x1);
+        return l.x1 - l.x0 > 0.6 * (gx1 - gx0) && maxGap < Math.max(4, 0.6 * l.size) && l.spans.length >= 6;
+      });
+      if (boundary) { split.push(cur); cur = [b]; } else cur.push(b);
+    }
+    split.push(cur);
+  }
+  const out: TableDraft[] = [];
+  for (const g of split) {
     if (g.length < 2) continue;
     const x0 = Math.min(...g.map((h) => h.x0)), x1 = Math.max(...g.map((h) => h.x1));
     const y0 = g[0].y, y1 = g[g.length - 1].y;
@@ -459,6 +485,105 @@ function detectRuledTables(page: PageModel, used: Set<Seg>, taken: Set<Span>): T
     out.push({ x0, x1, y0, y1, xs, ys, hs: hsDraft, vs, spans });
     for (const h of g) h.src.forEach((sg) => used.add(sg));
     for (const sp of spans) taken.add(sp);
+  }
+  return out;
+}
+
+/**
+ * 夹在文字行中的小图标（作者名后的 ORCID 图标、行内的小符号图片）：改成该行里的行内图片。
+ * 否则它们被当成独立的图片，各占一段，把下面的行整体推下去，图标本身也和名字脱开
+ */
+function inlineIcons(pg: PageModel): number {
+  const keep: ImageBox[] = [];
+  for (const im of pg.images) {
+    const h = im.y1 - im.y0, w = im.x1 - im.x0;
+    const row = pg.spans.filter((sp) => sp.text.trim() && !sp.img && Math.abs(sp.baseline - im.y1) <= 0.35 * sp.size + 1 && h <= 1.6 * sp.size && w <= 3 * sp.size);
+    const near = row.filter((sp) => Math.min(Math.abs(sp.x1 - im.x0), Math.abs(sp.x0 - im.x1)) < 1.5 * sp.size);
+    const over = row.some((sp) => Math.min(sp.x1, im.x1) - Math.max(sp.x0, im.x0) > 0.5 * Math.min(w, sp.x1 - sp.x0));
+    if (im.render || im.behind || !near.length || over) { keep.push(im); continue; }
+    const ref = near.reduce((a, b) => (b.size > a.size ? b : a));
+    const size = Math.max(...row.map((sp) => sp.size));
+    pg.spans.push({
+      text: "\uFFFC", x0: im.x0, x1: im.x1, top: ref.baseline - 0.75 * size, bottom: ref.baseline + 0.22 * size, baseline: ref.baseline, size,
+      font: ref.font, bold: false, italic: false, color: "000000", natural: w, wordW: w, spaceW: ref.spaceW, wordSpaceW: ref.wordSpaceW, img: im,
+    });
+  }
+  const n = pg.images.length - keep.length;
+  pg.images = keep;
+  return n;
+}
+
+/**
+ * 左右并排的两个文字块（Elsevier 等期刊首页的"文章信息 / 关键词"与"摘要"）：
+ * 一段连续的行里有一条所有行都不跨越的竖向空白，且这条空白不在页面中部（不是正文的双栏），
+ * 两侧各有至少 3 行实在的文字 → 写成一张无边框的两格表格，两侧各自成段。
+ * 否则两侧的行会按纵坐标交错排在一起：左侧的短行把右侧段落切碎，行距也被打乱。
+ * 两侧标题下各自的横线（"ARTICLE INFO" / "ABSTRACT" 下的线）作为表头行的下边框。
+ */
+function detectSideBySide(page: PageModel, used: Set<Seg>, taken: Set<Span>): TableDraft[] {
+  const free = page.spans.filter((sp) => !taken.has(sp) && sp.text.trim() && !sp.img);
+  if (free.length < 12) return [];
+  const lines = buildLines(free).sort((a, b) => a.top - b.top);
+  const X0 = Math.min(...lines.map((l) => l.x0)), X1 = Math.max(...lines.map((l) => l.x1)), W = X1 - X0;
+  if (W < 200) return [];
+  const lo = X0 + 0.12 * W, hi = X0 + 0.88 * W;
+  type Iv = [number, number];
+  const cut = (ivs: Iv[], a: number, b: number): Iv[] => ivs.flatMap(([p, q]): Iv[] => (b <= p || a >= q ? [[p, q]] : [...(a > p ? [[p, a] as Iv] : []), ...(b < q ? [[b, q] as Iv] : [])]));
+  const offCenter = (iv: Iv) => { const c = (iv[0] + iv[1]) / 2; return c < X0 + 0.4 * W || c > X0 + 0.6 * W; };
+  // 本页正文的双栏：分界落在栏边界上（左栏几行短句 + 右栏正文）只是普通的分栏，不是并排的文字块
+  const pageGutter = detectGutter(lines, { x0: X0, x1: X1 });
+  const out: TableDraft[] = [];
+  let i = 0;
+  while (i < lines.length) {
+    let corridor: Iv[] = [[lo, hi]];
+    for (const sp of lines[i].spans) corridor = cut(corridor, sp.x0 - 3, sp.x1 + 3);
+    corridor = corridor.filter((iv) => iv[1] - iv[0] >= 8 && offCenter(iv));
+    let j = i + 1;
+    while (corridor.length && j < lines.length && lines[j].top - lines[j - 1].bottom < 2.5 * Math.max(lines[j].size, lines[j - 1].size)) {
+      let next = corridor;
+      for (const sp of lines[j].spans) next = cut(next, sp.x0 - 3, sp.x1 + 3);
+      next = next.filter((iv) => iv[1] - iv[0] >= 8 && offCenter(iv));
+      if (!next.length) break;
+      corridor = next;
+      j++;
+    }
+    const run = lines.slice(i, j);
+    // 取最宽的空白作为分界
+    const gap = corridor.sort((a, b) => (b[1] - b[0]) - (a[1] - a[0]))[0];
+    if (gap && run.length >= 6) {
+      const mid = (gap[0] + gap[1]) / 2;
+      // 分界取两侧文字之间空白的正中（空白带受扫描范围限制，不一定居中）
+      const lEdge = Math.max(...run.flatMap((l) => l.spans.filter((sp) => sp.x1 <= mid).map((sp) => sp.x1)), -Infinity);
+      const rEdge = Math.min(...run.flatMap((l) => l.spans.filter((sp) => sp.x0 >= mid).map((sp) => sp.x0)), Infinity);
+      const gx = Number.isFinite(lEdge) && Number.isFinite(rEdge) ? (lEdge + rEdge) / 2 : mid;
+      const side = (l: Line, left: boolean) => l.spans.filter((sp) => (left ? sp.x1 <= gx : sp.x0 >= gx));
+      const chars = (left: boolean) => run.reduce((n, l) => n + side(l, left).reduce((m, sp) => m + sp.text.trim().length, 0), 0);
+      const nL = run.filter((l) => side(l, true).length).length, nR = run.filter((l) => side(l, false).length).length;
+      const onColumns = !!pageGutter && (Math.abs(rEdge - pageGutter.g1) <= 4 || Math.abs(lEdge - pageGutter.g0) <= 4);
+      if (nL >= 3 && nR >= 3 && chars(true) >= 40 && chars(false) >= 40 && !onColumns) {
+        const spans = run.flatMap((l) => l.spans);
+        const x0 = Math.min(...spans.map((sp) => sp.x0)) - CELL_MARGIN, x1 = Math.max(...spans.map((sp) => sp.x1)) + CELL_MARGIN;
+        const y0 = Math.min(...spans.map((sp) => sp.top)) - 1, y1 = Math.max(...spans.map((sp) => sp.bottom)) + 1;
+        // 两侧各自的标题横线：落在块内、只在一侧、两侧同一高度 → 表头行的下边框
+        const isL = (h: HSeg) => (h.x0 + h.x1) / 2 < gx && h.x1 < rEdge - 1, isR = (h: HSeg) => (h.x0 + h.x1) / 2 > gx && h.x0 > lEdge + 1;
+        const rules = mergeH(page.segs.filter((sg) => !used.has(sg))).filter((h) => h.y > y0 && h.y < y1 && h.x1 - h.x0 > 30 && (isL(h) || isR(h)));
+        const ys = [y0];
+        const hs: HSeg[] = [];
+        const ry = rules.length >= 2 && rules.some(isL) && rules.some(isR) ? rules[0].y : null;
+        if (ry !== null && rules.every((h) => Math.abs(h.y - ry) <= 1.5) && !spans.some((sp) => sp.top < ry && sp.bottom > ry)) {
+          ys.push(ry);
+          for (const h of rules) {
+            hs.push({ ...h, y: ry, x0: isL(h) ? x0 : gx, x1: isL(h) ? gx : x1 });
+            h.src.forEach((sg) => used.add(sg));
+          }
+        }
+        ys.push(y1);
+        const xs = [x0, gx, x1];
+        out.push({ x0, x1, y0, y1, xs, ys, hs, vs: xs.map((x) => ({ x, y0, y1, w: 0, color: "none", src: [] })), spans });
+        for (const sp of spans) taken.add(sp);
+      }
+    }
+    i = j;
   }
   return out;
 }
@@ -585,11 +710,11 @@ function spanFormat(s: Span, lineSize: number, lineBaseline: number): Omit<Run, 
     if (vertAlign) size = Math.max(s.size / 0.66, s.size);
   }
   if (s.img) return { font: s.font, size: lineSize, bold: false, italic: false, color: s.color, img: s.img, imgLower: s.img.y1 - lineBaseline };
-  return { font: s.font, size, bold: s.bold, italic: s.italic, color: s.color, underline: s.underline, strike: s.strike, vertAlign };
+  return { font: s.font, size, bold: s.bold, italic: s.italic, color: s.color, underline: s.underline, strike: s.strike, vertAlign, smallCaps: s.smallCaps, tracking: s.tracking };
 }
 
 const sameFmt = (a: Run, b: Omit<Run, "text" | "tab">) =>
-  !a.tab && !a.br && !a.img && !b.img && a.font === b.font && a.size === b.size && a.bold === b.bold && a.italic === b.italic && a.color === b.color && !!a.underline === !!b.underline && !!a.strike === !!b.strike && a.vertAlign === b.vertAlign;
+  !a.tab && !a.br && !a.img && !b.img && a.font === b.font && a.size === b.size && a.bold === b.bold && a.italic === b.italic && a.color === b.color && !!a.underline === !!b.underline && !!a.strike === !!b.strike && a.vertAlign === b.vertAlign && !!a.smallCaps === !!b.smallCaps && a.tracking === b.tracking;
 
 function pushText(runs: Run[], text: string, fmt: Omit<Run, "text" | "tab">) {
   if (fmt.img) {
@@ -1070,7 +1195,10 @@ function dashRules(pg: PageModel): void {
     const near = row.filter((s) => s.x1 > g.x0 - 2.5 * s.size && s.x0 < g.x1 + 2.5 * s.size);
     const ref = near[0];
     const overlapped = row.some((s) => Math.min(s.x1, g.x1) - Math.max(s.x0, g.x0) > 0.5);
-    if (!ref || overlapped || len < 0.8 * ref.size || len > 6 * ref.size) { keep.push(g); continue; }
+    // 分数线：正上方和正下方都紧挨着文字（分子、分母），不是破折号
+    const stacked = (above: boolean) => pg.spans.some((s) => s.text.trim() && s.x1 > g.x0 && s.x0 < g.x1 &&
+      (above ? s.baseline <= y + 0.5 && s.baseline > y - 1.2 * s.size : s.top >= y - 1 && s.top < y + 1.2 * s.size));
+    if (!ref || overlapped || len < 0.8 * ref.size || len > 6 * ref.size || (stacked(true) && stacked(false))) { keep.push(g); continue; }
     const n = Math.max(1, Math.round(len / ref.size)); // 长破折号宽 1 个字号
     added.push({ ...ref, text: "\u2014".repeat(n), x0: g.x0, x1: g.x1, bold: false, italic: false, natural: n * ref.size, wordW: n * ref.size, img: undefined, type3: undefined });
   }
@@ -1099,7 +1227,7 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
   const bodyBase = top1(baseN) ?? "";
   const mathCtx: MathCtx = { bodySize: top1(sizeN) ?? 10, bodyBase, bodyIsTeX: /^(CM|SF|LM|EC)/.test(bodyBase) };
   const rasterText: string[] = [];
-  let figureCount = 0, equationCount = 0, inlineMathCount = 0;
+  let figureCount = 0, equationCount = 0, inlineMathCount = 0, iconCount = 0;
 
   // 预处理：矢量图（渲染为图片）、表格、装饰线
   const pre = pages.map((pg) => {
@@ -1135,9 +1263,11 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
       inlineMathCount += ink.inline.length;
     }
     dashRules(pg);
+    iconCount += inlineIcons(pg);
     const { tables, used } = detectTables(pg);
     const inTable = new Set(tables.flatMap((t) => t.spans));
     tables.push(...detectRuledTables(pg, used, inTable));
+    tables.push(...detectSideBySide(pg, used, inTable));
     const free = pg.spans.filter((s) => !inTable.has(s));
     const rules = applyTextDecorations(free, pg.segs, used);
     return { pg, tables, free, rules, figures };
@@ -1190,7 +1320,10 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
     for (let k = ls.length - 1; k >= 0; k--) {
       const l = ls[k], prev = ls[k - 1];
       if (l.top < H * 0.9) break;
-      if (!prev || l.top - prev.bottom > 1.2 * l.size || out.length) out.push(l);
+      // 页脚可以有好几行（期刊首页的 doi、收稿日期、版权行），但都与第一行页脚同样字号、且比正文小；
+      // 遇到正文字号的行就停：页码上方紧挨着的正文末行、栏底的公式不能被卷进页脚
+      const footLike = out.length > 0 && Math.abs(l.size - out[0].size) < 0.6 && l.size < 0.95 * mathCtx.bodySize;
+      if (!prev || l.top - prev.bottom > 1.2 * l.size || footLike) out.push(l);
       else break;
     }
     // 页眉：从上往下
@@ -1403,7 +1536,11 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
     for (const t of tables) items.push({ kind: "table", t, side: sideOf(t.x0, t.x1), top: t.y0 });
 
     // 旁边有文字的图片（流式模式）：挂在段落上、文字环绕；旁边那几行的缩进由环绕产生，行本身改为从栏边界起排
-    const floatBeside = (img: ImageBox, side: "full" | "L" | "R", besideLines: Array<Extract<Item, { kind: "line" }> & { top: number }>) => {
+    const floatedLines = new Map<Extract<Item, { kind: "line" }> & { top: number }, { line: Line; reg: Region }>();
+    const floatedImgs: ImageBox[] = [];
+    const floatBeside = (img: ImageBox, side0: "full" | "L" | "R", besideLines: Array<Extract<Item, { kind: "line" }> & { top: number }>) => {
+      // 旁边是通栏文字（期刊页眉：左徽标、右封面、中间刊名）：图片随通栏文字排，否则它单独落进分栏带，找不到可挂的段落
+      const side = besideLines.length && besideLines.every((it) => it.side === "full") ? "full" : side0;
       const reg = regionOf(side);
       // 环绕间距：改写行边界之前，量图片与旁边文字行、下方文字行的实测距离
       const clamp = (v: number, hi: number) => Math.min(hi, Math.max(2, v));
@@ -1422,7 +1559,11 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
         // 下方文字行的 top 含字体上方留白，只取一半，避免整行文字被多推下去
         b: gapB < 20 ? clamp(gapB * 0.5, 8) : 2,
       };
-      for (const it of besideLines) it.line = it.line.x0 >= img.x1 - 6 ? { ...it.line, x0: reg.x0 } : { ...it.line, x1: reg.x1 };
+      for (const it of besideLines) {
+        if (!floatedLines.has(it)) floatedLines.set(it, { line: it.line, reg });
+        it.line = it.line.x0 >= img.x1 - 6 ? { ...it.line, x0: reg.x0 } : { ...it.line, x1: reg.x1 };
+      }
+      floatedImgs.push(img);
       items.push({ kind: "float", img, side, top: img.y0 - 0.01 });
     };
     const besideOf = (img: { x0: number; y0: number; x1: number; y1: number }, side: "full" | "L" | "R") =>
@@ -1496,6 +1637,18 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
         continue;
       }
       rest.push(img);
+    }
+    // 夹在两侧浮动图片之间、原本居中的行（期刊页眉的刊名）：在 Word 里居中于两图之间的空白，
+    // 行的范围按版心对称放置，段落识别为居中
+    for (const [it, { line: o, reg }] of floatedLines) {
+      const overlaps = floatedImgs.filter((im) => im.y1 > o.top && im.y0 < o.bottom);
+      const a = Math.max(reg.x0, ...overlaps.filter((im) => im.x1 <= o.x0 + 6).map((im) => im.x1));
+      const b = Math.min(reg.x1, ...overlaps.filter((im) => im.x0 >= o.x1 - 6).map((im) => im.x0));
+      const c = (o.x0 + o.x1) / 2, w = o.x1 - o.x0;
+      if (Math.abs(c - (a + b) / 2) <= 3 && o.x0 - a > 4 && b - o.x1 > 4) {
+        const rc = (reg.x0 + reg.x1) / 2;
+        it.line = { ...it.line, x0: rc - w / 2, x1: rc + w / 2 };
+      }
     }
     const groups: ImageBox[][] = [];
     for (const img of rest) {
@@ -1641,7 +1794,7 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
   for (const p of paras) for (const r of p.runs) {
     if (r.tab || r.br) continue;
     const sp = spacingOf.get(fontKey(r));
-    const base = r.paraSpacing ?? sp ?? 0;
+    const base = r.tracking !== undefined ? Math.round(r.tracking * 20) / 20 : r.paraSpacing ?? sp ?? 0;
     const v = r.lineSpacing !== undefined ? Math.min(r.lineSpacing, base) : base;
     r.spacing = Math.abs(v) >= 0.03 ? v : undefined;
   }
@@ -1706,7 +1859,7 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
     blocks,
     finalSection: curSection,
     bodyFont, bodySize,
-    stats: { ...stats, figures: figureCount, equations: equationCount, inlineMath: inlineMathCount },
+    stats: { ...stats, images: stats.images + iconCount, figures: figureCount, equations: equationCount, inlineMath: inlineMathCount },
     rasterText: rasterText.join("\n"),
     mode: ctx.mode,
     ...(hfOut ? { headers: hfOut.headers, footers: hfOut.footers, pageNumStart: hfOut.pageNumStart, headerDist, footerDist } : {}),
