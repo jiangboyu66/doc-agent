@@ -107,19 +107,20 @@ const BUILTIN: Command[] = [
     },
   },
   {
-    type: "local", name: "export", description: "导出文件（PDF 可导出为 Word）", argumentHint: "docx|pdf|html|markdown [exact|flow]",
+    type: "local", name: "export", description: "导出文件（PDF 可导出为 Word，可只转换部分页）", argumentHint: "docx|pdf|html|markdown [exact|flow] [页码范围，如 1-20]",
     async run(a, ctx) {
       const args = a.trim().split(/\s+/).filter(Boolean);
       const fmt = (args.find((x) => ["docx", "pdf", "html", "markdown"].includes(x)) ?? (ctx.session.meta.format === "pdf" ? "docx" : ctx.session.meta.format)) as ExportFormat;
       if (!["docx", "pdf", "html", "markdown"].includes(fmt)) return "格式可选：docx / pdf / html / markdown";
-      const out = await exportDocument(ctx.session.current(), ctx.session.meta.format, fmt, { pdfMode: args.includes("flow") ? "flow" : "exact" });
+      const pages = args.find((x) => /^[\d,，、\-–~]+$/.test(x) && /\d/.test(x));
+      const out = await exportDocument(ctx.session.current(), ctx.session.meta.format, fmt, { pdfMode: args.includes("flow") ? "flow" : "exact", pdfPages: ctx.session.meta.format === "pdf" ? pages : undefined });
       const name = `${ctx.session.meta.filename.replace(/\.[^.]+$/, "")}-v${ctx.session.meta.currentVersion}.${out.ext}`;
       const file = await ctx.session.writeExport(name, out.data);
       return `已导出：${file}\n${out.note}`;
     },
   },
   {
-    type: "local", name: "convert", description: "把 PDF 转换为可编辑的 Word 文档（默认在当前会话内转换并继续编辑；加 new 则生成新会话）", argumentHint: "flow|exact [builtin|pdf2docx|libreoffice] [new]",
+    type: "local", name: "convert", description: "把 PDF 转换为可编辑的 Word 文档（默认在当前会话内转换并继续编辑；加 new 则生成新会话；可只转换部分页）", argumentHint: "flow|exact [builtin|pdf2docx|libreoffice] [new] [页码范围，如 1-20]",
     async run(a, ctx) {
       const args = a.trim().split(/\s+/).filter(Boolean);
       const reconvert = ctx.session.meta.format === "docx" && ctx.session.meta.sourceFormat === "pdf";
@@ -128,12 +129,13 @@ const BUILTIN: Command[] = [
       const mode = args.includes("exact") ? "exact" : "flow";
       const engine = (["pdf2docx", "libreoffice"].find((e) => args.includes(e)) ?? "builtin") as "builtin" | "pdf2docx" | "libreoffice";
       const s = ctx.runtime.settings;
+      const pages = args.find((x) => /^[\d,，、\-–~]+$/.test(x) && /\d/.test(x));
       if (!args.includes("new")) {
-        const r = await convertPdfInPlace(ctx.session, { engine, mode });
+        const r = await convertPdfInPlace(ctx.session, { engine, mode, pages });
         const v = await ctx.session.commit(r.label, []);
         return `${r.text}\n已在当前会话内转换为 Word（版本 v${v}），现在可以直接让我修改；原 PDF 保留为 v0，可随时回滚。`;
       }
-      const { session, text } = await convertPdfSession(ctx.session, { engine, mode, defaults: { mode: s.permissionMode, trackChanges: s.trackChanges, author: s.author } });
+      const { session, text } = await convertPdfSession(ctx.session, { engine, mode, pages, defaults: { mode: s.permissionMode, trackChanges: s.trackChanges, author: s.author } });
       return `${text}\n新会话 ID：${session.id}（Web 界面会自动打开；命令行可用 --resume ${session.id} 继续编辑）`;
     },
   },

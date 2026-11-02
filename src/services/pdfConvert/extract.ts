@@ -205,14 +205,60 @@ const getObj = (store: any, id: string): Promise<any> =>
     }
   });
 
-export async function extractPdf(buf: Buffer, opts: { maxPages?: number } = {}): Promise<PageModel[]> {
+/** 单次转换的页数上限：再多的话 Word 文件与预览都过于庞大，按页码范围分批转换 */
+export const MAX_PDF_PAGES = 500;
+
+/**
+ * 页码范围："1-20"、"1-5, 8, 10-12"、"5-"（到最后一页）、"-20"（到第 20 页），也接受 "1–20"、"1~20"、"第1至20页"、"1，3"。
+ * 返回从 1 开始、升序去重、落在 [1, total] 内的页码；没有一页有效时报错
+ */
+export function parsePageRange(spec: string | number[], total: number): number[] {
+  const out = new Set<number>();
+  if (Array.isArray(spec)) {
+    for (const p of spec) if (Number.isInteger(p) && p >= 1 && p <= total) out.add(p);
+  } else {
+    const norm = spec.replace(/[０-９]/g, (c) => String(c.charCodeAt(0) - 0xff10)).replace(/[第页頁\s]/g, "")
+      .replace(/[–—－~～至到]/g, "-").replace(/[，、;；]/g, ",").replace(/前(\d+)/g, "1-$1");
+    for (const part of norm.split(",").filter(Boolean)) {
+      const m = /^(\d+)?(-)?(\d+)?$/.exec(part);
+      if (!m || (!m[1] && !m[3])) throw new Error(`页码范围 "${spec}" 无法识别：请写成 "1-20" 或 "1-5,8,10-12"。`);
+      const a = m[1] ? Number(m[1]) : 1, b = m[2] ? (m[3] ? Number(m[3]) : total) : a;
+      for (let p = Math.max(1, Math.min(a, b)); p <= Math.min(total, Math.max(a, b)); p++) out.add(p);
+    }
+  }
+  if (!out.size) throw new Error(`页码范围 "${Array.isArray(spec) ? spec.join(",") : spec}" 不在这份 PDF 的页码内（共 ${total} 页）。`);
+  return [...out].sort((a, b) => a - b);
+}
+
+/** 页码列表 → 简短写法："1–20"、"1–5、8、10–12" */
+export function formatPageRange(pages: number[]): string {
+  const parts: string[] = [];
+  for (let i = 0; i < pages.length; ) {
+    let j = i;
+    while (j + 1 < pages.length && pages[j + 1] === pages[j] + 1) j++;
+    parts.push(j > i ? `${pages[i]}–${pages[j]}` : `${pages[i]}`);
+    i = j + 1;
+  }
+  return parts.join("、");
+}
+
+/**
+ * 提取 PDF 各页的版面元素。
+ * pages：只提取这些页（页码范围或从 1 开始的页码列表）；省略时从第 1 页起。单次最多 maxPages 页（默认 MAX_PDF_PAGES），
+ * 超出的不提取——info 里记下 PDF 总页数、实际提取的页码、是否因上限被截断，由调用方如实告诉用户
+ */
+export async function extractPdf(buf: Buffer, opts: { maxPages?: number; pages?: string | number[]; info?: { total: number; pages: number[]; truncated: boolean } } = {}): Promise<PageModel[]> {
   const pdfjs = await loadPdfjs();
   const { OPS, Util } = pdfjs;
   const doc = await pdfjs.getDocument({ data: new Uint8Array(buf), isOffscreenCanvasSupported: false, disableFontFace: true, useSystemFonts: false, verbosity: 0, ...pdfjsDataOptions() }).promise;
   const pages: PageModel[] = [];
-  const n = Math.min(doc.numPages, opts.maxPages ?? 500);
   try {
-    for (let p = 1; p <= n; p++) pages.push(await extractPage(await doc.getPage(p), p - 1, OPS, Util));
+    const all = opts.pages !== undefined && (Array.isArray(opts.pages) ? opts.pages.length : opts.pages.trim())
+      ? parsePageRange(opts.pages, doc.numPages)
+      : Array.from({ length: doc.numPages }, (_, i) => i + 1);
+    const list = all.slice(0, opts.maxPages ?? MAX_PDF_PAGES);
+    if (opts.info) Object.assign(opts.info, { total: doc.numPages, pages: list, truncated: list.length < all.length });
+    for (const p of list) pages.push(await extractPage(await doc.getPage(p), p - 1, OPS, Util));
   } finally {
     await doc.destroy().catch(() => {});
   }
@@ -535,6 +581,9 @@ async function extractPage(page: any, index: number, OPS: any, Util: any): Promi
     // 与操作符流中的字符对齐，取得颜色与"伪粗体"（描边加粗）：用前几个字符在操作符字符流里定位
     let color = "000000", fakeBold = false, smallCaps = false;
     let natural: number | undefined;
+    // 一个文字项里颜色 / 伪粗体有变化（行首蓝色的引用编号 "[23]" 接着黑色正文）：pdf.js 按字体合并文字项、不看颜色，
+    // 整项取第一个字的颜色会把整行正文染成引用的蓝色。按变化处切成几段，各自的颜色、位置、自然字宽
+    let pieces: Array<{ str: string; x0: number; x1: number; color: string; fakeBold: boolean; natural?: number }> = [];
     // 字距加宽的文字（"a r t i c l e"）：pdf.js 按间距在每个字母之间插入了空格，还原成一个词，加宽由字符间距体现
     const spaced = /^(?:\S ){3,}\S$/u.test(it.str);
     const chars = [...it.str].filter((c) => c.trim());
@@ -559,8 +608,9 @@ async function extractPage(page: any, index: number, OPS: any, Util: any): Promi
       if (at !== -1) {
         color = textColors[at].color;
         fakeBold = textColors[at].fakeBold;
-        // 逐字核对并累计自然字宽
+        // 逐字核对并累计自然字宽；记下每个字形的起点（em）与它之前已计入的空格字形数
         let pos = at, em = 0, spaces = 0, matched = 0, lower = 0, wide = 0;
+        const starts: number[] = [], spacesAt: number[] = [];
         for (const ch of joined) {
           if (opText[pos] !== ch) break;
           if (/^[a-z]$/.test(ch) && textColors[pos].adv) {
@@ -568,8 +618,11 @@ async function extractPage(page: any, index: number, OPS: any, Util: any): Promi
             lower++;
             if (mode && textColors[pos].adv > 1.06 * mode) wide++;
           }
-          em += textColors[pos].adv + (pos > at ? textColors[pos].spaceBefore : 0);
-          if (pos > at && textColors[pos].spaceBefore > 0) spaces++;
+          const lead = pos > at ? textColors[pos].spaceBefore : 0;
+          if (lead > 0) spaces++;
+          starts.push(em + lead);
+          spacesAt.push(spaces);
+          em += textColors[pos].adv + lead;
           pos++;
           matched++;
         }
@@ -577,40 +630,71 @@ async function extractPage(page: any, index: number, OPS: any, Util: any): Promi
         if (matched === joined.length && em > 0) {
           // 用 TJ 位移代替空格字形的 PDF：按字体空格宽度补上词间空格
           const inner = spaced ? 0 : (it.str.trim().match(/\s+/g) ?? []).length;
-          if (spaces < inner) em += (inner - spaces) * (spaceEm.get(it.fontName) ?? 0.25);
+          const spEm = spaceEm.get(it.fontName) ?? 0.25;
+          const missing = spaces < inner;
+          if (missing) em += (inner - spaces) * spEm;
           natural = em * size;
           // 同一字形的字宽总是相同，普通文字不会出现偏差；有一半以上的小写字母变宽即为小型大写
           smallCaps = lower >= 3 && wide >= Math.max(2, 0.6 * lower);
+          // 按颜色 / 伪粗体切段（只处理 BMP 字符：操作符流按 UTF-16 码元记录）
+          const keyOf = (j: number) => `${textColors[at + j].color}|${textColors[at + j].fakeBold ? 1 : 0}`;
+          if (!spaced && !/[\ud800-\udfff]/.test(it.str) && joined.length > 1 && [...joined].some((_, j) => j > 0 && keyOf(j) !== keyOf(j - 1))) {
+            // 每个非空白字符在 it.str 中的下标，以及它前面 it.str 里的空白段数（TJ 位移代替空格时据此补上空格宽度）
+            const idx: number[] = [], gapsBefore: number[] = [];
+            let gaps = 0, prevSpace = false;
+            for (let k = 0; k < it.str.length; k++) {
+              if (!it.str[k].trim()) { if (!prevSpace && idx.length) gaps++; prevSpace = true; continue; }
+              prevSpace = false;
+              idx.push(k);
+              gapsBefore.push(gaps);
+            }
+            const startEm = (j: number) => starts[j] + (missing ? Math.max(0, gapsBefore[j] - spacesAt[j]) * spEm : 0);
+            const cuts = [0, ...[...joined].map((_, j) => j).filter((j) => j > 0 && keyOf(j) !== keyOf(j - 1))];
+            pieces = cuts.map((j, k) => {
+              const next = cuts[k + 1];
+              const f0 = k === 0 ? 0 : startEm(j) / em, f1 = next === undefined ? 1 : startEm(next) / em;
+              return {
+                str: it.str.slice(k === 0 ? 0 : idx[j], next === undefined ? it.str.length : idx[next]),
+                x0: x0 + width * f0, x1: x0 + width * f1,
+                color: textColors[at + j].color, fakeBold: textColors[at + j].fakeBold, natural: natural! * (f1 - f0),
+              };
+            });
+          }
         }
       } else if (textColors[ci]) {
         color = textColors[ci].color;
       }
     }
 
-    const sym = mapSymbolFont(expandLigatures((spaced ? it.str.replace(/ /g, "") : it.str).replace(/\u00ad/g, "")), fi.family);
-    model.spans.push({
-      text: sym.text,
-      x0, x1: x0 + width,
-      top: baseline - ascent * size,
-      bottom: baseline - descent * size,
-      baseline,
-      size: Math.round(size * 2) / 2,
-      font: sym.font,
-      bold: fi.bold || fakeBold,
-      italic: fi.italic,
-      color,
-      natural,
-      spaceW: (spaceEm.get(it.fontName) ?? 0.25) * size,
-      rawFont: rawNames.get(it.fontName),
-      math: fi.math,
-      type3: isType3(it.fontName) || undefined,
-      wordW: measureWord(sym.text, sym.font, fi.bold || fakeBold, fi.italic, Math.round(size * 2) / 2) ?? undefined,
-      wordSpaceW: measureWord(" ", sym.font, fi.bold || fakeBold, fi.italic, Math.round(size * 2) / 2) ?? undefined,
-      smallCaps: smallCaps || (isSmallCapsFont(rawNames.get(it.fontName)) && /[a-z]/.test(sym.text) && !/[A-Z]/.test(sym.text)) || undefined,
-      // 字距加宽 / 紧缩：pdf.js 插了空格的逐字母排列，或单个词（不受两端对齐的词间距影响）的实际宽度明显偏离自然宽度
-      tracking: natural && (spaced || (!/\s/.test(sym.text) && sym.text.length >= 3 && Math.abs(width / natural - 1) > 0.12))
-        ? (width - natural) / Math.max(1, sym.text.length) : undefined,
-    });
+    if (!pieces.length) pieces = [{ str: it.str, x0, x1: x0 + width, color, fakeBold, natural }];
+    for (const pc of pieces) {
+      const sym = mapSymbolFont(expandLigatures((spaced ? pc.str.replace(/ /g, "") : pc.str).replace(/\u00ad/g, "")), fi.family);
+      if (!sym.text.trim()) continue;
+      const bold = fi.bold || pc.fakeBold, w = pc.x1 - pc.x0, nat = pc.natural;
+      model.spans.push({
+        text: sym.text,
+        x0: pc.x0, x1: pc.x1,
+        top: baseline - ascent * size,
+        bottom: baseline - descent * size,
+        baseline,
+        size: Math.round(size * 2) / 2,
+        font: sym.font,
+        bold,
+        italic: fi.italic,
+        color: pc.color,
+        natural: nat,
+        spaceW: (spaceEm.get(it.fontName) ?? 0.25) * size,
+        rawFont: rawNames.get(it.fontName),
+        math: fi.math,
+        type3: isType3(it.fontName) || undefined,
+        wordW: measureWord(sym.text, sym.font, bold, fi.italic, Math.round(size * 2) / 2) ?? undefined,
+        wordSpaceW: measureWord(" ", sym.font, bold, fi.italic, Math.round(size * 2) / 2) ?? undefined,
+        smallCaps: smallCaps || (isSmallCapsFont(rawNames.get(it.fontName)) && /[a-z]/.test(sym.text) && !/[A-Z]/.test(sym.text)) || undefined,
+        // 字距加宽 / 紧缩：pdf.js 插了空格的逐字母排列，或单个词（不受两端对齐的词间距影响）的实际宽度明显偏离自然宽度
+        tracking: nat && (spaced || (!/\s/.test(sym.text) && sym.text.length >= 3 && Math.abs(w / nat - 1) > 0.12))
+          ? (w - nat) / Math.max(1, sym.text.length) : undefined,
+      });
+    }
   }
   model.spans = mergeLetterSpaced(model.spans);
   return model;

@@ -508,6 +508,66 @@ await test("PDF 会话转换为新的 Word 会话，原 PDF 会话不变", async
   assert(again.doc.listBlocks().some((b) => b.text.includes("PENGGUNAAN")), "重新加载后内容完整");
 });
 
+await test("只转换部分页：页码范围写法；导出 / 会话内转换只处理这些页，报告与文件名注明页码，重新转换沿用范围；超过单次上限时报告没转换的页", async () => {
+  const { parsePageRange, pdfToDocx, describeReport } = await import("../src/services/pdfConvert/index.js");
+  eq(parsePageRange("1-20", 611).length, 20, "1-20");
+  eq(parsePageRange("第3至5页", 10).join(","), "3,4,5", "中文写法");
+  eq(parsePageRange("前2页", 10).join(","), "1,2", "前 N 页");
+  eq(parsePageRange("8-, 1，3", 10).join(","), "1,3,8,9,10", "到最后一页、多段、全角逗号");
+  eq(parsePageRange("5-30", 10).join(","), "5,6,7,8,9,10", "超出的部分截到最后一页");
+  let threw = "";
+  try { parsePageRange("700-720", 611); } catch (e: any) { threw = e.message; }
+  assert(threw.includes("611"), `超出页码范围应报错并给出总页数：${threw}`);
+
+  const pdf = await fixture("colstart.pdf"); // 3 页
+  const whole = await pdfToDocx(pdf, { mode: "exact" });
+  for (const mode of ["exact", "flow"] as const) {
+    const { data, report } = await pdfToDocx(pdf, { mode, pages: "2-3" });
+    eq(report.pages, 2, `${mode}：转换页数`);
+    eq(report.pageRange, "2–3", `${mode}：页码`);
+    eq(report.totalPages, 3, `${mode}：原 PDF 总页数`);
+    eq(report.textCoverage, 1, `${mode}：这些页文字完整`);
+    assert(report.textTotal < whole.report.textTotal, `${mode}：只含第 2–3 页的文字`);
+    assert(describeReport(report).includes("第 2–3 页（共 2 页，原 PDF 共 3 页）"), describeReport(report));
+    // 逐页保留：第一页（原 PDF 第 2 页）前面不分页，只在原第 3 页前分页
+    if (mode === "exact") eq((new ZipPackage(data).readText("word/document.xml").match(/w:val="PageStart"/g) ?? []).length, 1, "逐页保留：只在第二页前分页");
+  }
+  // 整份超过单次上限：只转换前面的页，报告写明哪些页没有转换
+  const cut = await pdfToDocx(pdf, { mode: "exact", maxPages: 2 });
+  eq(cut.report.pages, 2, "上限内的页数");
+  assert(describeReport(cut.report).includes("共 3 页，超过单次转换上限 2 页：只转换了第 1–2 页，第 3 页没有转换"), describeReport(cut.report));
+
+  // Agent 工具：导出指定页、会话内转换指定页，重新转换沿用范围
+  const { findTool } = await import("../src/tools.js");
+  const s = await Session.create(pdf, "论文.pdf", { mode: "bypassPermissions", trackChanges: false, author: "测试" });
+  const exp = await findTool("doc_export")!.call({ format: "docx", pages: "2-3" } as any, { session: s } as any);
+  eq((exp.data as any)?.name, "论文（第2–3页）.docx", "导出文件名注明页码");
+  const conv = findTool("doc_convert_to_word")!;
+  const r1 = await conv.call({ layout: "flow", pages: "2-3" } as any, { session: s } as any);
+  assert(String(r1.content).includes("第 2–3 页"), `报告应注明页码：${r1.content}`);
+  await s.commit((r1 as any).docChange.label, []);
+  eq(s.meta.filename, "论文（第2–3页）.docx", "会话文件名注明页码");
+  eq(s.meta.origin?.pages, "2-3", "记下页码范围");
+  const r2 = await conv.call({ layout: "exact" } as any, { session: s } as any);
+  assert(String(r2.content).includes("第 2–3 页"), `重新转换应沿用页码范围：${r2.content}`);
+});
+
+await test("期刊里蓝色的引用编号：只有编号是蓝色，同一文字项里后面的黑色正文不被染蓝（两种模式）", async () => {
+  const { pdfToDocx } = await import("../src/services/pdfConvert/index.js");
+  const pdf = await fixture("citecolor.pdf");
+  for (const mode of ["exact", "flow"] as const) {
+    const { data, report } = await pdfToDocx(pdf, { mode });
+    eq(report.textCoverage, 1, `${mode}：文字完整性`);
+    const xml = new ZipPackage(data).readText("word/document.xml");
+    const runs = (xml.match(/<w:r>[\s\S]*?<\/w:r>/g) ?? []).map((r) => ({ text: (r.match(/<w:t[^>]*>([^<]*)<\/w:t>/g) ?? []).map((t) => t.replace(/<[^>]+>/g, "")).join(""), blue: /<w:color w:val="0000FF"\/>/.test(r) }));
+    const blue = runs.filter((r) => r.blue && r.text.trim()).map((r) => r.text.trim());
+    assert(blue.length >= 6 && blue.every((t) => /^[[\]\d,\s]+$/.test(t)), `${mode}：蓝色的只应是引用编号：${JSON.stringify(blue)}`);
+    for (const t of ["[18]", "[23]", "[29]", "[27], [28]"]) assert(blue.includes(t), `${mode}：${t} 应是蓝色：${JSON.stringify(blue)}`);
+    assert(runs.filter((r) => /While the transformer method|In particular, TransUNet and TransFuse/.test(r.text)).every((r) => !r.blue), `${mode}：引用后面的正文不应是蓝色`);
+    assert(/<w:t[^>]*>\[23\]<\/w:t><\/w:r><w:r>(?:(?!<\/w:r>)[\s\S])*<w:t[^>]*>\. While/.test(xml), `${mode}：[23] 与后面的正文紧挨着，中间不多出空格`);
+  }
+});
+
 // ---------------------------------------------------------------------------
 console.log("\n代理主循环（模拟模型）");
 // ---------------------------------------------------------------------------
@@ -1085,7 +1145,7 @@ await test("所有夹具 PDF：两种排版方式都不报错、文字完整；L
   const run = promisify(execFile);
   const soffice = process.env.SOFFICE_PATH || "soffice";
   const hasSoffice = await run(soffice, ["--version"]).then(() => true, () => false);
-  const names = ["columns", "journal", "figures", "math", "journal-front", "journal-eq", "journal-fig", "bios", "colstart", "signature"];
+  const names = ["columns", "journal", "figures", "math", "journal-front", "journal-eq", "journal-fig", "bios", "colstart", "signature", "citecolor"];
   const dir = await fs.mkdtemp(path.join(tmp, "pages-"));
   const bad: string[] = [];
   for (const name of names) {

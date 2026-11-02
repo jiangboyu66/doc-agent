@@ -47,7 +47,7 @@ export interface SessionMeta {
   /** 文档结构版本：跨重载、回滚保持单调递增，保证旧的段落引用不会误指到别的段落 */
   structureVersion?: number;
   /** 由其他文件转换而来（例如 PDF → Word）：来源与转换报告 */
-  origin?: { fromSession: string; fromFile: string; engine: string; mode?: string; report: string; coverage: number };
+  origin?: { fromSession: string; fromFile: string; engine: string; mode?: string; report: string; coverage: number; /** 只转换了部分页时的页码范围（重新转换时沿用） */ pages?: string };
   title?: string;
   /** 本会话是否开启思考模式（未设置时跟随全局配置） */
   thinking?: boolean;

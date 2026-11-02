@@ -15,7 +15,9 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import { extractPdf, type ImageBox, type PageModel } from "./extract.js";
+import { extractPdf, formatPageRange, MAX_PDF_PAGES, type ImageBox, type PageModel } from "./extract.js";
+
+export { parsePageRange, formatPageRange, MAX_PDF_PAGES } from "./extract.js";
 import { buildDocModel, type Block, type DocModel, type LayoutMode, type Para } from "./layout.js";
 import { writeDocx } from "./docxWriter.js";
 import { rasterAvailable, renderRegions } from "./render.js";
@@ -27,7 +29,12 @@ export type PdfEngine = "builtin" | "pdf2docx" | "libreoffice";
 
 export interface ConversionReport {
   engine: PdfEngine;
+  /** 本次转换的页数 */
   pages: number;
+  /** PDF 的总页数 */
+  totalPages?: number;
+  /** 只转换了一部分页时：转换的页码（"1–20"、"1–5、8"） */
+  pageRange?: string;
   paragraphs: number;
   tables: number;
   images: number;
@@ -144,15 +151,16 @@ async function findPython(): Promise<string[] | null> {
   return null;
 }
 
-async function runPdf2docx(buf: Buffer): Promise<Buffer> {
+async function runPdf2docx(buf: Buffer, pages?: number[]): Promise<Buffer> {
   const py = await findPython();
   if (!py) throw new Error("未找到可用的 pdf2docx。请先安装 Python，再运行 pip install pdf2docx；或在 .env 中用 PYTHON_PATH 指定 Python 路径。");
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "doc-agent-pdf-"));
   try {
     const src = path.join(dir, "in.pdf"), out = path.join(dir, "out.docx");
     await fs.writeFile(src, buf);
-    const script = "import sys,logging\nlogging.disable(logging.CRITICAL)\nfrom pdf2docx import Converter\ncv=Converter(sys.argv[1])\ncv.convert(sys.argv[2])\ncv.close()";
-    await execFileAsync(py[0], [...py.slice(1), "-c", script, src, out], { timeout: 10 * 60_000, windowsHide: true, maxBuffer: 64 * 1024 * 1024 });
+    // 只转换部分页时传 0 起的页码列表
+    const script = "import sys,json,logging\nlogging.disable(logging.CRITICAL)\nfrom pdf2docx import Converter\ncv=Converter(sys.argv[1])\np=json.loads(sys.argv[3])\ncv.convert(sys.argv[2],pages=p) if p else cv.convert(sys.argv[2])\ncv.close()";
+    await execFileAsync(py[0], [...py.slice(1), "-c", script, src, out, JSON.stringify(pages?.map((p) => p - 1) ?? null)], { timeout: 10 * 60_000, windowsHide: true, maxBuffer: 64 * 1024 * 1024 });
     return await fs.readFile(out);
   } finally {
     await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
@@ -178,14 +186,34 @@ async function runLibreOffice(buf: Buffer): Promise<Buffer> {
   }
 }
 
-export async function pdfToDocx(buf: Buffer, opts: { engine?: PdfEngine; title?: string; mode?: LayoutMode } = {}): Promise<{ data: Buffer; report: ConversionReport }> {
+/**
+ * pages：只转换这些页（"1-20"、"1-5,8,10-12" 或从 1 开始的页码列表）；省略时转换全部（单次最多 MAX_PDF_PAGES 页）
+ */
+export async function pdfToDocx(buf: Buffer, opts: { engine?: PdfEngine; title?: string; mode?: LayoutMode; pages?: string | number[]; maxPages?: number } = {}): Promise<{ data: Buffer; report: ConversionReport }> {
+  const cap = opts.maxPages ?? MAX_PDF_PAGES;
   const engine = opts.engine ?? "builtin";
   const t0 = Date.now();
-  const pages = await extractPdf(buf);
+  const info = { total: 0, pages: [] as number[], truncated: false };
+  const partial = opts.pages !== undefined && (Array.isArray(opts.pages) ? opts.pages.length > 0 : !!opts.pages.trim());
+  if (partial && engine === "libreoffice") throw new Error("LibreOffice 引擎不支持只转换部分页，请改用内置引擎。");
+  const pages = await extractPdf(buf, { pages: partial ? opts.pages : undefined, info, maxPages: cap });
+  // LibreOffice 引擎总是转换整份 PDF（只是完整性校验只核对前面这些页）
+  if (engine === "libreoffice") info.truncated = false;
   const textChars = pages.reduce((a, p) => a + p.spans.reduce((b, s) => b + s.text.replace(/\s/g, "").length, 0), 0);
   const notes: string[] = [];
   if (pages.length && textChars < 20 * pages.length && pages.some((p) => p.images.length)) {
     notes.push("这份 PDF 几乎没有可提取的文字，可能是扫描件（整页图片）。转换结果只包含图片，文字需要先做 OCR 识别。");
+  }
+
+  // 只转换了一部分页（指定了页码范围，或超过单次上限被截断）：如实写进报告，文字完整性只针对这些页
+  const subset = partial || info.truncated;
+  const range = subset ? formatPageRange(info.pages) : undefined;
+  if (info.truncated) {
+    const rest = info.pages.length ? info.pages[info.pages.length - 1] + 1 : 1;
+    const left = rest === info.total ? `${rest}` : `${rest}–${info.total}`, hint = rest === info.total ? `${rest}` : `${rest}-${info.total}`;
+    notes.unshift(partial
+      ? `指定的范围超过单次转换上限 ${cap} 页，只转换了第 ${range} 页；其余页请再指定页码范围转换。`
+      : `这份 PDF 共 ${info.total} 页，超过单次转换上限 ${cap} 页：只转换了第 ${range} 页，第 ${left} 页没有转换，需要时请指定页码范围（如 ${hint}）另行转换。`);
   }
 
   let data: Buffer;
@@ -198,7 +226,7 @@ export async function pdfToDocx(buf: Buffer, opts: { engine?: PdfEngine; title?:
     stats = r.stats;
     notes.push(...r.notes);
   } else if (engine === "pdf2docx") {
-    data = await runPdf2docx(buf);
+    data = await runPdf2docx(buf, subset ? info.pages : undefined);
   } else {
     data = await runLibreOffice(buf);
     notes.push("LibreOffice 引擎把每行文字放在独立的文本框里：版面接近，但修改时文字不会自动换行，建议优先使用内置引擎。");
@@ -215,6 +243,8 @@ export async function pdfToDocx(buf: Buffer, opts: { engine?: PdfEngine; title?:
     data,
     report: {
       engine, ...stats,
+      totalPages: info.total,
+      ...(range ? { pageRange: range } : {}),
       textTotal: v.total,
       textCoverage: v.coverage,
       missing: v.missing,
@@ -226,9 +256,10 @@ export async function pdfToDocx(buf: Buffer, opts: { engine?: PdfEngine; title?:
 
 export function describeReport(r: ConversionReport): string {
   return [
-    `已用${ENGINE_LABEL[r.engine]}把 PDF 转换为 Word（${(r.ms / 1000).toFixed(1)} 秒）：${r.pages} 页，${r.paragraphs} 个段落` +
+    `已用${ENGINE_LABEL[r.engine]}把 PDF 转换为 Word（${(r.ms / 1000).toFixed(1)} 秒）：` +
+      (r.pageRange ? `第 ${r.pageRange} 页（共 ${r.pages} 页，原 PDF 共 ${r.totalPages} 页）` : `${r.pages} 页`) + `，${r.paragraphs} 个段落` +
       (r.tables ? `，${r.tables} 个表格` : "") + (r.images ? `，${r.images} 张图片` : "") + "。",
-    `文字完整性：${(r.textCoverage * 100).toFixed(r.textCoverage === 1 ? 0 : 2)}%（共 ${r.textTotal} 个字符）。`,
+    `文字完整性：${(r.textCoverage * 100).toFixed(r.textCoverage === 1 ? 0 : 2)}%（${r.pageRange ? "转换的这些页" : "共"} ${r.textTotal} 个字符）。`,
     ...r.notes,
   ].join("\n");
 }

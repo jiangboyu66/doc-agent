@@ -40,13 +40,67 @@ function markFields(xml: string): string {
   return xml;
 }
 
+/** 快速预览默认最多渲染的页数：几百页的文档整份渲染要几十秒，期间整个页面（含对话）都卡住，新版本也刷不出来 */
+export const PREVIEW_PAGES = 50;
+/** 没有分页记录的文档按字数估计页数 */
+const CHARS_PER_PAGE = 3000;
+
+/**
+ * 长文档只渲染前 maxPages 页：按正文顶层元素累计页数——文档记录的上次分页位置、分页符、段前分页、"页首"样式、
+ * 另起一页的分节符；一个都没有时按字数估计。超出的部分删掉（保留文档最后的分节属性）。
+ * 返回截取后的 XML（不需要截取时为 null）与全文的估计页数
+ */
+export function limitPages(xml: string, maxPages: number): { xml: string | null; total: number } {
+  // 先用正则粗估，短文档不必解析
+  const markers = (xml.match(/<w:lastRenderedPageBreak\b|w:type="page"|<w:pageBreakBefore\b|w:val="PageStart"/g) ?? []).length;
+  const text = (xml.match(/<w:t(?:\s[^>]*)?>[^<]*/g) ?? []).reduce((n, t) => n + t.length - t.indexOf(">") - 1, 0);
+  const rough = markers ? markers + 1 : Math.ceil(text / CHARS_PER_PAGE);
+  if (rough <= maxPages + 10) return { xml: null, total: rough };
+  const doc = new DOMParser().parseFromString(xml, "application/xml");
+  if (doc.getElementsByTagName("parsererror").length) return { xml: null, total: rough };
+  const W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+  const body = doc.getElementsByTagNameNS(W, "body")[0];
+  if (!body) return { xml: null, total: rough };
+  const off = (el: Element | null | undefined) => !!el && /^(0|false|off)$/.test(el.getAttributeNS(W, "val") ?? "");
+  const breaksIn = (el: Element, first: boolean): number => {
+    let n = el.getElementsByTagNameNS(W, "lastRenderedPageBreak").length;
+    for (const br of Array.from(el.getElementsByTagNameNS(W, "br"))) if (br.getAttributeNS(W, "type") === "page") n++;
+    if (el.localName === "p" && !first) {
+      const ppr = Array.from(el.children).find((c) => c.localName === "pPr");
+      const pbb = ppr && Array.from(ppr.children).find((c) => c.localName === "pageBreakBefore");
+      const style = ppr && Array.from(ppr.children).find((c) => c.localName === "pStyle");
+      if ((pbb && !off(pbb)) || style?.getAttributeNS(W, "val") === "PageStart") n++;
+    }
+    return n;
+  };
+  const kids = Array.from(body.children);
+  const last = kids[kids.length - 1]?.localName === "sectPr" ? kids[kids.length - 1] : null;
+  let pages = 1, chars = 0, cut = -1;
+  kids.forEach((el, i) => {
+    if (el === last) return;
+    if (markers) pages += breaksIn(el, i === 0);
+    else { chars += el.textContent?.length ?? 0; pages = 1 + Math.floor(chars / CHARS_PER_PAGE); }
+    if (cut < 0 && pages > maxPages) cut = i;
+    // 另起一页的分节符（没有 w:type 也是另起一页）：下一段从新的一页开始
+    const sect = el.localName === "p" ? el.getElementsByTagNameNS(W, "sectPr")[0] : null;
+    if (markers && sect) {
+      const t = Array.from(sect.children).find((c) => c.localName === "type")?.getAttributeNS(W, "val");
+      if (t !== "continuous" && t !== "nextColumn") pages++;
+    }
+  });
+  if (cut < 0) return { xml: null, total: pages };
+  for (const el of kids.slice(cut)) if (el !== last) el.remove();
+  return { xml: new XMLSerializer().serializeToString(doc), total: pages };
+}
+
 /**
  * 渲染前的准备：
+ *   - 长文档只取前 maxPages 页（省略或 0 表示全部）；
  *   - 正文渲染用的副本去掉旧分页位置（由 paginate 重新分页）；
  *   - 页眉页脚中的页码域换成占位符（两份渲染都需要），渲染后填入实际页码；
  *   - 读取"连续分节前不平衡分栏"兼容选项（期刊排版会打开）与起始页码。
  */
-export async function prepareDocx(blob: Blob): Promise<{ blob: Blob; plain: Blob; balance: boolean; pageStart: number; wraps: WrapDist[]; anchors: PageAnchor[]; expandBreaks: boolean }> {
+export async function prepareDocx(blob: Blob, opts: { maxPages?: number } = {}): Promise<{ blob: Blob; plain: Blob; balance: boolean; pageStart: number; wraps: WrapDist[]; anchors: PageAnchor[]; expandBreaks: boolean; limited?: { shown: number; total: number } }> {
   const zip = await JSZip.loadAsync(blob);
   const settings = await zip.file("word/settings.xml")?.async("string");
   const balance = !(settings && /<\w+:noColumnBalance(\s|\/|>)/.test(settings) && !/<\w+:noColumnBalance\s+\w+:val="(0|false)"/.test(settings));
@@ -60,6 +114,13 @@ export async function prepareDocx(blob: Blob): Promise<{ blob: Blob; plain: Blob
   }
   const f = zip.file("word/document.xml");
   let xml = f ? await f.async("string") : "";
+  let limited: { shown: number; total: number } | undefined;
+  if (opts.maxPages) {
+    try {
+      const r = limitPages(xml, opts.maxPages);
+      if (r.xml) { xml = r.xml; zip.file("word/document.xml", xml); changed = true; limited = { shown: opts.maxPages, total: r.total }; }
+    } catch { /* 解析失败：整份渲染 */ }
+  }
   const pageStart = Number(/<\w+:pgNumType\b[^>]*\w+:start="(\d+)"/.exec(xml)?.[1] ?? 1) || 1;
   const wraps = wrapDistances(xml);
   // 手动换行结束的两端对齐行：Word 默认也会两端对齐（除非打开了 doNotExpandShiftReturn 兼容选项）
@@ -74,9 +135,9 @@ export async function prepareDocx(blob: Blob): Promise<{ blob: Blob; plain: Blob
     if (r.anchors.length) { xml = r.xml; anchors = r.anchors; zip.file("word/document.xml", xml); changed = true; }
   } catch { /* 解析失败：保持原样 */ }
   const plain = changed ? await zip.generateAsync({ type: "blob", mimeType: mime }) : blob;
-  if (!xml.includes("lastRenderedPageBreak")) return { blob: plain, plain, balance, pageStart, wraps, anchors, expandBreaks };
+  if (!xml.includes("lastRenderedPageBreak")) return { blob: plain, plain, balance, pageStart, wraps, anchors, expandBreaks, limited };
   zip.file("word/document.xml", xml.replace(/<w:lastRenderedPageBreak\s*\/>/g, ""));
-  return { blob: await zip.generateAsync({ type: "blob", mimeType: mime }), plain, balance, pageStart, wraps, anchors, expandBreaks };
+  return { blob: await zip.generateAsync({ type: "blob", mimeType: mime }), plain, balance, pageStart, wraps, anchors, expandBreaks, limited };
 }
 
 // ---------------------------------------------------------------------------

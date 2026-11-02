@@ -28,11 +28,11 @@ export const api = {
   interrupt: (id: string) => fetch(`/api/sessions/${id}/interrupt`, { method: "POST" }).then((r) => json<{ ok: true }>(r)),
   rollback: (id: string, version: number) =>
     fetch(`/api/sessions/${id}/rollback`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ version }) }).then((r) => json<{ meta: SessionMeta; version: number }>(r)),
-  exportAs: (id: string, format: string, pdf?: { mode: "exact" | "flow"; engine: string }) =>
+  exportAs: (id: string, format: string, pdf?: { mode: "exact" | "flow"; engine: string; pages?: string }) =>
     fetch(`/api/sessions/${id}/export`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ format, ...(pdf ?? {}) }) }).then((r) =>
       json<{ name: string; url: string; note: string; lossy: boolean }>(r)
     ),
-  convert: (id: string, body: { engine: string; mode: "exact" | "flow"; inPlace?: boolean }) =>
+  convert: (id: string, body: { engine: string; mode: "exact" | "flow"; inPlace?: boolean; pages?: string }) =>
     fetch(`/api/sessions/${id}/convert`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }).then((r) =>
       json<{ meta: SessionMeta; text: string }>(r)
     ),

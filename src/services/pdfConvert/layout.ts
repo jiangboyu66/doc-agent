@@ -1646,7 +1646,8 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
       if (inTableArea(f.x0, f.y0, f.x1, f.y1) || !keepShape(f.y0, f.y1)) continue;
       shapes.push({ kind: "rect", x0: f.x0, y0: f.y0, x1: f.x1, y1: f.y1, width: 0, color: f.color, behind: true });
     }
-    const anchor = tinyPara({ pageBreakBefore: (!flow && pg.index > 0) || brokeEarly(pi), images: pg.images.filter((im) => im.behind), textBoxes: [], shapes });
+    // 逐页保留：除了第一页，每页都从新的一页开始（按本次转换的顺序；只转换部分页时第一页不一定是原 PDF 的第 1 页）
+    const anchor = tinyPara({ pageBreakBefore: (!flow && pi > 0) || brokeEarly(pi), images: pg.images.filter((im) => im.behind), textBoxes: [], shapes });
     freshPage = true;
     const anchorAt = blocks.length;
     blocks.push(anchor);

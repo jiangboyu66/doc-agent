@@ -38,6 +38,8 @@ export function ConvertCard({ sessionId, runtime, onDone }: { sessionId: string;
   // 自动：下载 Word 时逐页保留原排版（外观与 PDF 一致），转换后继续编辑时用可编辑的流式排版（扩写改写不乱版）
   const [mode, setMode] = useState<"auto" | "exact" | "flow">("auto");
   const [engine, setEngine] = useState("builtin");
+  // 只转换部分页（如 1-20）；留空为全部
+  const [pages, setPages] = useState("");
   const [busy, setBusy] = useState<"" | "download" | "edit">("");
   const [err, setErr] = useState("");
   const [done, setDone] = useState<{ name: string; url: string; note: string } | null>(null);
@@ -48,7 +50,7 @@ export function ConvertCard({ sessionId, runtime, onDone }: { sessionId: string;
     setErr("");
     setDone(null);
     try {
-      const r = await api.exportAs(sessionId, "docx", { mode: mode === "flow" ? "flow" : "exact", engine });
+      const r = await api.exportAs(sessionId, "docx", { mode: mode === "flow" ? "flow" : "exact", engine, pages: pages.trim() || undefined });
       setDone(r);
       triggerDownload(r.url, r.name);
     } catch (e: any) {
@@ -62,7 +64,7 @@ export function ConvertCard({ sessionId, runtime, onDone }: { sessionId: string;
     setBusy("edit");
     setErr("");
     try {
-      const r = await api.convert(sessionId, { engine, mode: mode === "exact" ? "exact" : "flow", inPlace: true });
+      const r = await api.convert(sessionId, { engine, mode: mode === "exact" ? "exact" : "flow", inPlace: true, pages: pages.trim() || undefined });
       onDone(r.text);
     } catch (e: any) {
       setErr(`转换失败：${e.message}`);
@@ -126,6 +128,10 @@ export function ConvertCard({ sessionId, runtime, onDone }: { sessionId: string;
           </span>
         </label>
       </div>
+      <label className="ctl pages" title="只转换这些页：如 1-20、1-5,8,10-12、30-（第 30 页到最后）；留空为全部（单次最多 500 页）">
+        <span>页码范围</span>
+        <input className="pages" value={pages} onChange={(e) => setPages(e.target.value)} placeholder="全部，如 1-20" />
+      </label>
       {(engines.pdf2docx || engines.libreoffice) && (
         <label className="ctl engine">
           <span>转换引擎</span>

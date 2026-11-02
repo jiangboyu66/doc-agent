@@ -5,6 +5,9 @@ import { Markdown } from "./Markdown";
 
 type View = "fast" | "layout" | "source";
 
+/** 快速预览默认最多渲染的页数（几百页的文档整份渲染要几十秒，期间整个页面卡住） */
+const PREVIEW_PAGES = 50;
+
 /**
  * 文档预览
  * - Word：默认用 docx-preview 在浏览器里渲染（快，显示修订和批注）；"精确版式"用 LibreOffice 渲染成 PDF，
@@ -14,10 +17,13 @@ type View = "fast" | "layout" | "source";
 export function DocPreview({ sessionId, format, version, isCurrent, sofficeAvailable }: { sessionId: string; format: DocFormat; version: number; isCurrent: boolean; sofficeAvailable: boolean }) {
   const [view, setView] = useState<View>("fast");
   const [zoom, setZoom] = useState<number | "fit">("fit");
-  const [pageInfo, setPageInfo] = useState<{ current: number; total: number } | null>(null);
-  const onPages = useCallback((p: { current: number; total: number }) => setPageInfo((old) => (old && old.current === p.current && old.total === p.total ? old : p)), []);
+  const [pageInfo, setPageInfo] = useState<{ current: number; total: number; of?: number } | null>(null);
+  const onPages = useCallback((p: { current: number; total: number; of?: number }) => setPageInfo((old) => (old && old.current === p.current && old.total === p.total && old.of === p.of ? old : p)), []);
+  // 长文档默认只渲染前 PREVIEW_PAGES 页；用户点"显示全部"后本会话一直整份渲染
+  const [full, setFull] = useState(false);
   const url = api.documentUrl(sessionId, { version });
   useEffect(() => setPageInfo(null), [url]);
+  useEffect(() => setFull(false), [sessionId]);
 
   const views: Array<[View, string, string]> =
     format === "docx"
@@ -38,7 +44,7 @@ export function DocPreview({ sessionId, format, version, isCurrent, sofficeAvail
         </div>
         <span className="muted small">{isCurrent ? `当前版本 v${version}` : `正在查看历史版本 v${version}`}</span>
         {format === "docx" && view === "fast" && pageInfo && (
-          <span className="page-indicator" title="当前页 / 总页数">第 {pageInfo.current} / {pageInfo.total} 页</span>
+          <span className="page-indicator" title="当前页 / 总页数">第 {pageInfo.current} / {pageInfo.total} 页{pageInfo.of ? `（共约 ${pageInfo.of} 页）` : ""}</span>
         )}
         {format === "docx" && view === "fast" && (
           <div className="seg right">
@@ -49,7 +55,7 @@ export function DocPreview({ sessionId, format, version, isCurrent, sofficeAvail
         )}
       </div>
       <div className="preview-body">
-        {format === "docx" && view === "fast" && <DocxView url={url} zoom={zoom} onPages={onPages} />}
+        {format === "docx" && view === "fast" && <DocxView url={url} zoom={zoom} onPages={onPages} maxPages={full ? 0 : PREVIEW_PAGES} onShowAll={() => setFull(true)} />}
         {format === "docx" && view === "layout" && <iframe key={version} className="frame" title="版式预览" src={api.previewPdfUrl(sessionId, version)} />}
         {format === "pdf" && <iframe className="frame" title="PDF" src={url} />}
         {format === "html" && view === "fast" && <iframe key={url} className="frame white" title="HTML 预览" sandbox="" src={url} />}
@@ -85,12 +91,15 @@ function MarkdownView({ url }: { url: string }) {
   return <div className="paper"><Markdown className="doc-md" text={body} /></div>;
 }
 
-function DocxView({ url, zoom, onPages }: { url: string; zoom: number | "fit"; onPages?: (p: { current: number; total: number }) => void }) {
+function DocxView({ url, zoom, onPages, maxPages, onShowAll }: { url: string; zoom: number | "fit"; onPages?: (p: { current: number; total: number; of?: number }) => void; maxPages: number; onShowAll: () => void }) {
   const host = useRef<HTMLDivElement>(null);
   const outer = useRef<HTMLDivElement>(null);
   const [state, setState] = useState<"loading" | "ok" | "error">("loading");
   const [err, setErr] = useState("");
   const [scale, setScale] = useState(1);
+  // 只渲染了前几页时：显示的页数与全文估计页数
+  const [limited, setLimited] = useState<{ shown: number; total: number } | null>(null);
+  const limitedRef = useRef<{ shown: number; total: number } | null>(null);
 
   useEffect(() => {
     let alive = true;
@@ -122,7 +131,7 @@ function DocxView({ url, zoom, onPages }: { url: string; zoom: number | "fit"; o
         const plain = stage.cloneNode() as HTMLDivElement;
         document.body.append(stage, plain);
         try {
-          const prep = await prepareDocx(blob).catch(() => ({ blob, plain: blob, balance: true, pageStart: 1, wraps: [], anchors: [], expandBreaks: true }));
+          const prep = await prepareDocx(blob, { maxPages }).catch(() => ({ blob, plain: blob, balance: true, pageStart: 1, wraps: [], anchors: [], expandBreaks: true, limited: undefined }));
           await renderAsync(prep.blob, stage, undefined, opts);
           await renderAsync(prep.plain, plain, undefined, opts);
           fixAtLeastSpacing(stage);
@@ -147,7 +156,9 @@ function DocxView({ url, zoom, onPages }: { url: string; zoom: number | "fit"; o
           host.current.append(...Array.from(out.childNodes));
           // 页眉页脚填入实际页码，每页下方标注"第 n 页 / 共 N 页"
           const total = numberPages(host.current, prep.pageStart);
-          onPages?.({ current: 1, total });
+          limitedRef.current = prep.limited ?? null;
+          setLimited(prep.limited ?? null);
+          onPages?.({ current: 1, total, of: prep.limited?.total });
         } finally {
           stage.remove();
           plain.remove();
@@ -161,7 +172,7 @@ function DocxView({ url, zoom, onPages }: { url: string; zoom: number | "fit"; o
       }
     })();
     return () => { alive = false; };
-  }, [url]);
+  }, [url, maxPages]);
 
   // 适应宽度：按最宽页面与容器宽度计算缩放
   useEffect(() => {
@@ -193,7 +204,7 @@ function DocxView({ url, zoom, onPages }: { url: string; zoom: number | "fit"; o
       const probe = box.top + box.height / 3;
       let cur = 1;
       for (const p of pages) { if (p.getBoundingClientRect().top <= probe) cur = Number(p.dataset.page); else break; }
-      onPages({ current: cur, total: pages.length });
+      onPages({ current: cur, total: pages.length, of: limitedRef.current?.total });
     };
     const onScroll = () => { if (!raf) raf = requestAnimationFrame(update); };
     scroller.addEventListener("scroll", onScroll, { passive: true });
@@ -205,6 +216,12 @@ function DocxView({ url, zoom, onPages }: { url: string; zoom: number | "fit"; o
     <div className="docx-outer" ref={outer}>
       {state === "loading" && <div className="loading"><span className="spinner" aria-hidden /> 正在渲染文档…</div>}
       {state === "error" && <div className="notice error">预览失败：{err}。可切换到“精确版式”或下载后用 Word 打开。</div>}
+      {state === "ok" && limited && (
+        <div className="notice info preview-limit">
+          文档较长（约 {limited.total} 页），快速预览只显示前 {limited.shown} 页，以免浏览器卡住。
+          <button onClick={onShowAll}>显示全部</button>（可能需要几十秒）；完整版式也可切换到“精确版式”或下载后查看。
+        </div>
+      )}
       <div className="docx-host" ref={host} style={{ zoom: scale } as any} />
     </div>
   );

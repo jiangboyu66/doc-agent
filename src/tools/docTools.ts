@@ -458,12 +458,14 @@ export const DocExportTool = buildTool({
 - 导出与原文件相同的格式 = 编辑后的原文件本身，未修改部分逐字节不变（推荐）；
 - Word 导出 PDF 由 LibreOffice 按 Word 版式渲染；
 - 跨格式导出（如 Word → Markdown）只能近似保留结构，会在结果中注明；
-- PDF 文档可导出为 Word（docx）：pdf_layout = exact 逐行保留原排版（默认，适合表单/表格/论文），flow 段落自动换行（适合大段改写）。
+- PDF 文档可导出为 Word（docx）：pdf_layout = exact 逐行保留原排版（默认，适合表单/表格/论文），flow 段落自动换行（适合大段改写）；
+- 用户只要其中几页（"把前 20 页转成 Word""导出第 3–5 页"）：用 pages 指定页码范围，只转换这些页——不要整份转换后再删段落。
 导出不修改文档本身。`,
   inputSchema: z.object({
     format: z.enum(["docx", "pdf", "html", "markdown"]),
     filename: z.string().optional(),
     pdf_layout: z.enum(["exact", "flow"]).optional().describe("仅 PDF 导出 Word 时使用"),
+    pages: z.string().optional().describe(`仅 PDF 导出 Word / HTML / Markdown 时使用：只转换这些页：如 "1-20"（前 20 页）、"1-5,8,10-12"、"30-"（第 30 页到最后）；省略为整份（单次最多 500 页）`),
   }),
   userFacingName: (i) => `导出 ${String(i.format ?? "").toUpperCase()}`,
   isEnabled: () => true,
@@ -471,9 +473,13 @@ export const DocExportTool = buildTool({
   checkPermissions: async () => ({ behavior: "allow" }),
   async call(i, ctx) {
     const isPdf = ctx.session.meta.format === "pdf";
-    const out = await exportDocument(ctx.session.current(), ctx.session.meta.format, i.format, { pdfMode: i.pdf_layout ?? "exact" });
+    if (i.pages?.trim() && !(isPdf && i.format !== "pdf")) {
+      return { content: "pages 只用于把 PDF 的部分页导出为 Word / HTML / Markdown；当前导出不支持按页。", isError: true };
+    }
+    const out = await exportDocument(ctx.session.current(), ctx.session.meta.format, i.format, { pdfMode: i.pdf_layout ?? "exact", pdfPages: i.pages });
     const base = (i.filename || ctx.session.meta.filename).replace(/\.[^.]+$/, "").replace(/[\\/:*?"<>|]/g, "_");
-    const name = isPdf ? `${base}.${out.ext}` : `${base}-v${ctx.session.meta.currentVersion}.${out.ext}`;
+    const part = out.pageRange && !i.filename ? `（第${out.pageRange}页）` : "";
+    const name = isPdf ? `${base}${part}.${out.ext}` : `${base}-v${ctx.session.meta.currentVersion}.${out.ext}`;
     const file = await ctx.session.writeExport(name, out.data);
     return {
       content: `已导出 ${name}（${Math.round(out.data.length / 1024)} KB）。${out.note}`,
@@ -493,18 +499,21 @@ export const DocConvertToWordTool = buildTool({
   一旦增加文字就会挤乱版面；
 - 已经由 PDF 转换过的 Word 也可以再调用本工具，从原 PDF 重新转换（换一种模式，或转换器改进后修复公式 / 表格问题）；之前做过的段落修改（润色、改写）会自动搬到新文档上，报告会列出没能搬运的段落，旧版本可回滚；
 - 转换后文档结构全部变化：必须重新调用 doc_outline / doc_read 获取新的段落引用；
-- 原 PDF 保留为版本 v0，用户可随时回滚；转换报告会给出文字完整性。
+- 原 PDF 保留为版本 v0，用户可随时回滚；转换报告会给出文字完整性；
+- 用户只要其中几页时用 pages 指定页码范围，只转换这些页（重新转换时默认沿用上次的范围）。大文件（几百页）也应只转换需要的部分：
+  整份转换后再删段落既慢、又要用户逐次确认。
 只想"导出一份 Word 文件给用户下载"而不修改时，用 doc_export(format="docx")。`,
   inputSchema: z.object({
     layout: z.enum(["exact", "flow"]).optional().describe("flow 可编辑流式排版（默认，扩写/改写必须用它）；exact 逐页固定，只改字词时用"),
+    pages: z.string().optional().describe(`只转换这些页：如 "1-20"（前 20 页）、"1-5,8,10-12"、"30-"（第 30 页到最后）；省略为整份（单次最多 500 页）`),
     reason,
   }),
-  userFacingName: (i) => `PDF 转换为 Word（${i.layout === "exact" ? "逐页保留原排版" : "可编辑流式排版"}）`,
+  userFacingName: (i) => `PDF 转换为 Word（${i.layout === "exact" ? "逐页保留原排版" : "可编辑流式排版"}${i.pages ? `，第 ${i.pages} 页` : ""}）`,
   isEnabled: (ctx) => ctx.session.meta.format === "pdf" || (ctx.session.meta.sourceFormat === "pdf" && ctx.session.meta.format === "docx"),
   checkPermissions: async () => ({ behavior: "allow" }),
   async call(i, ctx) {
     const { convertPdfInPlace } = await import("../session/convertPdf.js");
-    const r = await convertPdfInPlace(ctx.session, { mode: i.layout ?? "flow" });
+    const r = await convertPdfInPlace(ctx.session, { mode: i.layout ?? "flow", pages: i.pages });
     return {
       content: `${r.text}\n已切换为 Word 文档，写工具现在可用。下一步：调用 doc_outline 重新获取段落引用后再修改。`,
       docChange: { label: r.label, changedRefs: [], structural: true },
