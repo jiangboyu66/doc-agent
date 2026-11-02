@@ -1085,7 +1085,7 @@ await test("所有夹具 PDF：两种排版方式都不报错、文字完整；L
   const run = promisify(execFile);
   const soffice = process.env.SOFFICE_PATH || "soffice";
   const hasSoffice = await run(soffice, ["--version"]).then(() => true, () => false);
-  const names = ["columns", "journal", "figures", "math", "journal-front", "journal-eq", "journal-fig", "bios", "colstart"];
+  const names = ["columns", "journal", "figures", "math", "journal-front", "journal-eq", "journal-fig", "bios", "colstart", "signature"];
   const dir = await fs.mkdtemp(path.join(tmp, "pages-"));
   const bad: string[] = [];
   for (const name of names) {
@@ -1167,6 +1167,37 @@ await test("首字下沉与正文同基线时仍识别为首字下沉；多行�
     const title = (xml.match(/<w:p [^>]*>(?:(?!<\/w:p>)[\s\S])*?A Physical-Flow-Based Approach(?:(?!<\/w:p>)[\s\S])*?<\/w:p>/) ?? [""])[0];
     assert(/<w:jc w:val="center"\/>/.test(title), `${mode}：两行居中的标题应居中（版心被页码撑宽也不影响）`);
     assert(/\[2\]\s*(<[^>]+>)*\s*——/.test(xml.replace(/<w:tab\/>/g, " ")), `${mode}：画成短横线的破折号应还原为 "——"`);
+  }
+});
+
+await test("合同签字页：左右并排的签字标签、无框表头不当成双栏；描边的小方框还原为 ☐ / ☒；比表头文字长的填写线不当成下划线", async () => {
+  const { pdfToDocx } = await import("../src/services/pdfConvert/index.js");
+  const pdf = await fixture("signature.pdf");
+  for (const mode of ["exact", "flow"] as const) {
+    const { data, report } = await pdfToDocx(pdf, { mode });
+    eq(report.textCoverage, 1, `${mode}：文字完整性，缺失：${report.missing}`);
+    eq(report.columnPages, 0, `${mode}：签字区、表头不应被当成双栏`);
+    const xml = new ZipPackage(data).readText("word/document.xml");
+    const paras = (xml.match(/<w:p [^>]*>[\s\S]*?<\/w:p>/g) ?? []).map((p) => p.replace(/<w:tab\/>/g, "\t").replace(/<[^>]+>/g, ""));
+    // 左右两个签字标签在同一段里，用制表位定位（误判成分栏时左侧标签被挤进只有编号宽的左栏，折成好几行）
+    for (const pair of ["(Signature)\t(Signature)", "(Printed Name)\t(Printed Name)", "(Title)\t(Date Signed)"]) {
+      assert(paras.some((t) => t.replace(/^\t/, "") === pair), `${mode}：签字标签 ${pair} 应在同一行：${paras.join(" | ")}`);
+    }
+    // 复选框：3 个空框、1 个打了叉的框，与选项文字同段；字体与 Word 的复选框控件相同；方框的竖边不再单独画出（"| |"）
+    eq((xml.match(/☐/g) ?? []).length, 3, `${mode}：空复选框个数`);
+    eq((xml.match(/☒/g) ?? []).length, 1, `${mode}：已勾选的复选框个数`);
+    assert(paras.some((t) => /^\t?☒\tNo prior works\.$/.test(t)) && paras.filter((t) => /^\t?☐\tAdditional sheets attached\.$/.test(t)).length === 2, `${mode}：复选框应与选项文字在同一段：${paras.join(" | ")}`);
+    assert(/<w:rFonts w:ascii="MS Gothic"[^>]*\/>(?:(?!<\/w:r>)[\s\S])*☐/.test(xml), `${mode}：复选框应使用 MS Gothic`);
+    // 表头下的填写线比表头文字长：是线，不是下划线（否则伸出文字的部分丢失，表头前的制表符也会带上下划线）；
+    // 框住字母的方框，底边也不是字母的下划线
+    assert(!xml.includes("<w:u "), `${mode}：表头、框内字母不应带下划线`);
+    assert(paras.some((t) => t === "See Exhibit A"), `${mode}：框里的字母是正文`);
+    // 逐页保留：线条 = 签字线 6 + 分隔线 1 + 填写行 3 + 表格填写线 12 + 框住字母的方框 4 条边；
+    // 竖线只有那个方框的两条边（复选框的竖边不再单独留下，"| |"）
+    if (mode === "exact") {
+      eq((xml.match(/name="直线 /g) ?? []).length, 26, "逐页保留：线条数");
+      eq((xml.match(/<wp:extent cx="0" /g) ?? []).length, 2, "逐页保留：竖线数");
+    }
   }
 });
 
