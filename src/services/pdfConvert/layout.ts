@@ -10,7 +10,7 @@
  *   - 每一页以分页开始，页与页之间不会互相推挤。
  */
 
-import type { FillRect, ImageBox, PageModel, Seg, Span } from "./extract.js";
+import type { FillRect, ImageBox, PageModel, PathBox, Seg, Span } from "./extract.js";
 import { collectHyphenated, collectWords, isSoftHyphen, wordCounts } from "../../documents/hyphen.js";
 import { detectDropCaps, detectEquations, detectIconPaths, detectFigures, detectImageGrids, detectMaskInk, rawBase, rasterBox, removeInside, spansText, type Box, type MathCtx } from "./raster.js";
 
@@ -159,7 +159,7 @@ export interface Line {
 }
 
 const CELL_MARGIN = 2.85; // pt，单元格左右边距（57 twips）
-const BULLET = /^(\[\d{1,4}\]|[•·▪■□◆◇○●➢➤►▸\-–—*]|\(?\d{1,3}[.)、]|\(?[a-zA-Z][.)]|\([ivxIVX]+\)|[ivxIVX]+[.)]|[一二三四五六七八九十]+[、.．])$/;
+const BULLET = /^(\[\d{1,4}\]|[•·▪■□◆◇○●➢➤►▸☐☑☒\-–—*]|\(?\d{1,3}[.)、]|\(?[a-zA-Z][.)]|\([ivxIVX]+\)|[ivxIVX]+[.)]|[一二三四五六七八九十]+[、.．])$/;
 const CJK = /[⺀-鿿豈-﫿＀-￯　-〿]/;
 
 /**
@@ -923,7 +923,8 @@ function buildPara(lines: Line[], r: Region, blockEdge: number, ctx: Ctx): Para 
           if (!tabs.some((t) => Math.abs(t.pos - tab.pos) < 1)) tabs.push(tab);
           const last = runs[runs.length - 1];
           if (last) last.text = last.text.replace(/\s+$/, "");
-          runs.push({ text: "", tab: true, ...plainFmt(fmt) });
+          // 制表符只在前后文字都带下划线 / 删除线时才带（同一条线从前一段文字延续到后一段），否则空白处会多出一条线
+          runs.push({ text: "", tab: true, ...plainFmt(fmt), underline: fmt.underline && p.underline, strike: fmt.strike && p.strike });
           text = text.replace(/^\s+/, "");
         } else if (gap > 0.18 * l.size && !/\s$/.test(runs[runs.length - 1]?.text ?? "") && !/^\s/.test(text)) {
           const pc = p.text.slice(-1), nc = text[0] ?? "";
@@ -982,7 +983,7 @@ function buildPara(lines: Line[], r: Region, blockEdge: number, ctx: Ctx): Para 
     const lead = Math.round((indLeft + firstLine) * 20) / 20;
     if (!tabs.some((t) => Math.abs(t.pos - lead) < 1) && tabs.every((t) => t.pos > lead)) {
       tabs.push({ pos: lead, align: "left" });
-      runs.unshift({ text: "", tab: true, ...plainFmt(spanFormat(first.spans[0], first.size, first.baseline)) });
+      runs.unshift({ text: "", tab: true, ...plainFmt(spanFormat(first.spans[0], first.size, first.baseline)), underline: undefined, strike: undefined });
       lineFits.forEach((f) => { f.start++; f.end++; });
       indLeft = 0; firstLine = 0;
     }
@@ -1137,14 +1138,21 @@ function applyTextDecorations(spans: Span[], segs: Seg[], used: Set<Seg>): HSeg[
   const free = mergeH(segs.filter((s) => !used.has(s)));
   const rules: HSeg[] = [];
   for (const h of free) {
-    let consumed = false;
+    const under: Span[] = [], strike: Span[] = [];
     for (const s of spans) {
       const overlap = Math.min(h.x1, s.x1) - Math.max(h.x0, s.x0);
       if (overlap < 0.5 * (s.x1 - s.x0)) continue;
-      if (h.y >= s.baseline - 0.5 && h.y <= s.baseline + 0.3 * s.size) { s.underline = true; consumed = true; }
-      else if (h.y < s.baseline - 0.15 * s.size && h.y > s.baseline - 0.45 * s.size) { s.strike = true; consumed = true; }
+      if (h.y >= s.baseline - 0.5 && h.y <= s.baseline + 0.3 * s.size) under.push(s);
+      else if (h.y < s.baseline - 0.15 * s.size && h.y > s.baseline - 0.45 * s.size) strike.push(s);
     }
-    if (!consumed && h.x1 - h.x0 >= 20) rules.push(h);
+    const marked = [...under, ...strike];
+    // 下划线 / 删除线与文字等长；明显长出文字一截的是线（表单的填写线、无框表格的列线恰好从表头文字下方经过）：
+    // 当成下划线会只剩文字下面那一段，伸出的部分丢失，前面的制表符也跟着带上下划线
+    const over = marked.length ? Math.max(Math.min(...marked.map((s) => s.x0)) - h.x0, h.x1 - Math.max(...marked.map((s) => s.x1))) : 0;
+    if (marked.length && over <= Math.max(2, 0.6 * Math.max(...marked.map((s) => s.size)))) {
+      for (const s of under) s.underline = true;
+      for (const s of strike) s.strike = true;
+    } else if (h.x1 - h.x0 >= 20) rules.push(h);
   }
   return rules;
 }
@@ -1200,16 +1208,31 @@ export function detectGutter(lines: Line[], r: Region): { g0: number; g1: number
     if (!bestRun || j - i > bestRun.b - bestRun.a) bestRun = { a: i, b: j };
     i = j + 1;
   }
-  const best = { x: (scores[bestRun!.a].x + scores[bestRun!.b].x) / 2, two: top };  const lefts: number[] = [], rights: number[] = [];
+  const best = { x: (scores[bestRun!.a].x + scores[bestRun!.b].x) / 2, two: top };
+  // 不跨栏的行：分栏线左侧 / 右侧的文字片段
+  const parts: Array<{ l: Line; L: Span[]; R: Span[] }> = [];
   for (const l of lines) {
-    const k = classify(l, best.x);
-    if (k === "cross") continue;
-    const left = l.spans.filter((s) => (s.x0 + s.x1) / 2 < best.x), right = l.spans.filter((s) => (s.x0 + s.x1) / 2 >= best.x);
-    if (left.length) lefts.push(Math.max(...left.map((s) => s.x1)));
-    if (right.length) rights.push(Math.min(...right.map((s) => s.x0)));
+    if (classify(l, best.x) === "cross") continue;
+    parts.push({ l, L: l.spans.filter((s) => (s.x0 + s.x1) / 2 < best.x), R: l.spans.filter((s) => (s.x0 + s.x1) / 2 >= best.x) });
   }
-  const g0 = edgeOf(lefts, "max"), g1 = edgeOf(rights, "min");
+  const Ls = parts.filter((p) => p.L.length), Rs = parts.filter((p) => p.R.length);
+  const endL = (p: { L: Span[] }) => Math.max(...p.L.map((s) => s.x1)), startR = (p: { R: Span[] }) => Math.min(...p.R.map((s) => s.x0));
+  const g0 = edgeOf(Ls.map(endL), "max"), g1 = edgeOf(Rs.map(startR), "min");
   if (g1 - g0 < 6) return null;
+  // 栏间距必须真是空白，两栏里必须是成段的正文。签字区、表单里左右并排的短标签（"(Signature)      (Signature)"）、
+  // 无框表格的表头也是"两侧都有文字"的行，几行就够上面的打分门槛；误判成分栏后，栏边界与这些标签对不上
+  // （左栏只到编号"1."的行尾），标签被挤出栏外、整片错位。这类行按单栏 + 制表位还原才对：
+  //   - 文字伸进栏间距（越过左栏右边界 / 右栏左边界）的行不能多：真正的分栏只有个别长网址、悬挂标点越界；
+  //   - 两栏都要有排满整栏的行（至少一半，最多要求 3 行）：并排的短标签、编号列排不满栏
+  const tol = (l: Line) => Math.max(3, 0.5 * l.size);
+  const intrude = parts.filter(({ l }) => l.spans.some((s) => s.x1 > g0 + tol(l) && s.x0 < g1 - tol(l))).length;
+  if (intrude > Math.max(2, 0.2 * parts.length)) return null;
+  const colL = g0 - Math.min(...Ls.flatMap((p) => p.L.map((s) => s.x0))), colR = Math.max(...Rs.flatMap((p) => p.R.map((s) => s.x1))) - g1;
+  if (colL < 0.15 * W || colR < 0.15 * W) return null;
+  const fullL = Ls.filter((p) => endL(p) <= g0 + tol(p.l) && endL(p) - Math.min(...p.L.map((s) => s.x0)) >= 0.6 * colL).length;
+  const fullR = Rs.filter((p) => startR(p) >= g1 - tol(p.l) && Math.max(...p.R.map((s) => s.x1)) - startR(p) >= 0.6 * colR).length;
+  const need = (n: number) => Math.min(3, Math.ceil(0.5 * n));
+  if (fullL < need(Ls.length) || fullR < need(Rs.length)) return null;
   return { g0, g1, x: best.x };
 }
 
@@ -1239,6 +1262,81 @@ function dashRules(pg: PageModel): void {
     added.push({ ...ref, text: "\u2014".repeat(n), x0: g.x0, x1: g.x1, bold: false, italic: false, natural: n * ref.size, wordW: n * ref.size, img: undefined, type3: undefined });
   }
   if (added.length) { pg.segs = keep; pg.spans = [...pg.spans, ...added]; }
+}
+
+/** 复选框字符的字体：与 Word 自带的复选框内容控件相同（☐ / ☒ 用 MS Gothic） */
+const CHECKBOX_FONT = "MS Gothic";
+
+/**
+ * 表单里画出来的复选框（合同、申请表的勾选项）：四条边围成的小方框 → "☐"，框里画了勾 / 叉的 → "☒"。
+ * 方框的上下边太短，既不是下划线也构不成表格，原先被丢掉、只剩左右两条竖线（"| |"）；流式模式下整个方框都不见了。
+ * 还原成字符后随文字排版，在 Word 里也能直接改成 ☒ 打勾。
+ * 条件：边长 4–20pt、近似正方形、四边齐全；不与其他线相连（表格的格子、连成一排的输入方格留给表格识别）；
+ * 框里没有文字、色块、图片；同一行有文字（取它的字号与基线）。
+ * 同样大小、孤立的方框但不是复选框（框住的字母 / 编号、同一行没有文字）：返回它的四条边，由调用方画成完整的方框
+ */
+function checkBoxes(pg: PageModel): Seg[] {
+  type B = { x0: number; y0: number; x1: number; y1: number };
+  const mid = (a: number, b: number) => (a + b) / 2;
+  const near = (a: number, b: number) => Math.abs(a - b) <= 1.5;
+  const same = (a: Seg, b: Seg) => a.horizontal === b.horizontal && near(a.x0, b.x0) && near(a.x1, b.x1) && near(a.y0, b.y0) && near(a.y1, b.y1);
+  const H = pg.segs.filter((s) => s.horizontal), V = pg.segs.filter((s) => !s.horizontal);
+  const goneSegs = new Set<Seg>(), gonePaths = new Set<PathBox>();
+  const added: Span[] = [], frames: Seg[] = [];
+  let marked = 0;
+  for (const top of H) {
+    const w = top.x1 - top.x0, yT = mid(top.y0, top.y1);
+    if (goneSegs.has(top) || w < 4 || w > 20) continue;
+    // 底边与两条竖边：竖边要恰好连起上下两条边（一列上下紧挨的方框，下一个框的顶边不能当成这个框的底边）
+    let found: { box: B; sides: Seg[] } | null = null;
+    for (const bottom of H) {
+      const yB = mid(bottom.y0, bottom.y1);
+      if (bottom === top || goneSegs.has(bottom) || !near(bottom.x0, top.x0) || !near(bottom.x1, top.x1) || yB - yT < 0.7 * w || yB - yT > 1.4 * w) continue;
+      const side = (x: number) => V.find((v) => !goneSegs.has(v) && near(mid(v.x0, v.x1), x) && near(v.y0, yT) && near(v.y1, yB));
+      const l = side(top.x0), r = side(top.x1);
+      if (l && r) { found = { box: { x0: top.x0, y0: yT, x1: top.x1, y1: yB }, sides: [top, bottom, l, r] }; break; }
+    }
+    if (!found) continue;
+    const { box, sides } = found;
+    const pad = 1.5;
+    const touches = (b: B) => b.x1 > box.x0 - pad && b.x0 < box.x1 + pad && b.y1 > box.y0 - pad && b.y0 < box.y1 + pad;
+    const within = (b: B) => b.x0 >= box.x0 - pad && b.x1 <= box.x1 + pad && b.y0 >= box.y0 - pad && b.y1 <= box.y1 + pad;
+    // 四条边（同一条边描了两遍的也算）之外，不能再有线段碰到方框
+    const edges = pg.segs.filter((s) => sides.some((e) => same(s, e)));
+    if (pg.segs.some((s) => !edges.includes(s) && touches(s))) continue;
+    // 框上的勾 / 叉（斜线、曲线，勾常常伸出框外一点）：打了勾的复选框。与更大的图形相连的不是复选框；
+    // 圆角方框角上的小圆弧不是勾
+    const h = box.y1 - box.y0, cy = mid(box.y0, box.y1);
+    const marks = pg.paths.filter((p) => (p.diagonal || p.curved) && touches(p) && Math.max(p.x1 - p.x0, p.y1 - p.y0) >= 0.3 * Math.min(w, h));
+    const reach = { x0: box.x0 - 0.5 * w, y0: box.y0 - 0.5 * h, x1: box.x1 + 0.5 * w, y1: box.y1 + 0.5 * h };
+    if (marks.some((p) => p.x0 < reach.x0 || p.x1 > reach.x1 || p.y0 < reach.y0 || p.y1 > reach.y1)) continue;
+    const inBox = (s: Span) => mid(s.x0, s.x1) > box.x0 && mid(s.x0, s.x1) < box.x1 && mid(s.top, s.bottom) > box.y0 && mid(s.top, s.bottom) < box.y1;
+    const occupied = pg.spans.some((s) => s.text.trim() && inBox(s)) || pg.fills.some(within) || pg.images.some(within);
+    // 同一行的文字：竖直方向覆盖方框中心，字号与方框相称
+    const row = occupied ? [] : pg.spans.filter((s) => s.text.trim() && !s.img && s.top < cy && s.bottom > cy && h >= 0.4 * s.size && h <= 1.6 * s.size);
+    edges.forEach((s) => goneSegs.add(s));
+    if (!row.length) {
+      // 不是复选框：上下边留在线段里会被丢掉（或被当成框内文字的下划线），只剩左右两条竖线——改由调用方画出四条边
+      frames.push(...sides);
+      continue;
+    }
+    const dist = (s: Span) => Math.max(s.x0 - box.x1, box.x0 - s.x1);
+    const ref = row.reduce((a, b) => (dist(b) < dist(a) ? b : a));
+    for (const p of pg.paths) if (within(p) || marks.includes(p)) gonePaths.add(p);
+    // 勾 / 叉在提取时记作"未能转换的矢量图形"，现在已还原
+    marked += marks.filter((p) => (p.x1 - p.x0) * (p.y1 - p.y0) > 4).length;
+    added.push({
+      text: marks.length ? "☒" : "☐", x0: box.x0, x1: box.x1, top: ref.top, bottom: ref.bottom, baseline: ref.baseline, size: ref.size,
+      font: CHECKBOX_FONT, bold: false, italic: false, color: top.color,
+      natural: box.x1 - box.x0, wordW: ref.size, spaceW: ref.spaceW, wordSpaceW: ref.wordSpaceW,
+    });
+  }
+  if (!goneSegs.size) return frames;
+  pg.segs = pg.segs.filter((s) => !goneSegs.has(s));
+  pg.paths = pg.paths.filter((p) => !gonePaths.has(p));
+  pg.vectorShapes = Math.max(0, pg.vectorShapes - marked);
+  if (added.length) pg.spans = [...pg.spans, ...added];
+  return frames;
 }
 
 export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; raster?: boolean } = {}): DocModel {
@@ -1299,6 +1397,7 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
       inlineMathCount += ink.inline.length;
     }
     dashRules(pg);
+    const frames = checkBoxes(pg);
     // 作者名后的矢量小图标（ORCID）：渲染成图后作为行内图片
     if (opts.raster) {
       const t1 = detectTables(pg).tables.map((t) => ({ x0: t.x0, y0: t.y0, x1: t.x1, y1: t.y1 }));
@@ -1311,7 +1410,7 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
     tables.push(...detectSideBySide(pg, used, inTable));
     const free = pg.spans.filter((s) => !inTable.has(s));
     const rules = applyTextDecorations(free, pg.segs, used);
-    return { pg, tables, free, rules, figures };
+    return { pg, tables, free, rules, figures, frames };
   });
 
   // 版心：全部页面的内容边界
@@ -1458,7 +1557,7 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
   let notes: Para[] = [];
   let notesBottom = 0;
 
-  for (const [pi, { pg, tables, free, rules, figures }] of pre.entries()) {
+  for (const [pi, { pg, tables, free, rules, figures, frames }] of pre.entries()) {
     curPage = pi;
     stats.images += pg.images.length;
     // 与文字重叠的图片（水印、底图）放在文字下方
@@ -1491,6 +1590,12 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
     const usedV = new Set(tables.flatMap((t) => t.vs.flatMap((v) => v.src)));
     for (const v of mergeV(pg.segs.filter((sg) => !sg.horizontal && !usedV.has(sg)))) {
       if (v.y1 - v.y0 >= 8 && !inTableArea(v.x - 1, v.y0, v.x + 1, v.y1) && keepShape(v.y0, v.y1)) shapes.push({ kind: "line", x0: v.x, y0: v.y0, x1: v.x, y1: v.y1, width: v.w, color: v.color, behind: false });
+    }
+    // 不是复选框的小方框（框住的字母、编号）：四条边都画出来
+    for (const s of frames) {
+      if (inTableArea(s.x0, s.y0, s.x1, s.y1) || !keepShape(s.y0, s.y1)) continue;
+      const x = (s.x0 + s.x1) / 2, y = (s.y0 + s.y1) / 2;
+      shapes.push({ kind: "line", x0: s.horizontal ? s.x0 : x, y0: s.horizontal ? y : s.y0, x1: s.horizontal ? s.x1 : x, y1: s.horizontal ? y : s.y1, width: s.width, color: s.color, behind: false });
     }
     for (const f of pg.fills) {
       if (inTableArea(f.x0, f.y0, f.x1, f.y1) || !keepShape(f.y0, f.y1)) continue;
