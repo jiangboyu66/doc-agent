@@ -1170,7 +1170,7 @@ await test("首字下沉与正文同基线时仍识别为首字下沉；多行�
   }
 });
 
-await test("合同签字页：左右并排的签字标签、无框表头不当成双栏；描边的小方框还原为 ☐ / ☒；比表头文字长的填写线不当成下划线", async () => {
+await test("合同签字页：左右并排的签字标签、无框表头不当成双栏；描边的小方框还原为 ☐ / ☒；比表头文字长的填写线不当成下划线；两行页脚、主动换页、连着的填写线（可编辑排版）", async () => {
   const { pdfToDocx } = await import("../src/services/pdfConvert/index.js");
   const pdf = await fixture("signature.pdf");
   for (const mode of ["exact", "flow"] as const) {
@@ -1197,6 +1197,23 @@ await test("合同签字页：左右并排的签字标签、无框表头不当�
     if (mode === "exact") {
       eq((xml.match(/name="直线 /g) ?? []).length, 26, "逐页保留：线条数");
       eq((xml.match(/<wp:extent cx="0" /g) ?? []).length, 2, "逐页保留：竖线数");
+    }
+    // 紧挨着的两行页脚（"Consulting Agreement" / "Page N"）：是页脚，不留在正文里
+    // （逐页保留：页面绝对坐标的文本框；可编辑排版：真正的页脚，正文里不再夹着页脚和它上方的大段空白）
+    const pkg = new ZipPackage(data);
+    assert(!xml.replace(/<w:txbxContent>[\s\S]*?<\/w:txbxContent>/g, "").includes("Consulting Agreement"), `${mode}：页脚不应留在正文里`);
+    if (mode === "flow") {
+      assert(pkg.names().some((n) => /^word\/footer\d*\.xml$/.test(n) && pkg.readText(n).includes("Consulting Agreement")), "可编辑排版：页脚应写进页脚部件");
+      // 原文在 "[Signatures to follow on next page]" 之后主动换页：保留分页符，签字页不被提到上一页
+      const brk = xml.indexOf('w:val="PageStart"');
+      assert(brk > xml.indexOf("[Signatures to follow on next page]") && brk < xml.indexOf("This Agreement takes effect"), "可编辑排版：签字页之前应保留分页符");
+      eq((xml.match(/w:val="PageStart"/g) ?? []).length, 1, "可编辑排版：只在主动换页处分页");
+      // 连着的三条相同的填写线（段落下边框）：相邻两段边框、缩进都相同会被 Word / LibreOffice 并成一条，中间要隔开
+      const blocks = (xml.match(/<w:p [^>]*>[\s\S]*?<\/w:p>/g) ?? []).map((p) => ({ bdr: p.includes("<w:pBdr>"), ind: p.match(/<w:ind [^>]*\/>/)?.[0] ?? "" }));
+      assert(!blocks.some((b, i) => i > 0 && b.bdr && blocks[i - 1].bdr && b.ind === blocks[i - 1].ind), "可编辑排版：相同的填写线不应相邻（会被合并成一条）");
+      const sameInd = new Map<string, number>();
+      for (const b of blocks) if (b.bdr) sameInd.set(b.ind, (sameInd.get(b.ind) ?? 0) + 1);
+      assert([...sameInd.values()].some((n) => n >= 3), "可编辑排版：三条相同的填写线都应保留");
     }
   }
 });

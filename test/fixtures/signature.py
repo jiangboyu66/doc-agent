@@ -1,10 +1,15 @@
-"""生成测试夹具 signature.pdf：合同末页的签字区与勾选表单（版面仿照常见的英文合同签字页）。
+"""生成测试夹具 signature.pdf：合同的最后两页（版面仿照常见的英文合同）。
+第 1 页：正文条款，最后一行 "[Signatures to follow on next page]" 之后大片空白——原文在这里主动换页；
+第 2 页：签字页与勾选表单——
   - 签字区：左右两组签字线，线下居中的标签 "(Signature)" / "(Printed Name)" / "(Title)" 左右并排；
   - 复选框：描边的小方框（四条边，10.5pt），右侧是选项文字；第一个框里画了叉（已勾选）；
+  - 连着的三条相同的填写线；
   - 无框表格：表头 "Prior Work / Party(ies) / Relationship"，每列一条比表头文字长的填写线，下面 3 行编号 + 填写线；
   - 框住字母 "A" 的小方框（不是复选框）。
-这一页里左右并排的短标签、表头会被误判成"双栏正文"（栏边界取到编号 "1." 的行尾，标签被挤出栏外）；
-方框的上下边太短被丢掉、只剩两条竖线；表头下的填写线被当成文字的下划线。"""
+两页都有紧挨着的两行页脚 "Consulting Agreement" / "Page N"。
+易错点：签字页里左右并排的短标签、表头会被误判成"双栏正文"（栏边界取到编号 "1." 的行尾，标签被挤出栏外）；
+方框的上下边太短被丢掉、只剩两条竖线；表头下的填写线被当成文字的下划线；可编辑排版下连着的填写线并成一条、
+两行页脚留在正文里、签字页被提到上一页。"""
 import sys
 from reportlab.pdfgen import canvas
 
@@ -39,6 +44,37 @@ def box(x, y, checked=False):
         c.line(x + 2, H - y - 8.6, x + 8.5, H - y - 2)
 
 
+def paragraph(base, words, first_indent=0, width=468):
+    """左对齐的正文段落（行距 12.7pt），返回下一段的基线"""
+    line, x0 = [], 72 + first_indent
+    for w in words.split():
+        if c.stringWidth(" ".join(line + [w]), R, 11) > width - (x0 - 72) and line:
+            text(x0, base, " ".join(line))
+            base, line, x0 = base + 12.7, [], 72
+        line.append(w)
+    text(x0, base, " ".join(line))
+    return base + 12.7
+
+
+def footer(n):
+    c.setFont(R, 8)
+    c.drawRightString(540, H - 734.9, "Consulting Agreement")
+    c.drawRightString(540, H - 744.2, f"Page {n}")
+
+
+# 第 1 页：正文条款，签字见下页
+text(72, 82.3, "9.  General.", B)
+y = paragraph(108.0, "9.1 Counterparts. This Agreement may be executed in two or more counterparts, each of which will be deemed an original, "
+              "but all of which together will constitute one and the same instrument. Counterparts may be delivered by electronic mail "
+              "or any other transmission method and will be deemed to have been duly and validly delivered.", 36)
+y = paragraph(y + 8, "9.2 Entire Agreement. This Agreement is the final, complete and exclusive agreement of the parties with respect to "
+              "the subject matter hereof and supersedes and merges all prior discussions between the parties. No modification of or "
+              "amendment to this Agreement will be effective unless in writing and signed by the party to be charged.", 36)
+center(306, y + 20, "[Signatures to follow on next page]")
+footer(1)
+c.showPage()
+
+# 第 2 页：签字页与勾选表单
 text(72, 82.3, "This Agreement takes effect on the date signed by the Consultant below.")
 text(77.3, 106.8, "Example Holdings Ltd.", B)
 text(351.8, 106.8, "Consultant:", B)
@@ -79,8 +115,6 @@ text(144, 588.0, "Additional sheets attached.")
 text(72, 620.0, "See Exhibit")
 box(130, 610.6)
 center(135.25, 620.0, "A")
-c.setFont(R, 8)
-c.drawRightString(540, H - 734.9, "Consulting Agreement")
-c.drawRightString(540, H - 744.2, "Page 6")
+footer(2)
 c.showPage()
 c.save()
