@@ -135,6 +135,7 @@ body:has(.workspace) { overflow: hidden; }
 .ctl { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
 .ctl select, .ctl input.author { height: 30px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); padding: 0 6px; color: var(--ink); font-size: 13px; }
 .ctl input.author { width: 96px; }
+.ctl input.pages { width: 120px; height: 30px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); padding: 0 6px; color: var(--ink); font-size: 13px; }
 .ctl.toggle { cursor: pointer; color: var(--ink-2); }
 .ctl.toggle input { accent-color: var(--accent); }
 .cost { font-family: var(--mono); font-size: 12px; color: var(--muted); padding: 2px 6px; border-radius: 4px; background: var(--line-2); cursor: help; }
@@ -326,3 +327,5 @@ body:has(.workspace) { overflow: hidden; }
   .topbar { flex-wrap: wrap; }
   .controls { width: 100%; justify-content: flex-start; }
 }
+.preview-limit { margin: 8px 16px 0; }
+.preview-limit button { margin: 0 4px; padding: 1px 8px; font-size: 12px; }

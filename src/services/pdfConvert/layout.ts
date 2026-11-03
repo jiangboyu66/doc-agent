@@ -1475,9 +1475,31 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
     }
     return out;
   });
+  const norm = (l: Line) => l.spans.map((sp) => sp.text).join(" ").replace(/\d+/g, "#").replace(/\s+/g, " ").trim();
+  // 两行紧挨着的页脚（"文档名" + "Page N"）：最下面一行与上一行几乎没有间距，上面逐行往上判断时第一行就停了，
+  // 整组页脚留在正文里——流式模式下它连同上方的大段空白排在正文中间，下一页的内容接在它后面。
+  // 最下面一组紧挨着、同样小字号、整组与上方正文之间有明显空白的行，在多页重复出现（数字归一后文字相同）就是页脚；
+  // 只在一页出现的（栏底的脚注）不动
+  const footBlocks = pageLines.map((ls, i) => {
+    const H = pre[i].pg.height;
+    if (floating[i].some((l) => l.top >= H / 2)) return [];
+    const out: Line[] = [];
+    for (let k = ls.length - 1; k >= 0; k--) {
+      const l = ls[k], below = out[out.length - 1];
+      if (l.top < H * 0.9 || l.size >= 0.95 * mathCtx.bodySize) break;
+      if (below && (Math.abs(l.size - below.size) >= 0.6 || below.top - l.bottom > 1.2 * l.size)) break;
+      out.push(l);
+    }
+    const above = ls[ls.length - 1 - out.length], first = out[out.length - 1];
+    return out.length >= 2 && (!above || first.top - above.bottom > 1.2 * first.size) ? out : [];
+  });
+  const footPages = new Map<string, Set<number>>();
+  const addFoot = (l: Line, i: number) => { const k = norm(l); if (!footPages.has(k)) footPages.set(k, new Set()); footPages.get(k)!.add(i); };
+  floating.forEach((ls, i) => { for (const l of ls) if (l.top >= pre[i].pg.height / 2) addFoot(l, i); });
+  footBlocks.forEach((b, i) => b.forEach((l) => addFoot(l, i)));
+  footBlocks.forEach((b, i) => { if (b.length && b.every((l) => (footPages.get(norm(l))?.size ?? 0) >= 2)) floating[i].push(...b); });
   // 流式模式：只有在多页重复出现的（页眉、页码、刊名卷期）才写进页眉页脚；只在一页出现的栏底标题、正文末行等放回正文
   if (flow && pages.length > 1) {
-    const norm = (l: Line) => l.spans.map((sp) => sp.text).join(" ").replace(/\d+/g, "#").replace(/\s+/g, " ").trim();
     const seen = new Map<string, Set<number>>();
     floating.forEach((ls, i) => { for (const l of ls) { const k = norm(l); if (!seen.has(k)) seen.set(k, new Set()); seen.get(k)!.add(i); } });
     floating.forEach((ls, i) => { floating[i] = ls.filter((l) => (seen.get(norm(l))?.size ?? 0) >= 2); });
@@ -1530,7 +1552,7 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
   let mTop = marginTop, mBottom = marginBottom;
   let headerDist: number | undefined, footerDist: number | undefined;
   if (flow) {
-    const bt: number[] = [], bb: number[] = [], ht: number[] = [], fb: number[] = [];
+    const bt: number[] = [], bb: number[] = [], ht: number[] = [], fb: number[] = [], ft: number[] = [];
     pre.forEach(({ pg, tables, figures }, i) => {
       const ls = pageLines[i];
       const pics = [...pg.images.filter((im) => !im.behind && im.y0 > pg.height * 0.1 && im.y1 < pg.height * 0.9), ...figures];
@@ -1538,10 +1560,17 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
       const ye = [...ls.map((l) => l.bottom), ...tables.map((t) => t.y1), ...pics.map((f) => f.y1)];
       if (ys.length) bt.push(Math.min(...ys));
       if (ye.length) bb.push(Math.max(...ye));
-      for (const l of floating[i]) if (l.top < pg.height / 2) ht.push(l.top); else fb.push(l.bottom);
+      for (const l of floating[i]) if (l.top < pg.height / 2) ht.push(l.top); else { fb.push(l.bottom); ft.push(l.top); }
     });
     mTop = Math.max(9, (bt.length ? Math.min(...bt) : 72) - 2);
     mBottom = Math.max(9, pageH - (bb.length ? Math.max(...bb) : pageH - 72) - 2);
+    // 可编辑排版的版面元素比原文略高（同一高度并排的几条线各占一个极小段落），版心按原文正文的最低处算会正好排满：
+    // 原文排到最低处的那一页（主动换页后单独成页的签字页）会被挤出一行到下一页。
+    // 正文与页脚之间空着的地方留出至多两行余量（不会碰到页脚）
+    if (ft.length && bb.length) {
+      const room = Math.min(...ft) - Math.max(...bb) - 0.5 * mathCtx.bodySize;
+      if (room > 0) mBottom = Math.max(9, mBottom - Math.min(room, 2.4 * mathCtx.bodySize));
+    }
     if (ht.length) headerDist = Math.max(4, Math.min(...ht) - 1);
     if (fb.length) footerDist = Math.max(4, pageH - Math.max(...fb) - 1);
   }
@@ -1551,6 +1580,22 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
   const allBody = pageLines.flat();
   const bodyTop = allBody.length ? Math.min(...allBody.map((l) => l.top)) : 0;
   const bodyBottom = allBody.length ? Math.max(...allBody.map((l) => l.bottom)) : pageH;
+  // 流式模式：原文提前换页的地方（这一页下方大片空着、最后一段已经结束就换页，如"签字见下页"）保留分页符，
+  // 否则下一页的内容会接着排上来。自然换页最多空出几行（孤行控制、放不下的图表），远不到版心的两成；
+  // 最后一行排满到栏的右边界的，段落多半接到下一页，也不是主动换页
+  const pageEnd = pre.map(({ pg, tables, figures }, i) => Math.max(0, ...pageLines[i].map((l) => l.bottom), ...tables.map((t) => t.y1),
+    ...[...pg.images, ...figures].filter((im) => im.y0 < bodyBottom).map((im) => im.y1)));
+  const endsMidParagraph = (i: number) => {
+    const ls = pageLines[i];
+    if (!ls.length) return false;
+    const low = Math.max(...ls.map((l) => l.bottom));
+    if (low < pageEnd[i] - 2) return false; // 页面最后是表格 / 图
+    const last = ls.filter((l) => l.bottom >= low - 2).sort((a, b) => b.x1 - a.x1)[0];
+    const g = gutters[i], edge = g && last.x1 <= g.x ? g.g0 : right;
+    return edge - last.x1 <= Math.max(3, 0.03 * (right - left));
+  };
+  const brokeEarly = (pi: number) => flow && pi > 0 && !endsMidParagraph(pi - 1) &&
+    bodyBottom - pageEnd[pi - 1] > Math.max(0.2 * (bodyBottom - bodyTop), 8 * mathCtx.bodySize);
   /** 每页的页眉 / 页脚行（流式模式） */
   const hf: Array<{ head: Line[]; foot: Line[]; imgs: ImageBox[]; mid: number }> = [];
   /** 首页栏底的注释（作者单位、基金等）：流式模式下放进首页页脚，正文增减时位置不变 */
@@ -1601,7 +1646,8 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
       if (inTableArea(f.x0, f.y0, f.x1, f.y1) || !keepShape(f.y0, f.y1)) continue;
       shapes.push({ kind: "rect", x0: f.x0, y0: f.y0, x1: f.x1, y1: f.y1, width: 0, color: f.color, behind: true });
     }
-    const anchor = tinyPara({ pageBreakBefore: !flow && pg.index > 0, images: pg.images.filter((im) => im.behind), textBoxes: [], shapes });
+    // 逐页保留：除了第一页，每页都从新的一页开始（按本次转换的顺序；只转换部分页时第一页不一定是原 PDF 的第 1 页）
+    const anchor = tinyPara({ pageBreakBefore: (!flow && pi > 0) || brokeEarly(pi), images: pg.images.filter((im) => im.behind), textBoxes: [], shapes });
     freshPage = true;
     const anchorAt = blocks.length;
     blocks.push(anchor);
@@ -1870,7 +1916,8 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
     }
     if (bands.some((b) => b.cols)) stats.columnPages++;
     // 流式模式：每页的第一块紧接上一页的内容，不保留页面顶部的空白
-    if (flow && pi > 0 && items.length) cursor = items[0].top;
+    // （原文在这里主动换页的，新的一页从页首排起，保留原来的上边距）
+    if (flow && pi > 0 && items.length && !anchor.pageBreakBefore) cursor = items[0].top;
     const pageFirst = blocks.length;
 
     for (const band of bands) {
@@ -1929,7 +1976,7 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
       if (f) f.pageMark = true;
     }
     // 流式模式：没有挂任何东西的页首锚点段落不需要
-    if (flow && !anchor.images!.length && !anchor.shapes!.length && !anchor.textBoxes!.length) blocks.splice(anchorAt, 1);
+    if (flow && !anchor.pageBreakBefore && !anchor.images!.length && !anchor.shapes!.length && !anchor.textBoxes!.length) blocks.splice(anchorAt, 1);
   }
 
   // 流式模式：合并被分栏、分页切断的段落（左栏末段 + 右栏首段、上一页末段 + 下一页首段）
@@ -2065,7 +2112,7 @@ function mergeSplitParagraphs(blocks: Block[], ctx: Ctx) {
   let last: Para | null = null;
   for (const b of blocks) {
     if (b.kind === "p" && b.tiny) {
-      if (b.sectionEnd || b.inlineImages || b.borderBottom) last = null;
+      if (b.sectionEnd || b.inlineImages || b.borderBottom || b.pageBreakBefore) last = null;
       out.push(b);
       continue;
     }
@@ -2251,11 +2298,19 @@ function layoutItems(items: Array<PageItem & { top: number }>, r: Region, cursor
     } else {
       flush();
       const p = tinyPara({ borderBottom: { width: it.h.w, color: it.h.color } });
-      p.spaceBefore = Math.max(0, it.h.y - cursor - 1);
+      const gap = Math.max(0, it.h.y - cursor - 1);
       p.indLeft = Math.max(0, it.h.x0 - r.x0);
       p.indRight = Math.max(0, r.x1 - it.h.x1);
+      // 相邻两段的下边框、缩进都相同时，Word / LibreOffice 把它们并成一组、只在组末画一条线（表单里连着的三条填写线只剩一条）：
+      // 中间隔一个没有边框的空段，空段的高度就是原来的段前距
+      const prev = blocks[blocks.length - 1];
+      const sep = prev?.kind === "p" && !!prev.borderBottom && Math.abs(prev.indLeft - p.indLeft) < 0.05 && Math.abs(prev.indRight - p.indRight) < 0.05;
+      if (sep) blocks.push(spacer(gap));
+      else p.spaceBefore = gap;
       blocks.push(p);
-      cursor = Math.max(cursor, it.h.y);
+      // 同一高度并排的几条线（左右两条签字线、无框表格每列一条）各占一个极小段落：位置按它们实际占的高度累计，
+      // 否则每多一条线下面的内容就往下错 1pt，一页下来累积十几磅，单独成页的签字页被挤出一行到下一页
+      cursor += (sep ? Math.max(1, gap) : gap) + TINY;
     }
   }
   flush();

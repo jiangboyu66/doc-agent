@@ -247,15 +247,17 @@ app.post("/api/sessions/:id/convert", wrap(async (req, res) => {
   const engine = ["builtin", "pdf2docx", "libreoffice"].includes(req.body?.engine) ? req.body.engine : "builtin";
   // 转换后用于编辑：默认流式（文字增减时自动重排）；明确要求时才逐页固定
   const mode = req.body?.mode === "exact" ? "exact" : "flow";
+  // 只转换部分页（"1-20"）
+  const pages = typeof req.body?.pages === "string" && req.body.pages.trim() ? req.body.pages.trim().slice(0, 200) : undefined;
   if (req.body?.inPlace) {
     // 在当前会话内转换：对话保留，转换后直接继续编辑
     if (l.abort) throw new Error("Agent 正在运行，请等待完成或先中断。");
-    const r = await convertPdfInPlace(l.session, { engine, mode });
+    const r = await convertPdfInPlace(l.session, { engine, mode, pages });
     const version = await l.session.commit(r.label, []);
     return res.json({ meta: l.session.meta, report: r.report, text: r.text, version });
   }
   const { session, report, text } = await convertPdfSession(l.session, {
-    engine, mode,
+    engine, mode, pages,
     defaults: { mode: runtime.settings.permissionMode, trackChanges: runtime.settings.trackChanges, author: runtime.settings.author },
   });
   live.set(session.id, { session, abort: null, pending: new Map() });
@@ -269,10 +271,11 @@ app.post("/api/sessions/:id/export", wrap(async (req, res) => {
   if (!["docx", "pdf", "html", "markdown"].includes(fmt)) throw new Error("格式可选：docx / pdf / html / markdown");
   const pdfMode = req.body?.mode === "flow" ? "flow" : "exact";
   const pdfEngine = ["pdf2docx", "libreoffice"].includes(req.body?.engine) ? req.body.engine : "builtin";
-  const out = await exportDocument(l.session.current(), l.session.meta.format, fmt, { pdfMode, pdfEngine });
+  const pdfPages = l.session.meta.format === "pdf" && typeof req.body?.pages === "string" && req.body.pages.trim() ? req.body.pages.trim().slice(0, 200) : undefined;
+  const out = await exportDocument(l.session.current(), l.session.meta.format, fmt, { pdfMode, pdfEngine, pdfPages });
   const base = l.session.meta.filename.replace(/\.[^.]+$/, "");
-  // PDF 导出 Word：直接用原文件名（例如 表单.pdf → 表单.docx）
-  const name = l.session.meta.format === "pdf" ? `${base}${pdfMode === "flow" ? "（可改写）" : ""}.${out.ext}` : `${base}-v${l.session.meta.currentVersion}.${out.ext}`;
+  // PDF 导出 Word：直接用原文件名（例如 表单.pdf → 表单.docx）；只转换部分页时注明页码
+  const name = l.session.meta.format === "pdf" ? `${base}${out.pageRange ? `（第${out.pageRange}页）` : ""}${pdfMode === "flow" ? "（可改写）" : ""}.${out.ext}` : `${base}-v${l.session.meta.currentVersion}.${out.ext}`;
   await l.session.writeExport(name, out.data);
   res.json({ name, url: `/api/sessions/${l.session.id}/exports/${encodeURIComponent(name)}`, note: out.note, lossy: out.lossy });
 }));

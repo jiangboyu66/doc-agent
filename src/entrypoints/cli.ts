@@ -149,7 +149,8 @@ async function main() {
     .option("--track", "开启 Word 修订模式")
     .option("--model <model>", "模型，如 deepseek-flash / deepseek-v4-pro")
     .option("--author <name>", "修订与批注的作者名")
-    .option("--convert [mode]", "PDF：先转换为可编辑的 Word 再处理（exact = 逐行保留原排版，默认；flow = 自动换行便于大改）");
+    .option("--convert [mode]", "PDF：先转换为可编辑的 Word 再处理（exact = 逐行保留原排版，默认；flow = 自动换行便于大改）")
+    .option("--pages <range>", "PDF 转 Word 时只转换这些页，如 1-20 或 1-5,8,10-12");
   program.parse();
   const opts = program.opts();
   const file = program.args[0];
@@ -182,7 +183,7 @@ async function main() {
     if (convert) {
       const mode = opts.convert === "flow" ? "flow" : "exact";
       console.log(chalk.dim("正在把 PDF 转换为 Word…"));
-      const r = await convertPdfSession(session, { mode, defaults: { mode: runtime.settings.permissionMode, trackChanges: runtime.settings.trackChanges, author: runtime.settings.author } });
+      const r = await convertPdfSession(session, { mode, pages: opts.pages, defaults: { mode: runtime.settings.permissionMode, trackChanges: runtime.settings.trackChanges, author: runtime.settings.author } });
       console.log(chalk.green(r.text));
       session = r.session;
     }
@@ -194,7 +195,7 @@ async function main() {
   if (opts.output && !opts.print) {
     const ext = path.extname(opts.output).slice(1).toLowerCase();
     const fmt = (ext === "md" ? "markdown" : ext) as ExportFormat;
-    const out = await exportDocument(session.current(), session.meta.format, fmt, { pdfMode: opts.convert === "flow" ? "flow" : "exact" });
+    const out = await exportDocument(session.current(), session.meta.format, fmt, { pdfMode: opts.convert === "flow" ? "flow" : "exact", pdfPages: session.meta.format === "pdf" ? opts.pages : undefined });
     await fs.writeFile(opts.output, out.data);
     console.log(chalk.green(`已导出到 ${opts.output}`));
     console.log(chalk.dim(out.note));

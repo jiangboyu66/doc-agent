@@ -508,6 +508,66 @@ await test("PDF 会话转换为新的 Word 会话，原 PDF 会话不变", async
   assert(again.doc.listBlocks().some((b) => b.text.includes("PENGGUNAAN")), "重新加载后内容完整");
 });
 
+await test("只转换部分页：页码范围写法；导出 / 会话内转换只处理这些页，报告与文件名注明页码，重新转换沿用范围；超过单次上限时报告没转换的页", async () => {
+  const { parsePageRange, pdfToDocx, describeReport } = await import("../src/services/pdfConvert/index.js");
+  eq(parsePageRange("1-20", 611).length, 20, "1-20");
+  eq(parsePageRange("第3至5页", 10).join(","), "3,4,5", "中文写法");
+  eq(parsePageRange("前2页", 10).join(","), "1,2", "前 N 页");
+  eq(parsePageRange("8-, 1，3", 10).join(","), "1,3,8,9,10", "到最后一页、多段、全角逗号");
+  eq(parsePageRange("5-30", 10).join(","), "5,6,7,8,9,10", "超出的部分截到最后一页");
+  let threw = "";
+  try { parsePageRange("700-720", 611); } catch (e: any) { threw = e.message; }
+  assert(threw.includes("611"), `超出页码范围应报错并给出总页数：${threw}`);
+
+  const pdf = await fixture("colstart.pdf"); // 3 页
+  const whole = await pdfToDocx(pdf, { mode: "exact" });
+  for (const mode of ["exact", "flow"] as const) {
+    const { data, report } = await pdfToDocx(pdf, { mode, pages: "2-3" });
+    eq(report.pages, 2, `${mode}：转换页数`);
+    eq(report.pageRange, "2–3", `${mode}：页码`);
+    eq(report.totalPages, 3, `${mode}：原 PDF 总页数`);
+    eq(report.textCoverage, 1, `${mode}：这些页文字完整`);
+    assert(report.textTotal < whole.report.textTotal, `${mode}：只含第 2–3 页的文字`);
+    assert(describeReport(report).includes("第 2–3 页（共 2 页，原 PDF 共 3 页）"), describeReport(report));
+    // 逐页保留：第一页（原 PDF 第 2 页）前面不分页，只在原第 3 页前分页
+    if (mode === "exact") eq((new ZipPackage(data).readText("word/document.xml").match(/w:val="PageStart"/g) ?? []).length, 1, "逐页保留：只在第二页前分页");
+  }
+  // 整份超过单次上限：只转换前面的页，报告写明哪些页没有转换
+  const cut = await pdfToDocx(pdf, { mode: "exact", maxPages: 2 });
+  eq(cut.report.pages, 2, "上限内的页数");
+  assert(describeReport(cut.report).includes("共 3 页，超过单次转换上限 2 页：只转换了第 1–2 页，第 3 页没有转换"), describeReport(cut.report));
+
+  // Agent 工具：导出指定页、会话内转换指定页，重新转换沿用范围
+  const { findTool } = await import("../src/tools.js");
+  const s = await Session.create(pdf, "论文.pdf", { mode: "bypassPermissions", trackChanges: false, author: "测试" });
+  const exp = await findTool("doc_export")!.call({ format: "docx", pages: "2-3" } as any, { session: s } as any);
+  eq((exp.data as any)?.name, "论文（第2–3页）.docx", "导出文件名注明页码");
+  const conv = findTool("doc_convert_to_word")!;
+  const r1 = await conv.call({ layout: "flow", pages: "2-3" } as any, { session: s } as any);
+  assert(String(r1.content).includes("第 2–3 页"), `报告应注明页码：${r1.content}`);
+  await s.commit((r1 as any).docChange.label, []);
+  eq(s.meta.filename, "论文（第2–3页）.docx", "会话文件名注明页码");
+  eq(s.meta.origin?.pages, "2-3", "记下页码范围");
+  const r2 = await conv.call({ layout: "exact" } as any, { session: s } as any);
+  assert(String(r2.content).includes("第 2–3 页"), `重新转换应沿用页码范围：${r2.content}`);
+});
+
+await test("期刊里蓝色的引用编号：只有编号是蓝色，同一文字项里后面的黑色正文不被染蓝（两种模式）", async () => {
+  const { pdfToDocx } = await import("../src/services/pdfConvert/index.js");
+  const pdf = await fixture("citecolor.pdf");
+  for (const mode of ["exact", "flow"] as const) {
+    const { data, report } = await pdfToDocx(pdf, { mode });
+    eq(report.textCoverage, 1, `${mode}：文字完整性`);
+    const xml = new ZipPackage(data).readText("word/document.xml");
+    const runs = (xml.match(/<w:r>[\s\S]*?<\/w:r>/g) ?? []).map((r) => ({ text: (r.match(/<w:t[^>]*>([^<]*)<\/w:t>/g) ?? []).map((t) => t.replace(/<[^>]+>/g, "")).join(""), blue: /<w:color w:val="0000FF"\/>/.test(r) }));
+    const blue = runs.filter((r) => r.blue && r.text.trim()).map((r) => r.text.trim());
+    assert(blue.length >= 6 && blue.every((t) => /^[[\]\d,\s]+$/.test(t)), `${mode}：蓝色的只应是引用编号：${JSON.stringify(blue)}`);
+    for (const t of ["[18]", "[23]", "[29]", "[27], [28]"]) assert(blue.includes(t), `${mode}：${t} 应是蓝色：${JSON.stringify(blue)}`);
+    assert(runs.filter((r) => /While the transformer method|In particular, TransUNet and TransFuse/.test(r.text)).every((r) => !r.blue), `${mode}：引用后面的正文不应是蓝色`);
+    assert(/<w:t[^>]*>\[23\]<\/w:t><\/w:r><w:r>(?:(?!<\/w:r>)[\s\S])*<w:t[^>]*>\. While/.test(xml), `${mode}：[23] 与后面的正文紧挨着，中间不多出空格`);
+  }
+});
+
 // ---------------------------------------------------------------------------
 console.log("\n代理主循环（模拟模型）");
 // ---------------------------------------------------------------------------
@@ -1085,7 +1145,7 @@ await test("所有夹具 PDF：两种排版方式都不报错、文字完整；L
   const run = promisify(execFile);
   const soffice = process.env.SOFFICE_PATH || "soffice";
   const hasSoffice = await run(soffice, ["--version"]).then(() => true, () => false);
-  const names = ["columns", "journal", "figures", "math", "journal-front", "journal-eq", "journal-fig", "bios", "colstart", "signature"];
+  const names = ["columns", "journal", "figures", "math", "journal-front", "journal-eq", "journal-fig", "bios", "colstart", "signature", "citecolor"];
   const dir = await fs.mkdtemp(path.join(tmp, "pages-"));
   const bad: string[] = [];
   for (const name of names) {
@@ -1170,7 +1230,7 @@ await test("首字下沉与正文同基线时仍识别为首字下沉；多行�
   }
 });
 
-await test("合同签字页：左右并排的签字标签、无框表头不当成双栏；描边的小方框还原为 ☐ / ☒；比表头文字长的填写线不当成下划线", async () => {
+await test("合同签字页：左右并排的签字标签、无框表头不当成双栏；描边的小方框还原为 ☐ / ☒；比表头文字长的填写线不当成下划线；两行页脚、主动换页、连着的填写线（可编辑排版）", async () => {
   const { pdfToDocx } = await import("../src/services/pdfConvert/index.js");
   const pdf = await fixture("signature.pdf");
   for (const mode of ["exact", "flow"] as const) {
@@ -1197,6 +1257,23 @@ await test("合同签字页：左右并排的签字标签、无框表头不当�
     if (mode === "exact") {
       eq((xml.match(/name="直线 /g) ?? []).length, 26, "逐页保留：线条数");
       eq((xml.match(/<wp:extent cx="0" /g) ?? []).length, 2, "逐页保留：竖线数");
+    }
+    // 紧挨着的两行页脚（"Consulting Agreement" / "Page N"）：是页脚，不留在正文里
+    // （逐页保留：页面绝对坐标的文本框；可编辑排版：真正的页脚，正文里不再夹着页脚和它上方的大段空白）
+    const pkg = new ZipPackage(data);
+    assert(!xml.replace(/<w:txbxContent>[\s\S]*?<\/w:txbxContent>/g, "").includes("Consulting Agreement"), `${mode}：页脚不应留在正文里`);
+    if (mode === "flow") {
+      assert(pkg.names().some((n) => /^word\/footer\d*\.xml$/.test(n) && pkg.readText(n).includes("Consulting Agreement")), "可编辑排版：页脚应写进页脚部件");
+      // 原文在 "[Signatures to follow on next page]" 之后主动换页：保留分页符，签字页不被提到上一页
+      const brk = xml.indexOf('w:val="PageStart"');
+      assert(brk > xml.indexOf("[Signatures to follow on next page]") && brk < xml.indexOf("This Agreement takes effect"), "可编辑排版：签字页之前应保留分页符");
+      eq((xml.match(/w:val="PageStart"/g) ?? []).length, 1, "可编辑排版：只在主动换页处分页");
+      // 连着的三条相同的填写线（段落下边框）：相邻两段边框、缩进都相同会被 Word / LibreOffice 并成一条，中间要隔开
+      const blocks = (xml.match(/<w:p [^>]*>[\s\S]*?<\/w:p>/g) ?? []).map((p) => ({ bdr: p.includes("<w:pBdr>"), ind: p.match(/<w:ind [^>]*\/>/)?.[0] ?? "" }));
+      assert(!blocks.some((b, i) => i > 0 && b.bdr && blocks[i - 1].bdr && b.ind === blocks[i - 1].ind), "可编辑排版：相同的填写线不应相邻（会被合并成一条）");
+      const sameInd = new Map<string, number>();
+      for (const b of blocks) if (b.bdr) sameInd.set(b.ind, (sameInd.get(b.ind) ?? 0) + 1);
+      assert([...sameInd.values()].some((n) => n >= 3), "可编辑排版：三条相同的填写线都应保留");
     }
   }
 });

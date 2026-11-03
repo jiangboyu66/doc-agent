@@ -73,6 +73,8 @@ export interface ExportOutcome {
   /** 这次导出是否可能损失版式细节（跨格式转换） */
   lossy: boolean;
   note: string;
+  /** PDF → Word 只转换了一部分页时：转换的页码（"1–20"） */
+  pageRange?: string;
 }
 
 /**
@@ -84,6 +86,8 @@ export interface ExportOptions {
   pdfMode?: "exact" | "flow";
   /** PDF → Word 的转换引擎 */
   pdfEngine?: "builtin" | "pdf2docx" | "libreoffice";
+  /** PDF → Word：只转换这些页（"1-20"、"1-5,8,10-12"）；省略时转换全部 */
+  pdfPages?: string;
 }
 
 export async function exportDocument(current: Buffer, from: DocFormat, to: ExportFormat, opts: ExportOptions = {}): Promise<ExportOutcome> {
@@ -94,8 +98,8 @@ export async function exportDocument(current: Buffer, from: DocFormat, to: Expor
   if (from === "pdf") {
     // PDF → Word：内置版面重建引擎；再从 Word 转 HTML / Markdown
     const { pdfToDocx, describeReport } = await import("./pdfConvert/index.js");
-    const { data, report } = await pdfToDocx(current, { mode: opts.pdfMode ?? "exact", engine: opts.pdfEngine ?? "builtin" });
-    if (to === "docx") return { data, ext: "docx", lossy: true, note: describeReport(report) };
+    const { data, report } = await pdfToDocx(current, { mode: opts.pdfMode ?? "exact", engine: opts.pdfEngine ?? "builtin", pages: opts.pdfPages });
+    if (to === "docx") return { data, ext: "docx", lossy: true, note: describeReport(report), pageRange: report.pageRange };
     const fromArg = "docx", toArg = to === "markdown" ? "gfm" : to;
     const extra = to === "html" ? ["--standalone", "--metadata", "title=Document"] : [];
     const out = await pandoc(data, fromArg, toArg, extOf[to], extra);
