@@ -217,16 +217,47 @@ export function detectFigures(pg: PageModel, bodySize: number, tableBoxes: Box[]
     return boxes;
   };
   merged.push(...mergeAll(figs.sort((a, b) => a.y0 - b.y0).map((f) => ({ ...f }))));
+  // 同一行上、本身不足以判定为图的零散图元（示意图里单独的一个圆圈、圆圈旁的小图）：
+  // 与已判定的图之间只隔着箭头、省略号这类符号（没有成词的文字）时并入，否则一幅图被切成"一段渲染 + 几段文字和图片"
+  const weak = clusters.filter((c) => !figs.some((f) => overlapArea(f, c.box) > 0) && c.els.some((e) => e.curvy || e.image)
+    && c.box.x1 - c.box.x0 >= 6 && c.box.y1 - c.box.y0 >= 6).map((c) => c.box);
+  const symbolsOnly = (a: Box, b: Box) => {
+    const gx0 = Math.min(a.x1, b.x1), gx1 = Math.max(a.x0, b.x0);
+    const gy0 = Math.max(a.y0, b.y0), gy1 = Math.min(a.y1, b.y1);
+    return !pg.spans.some((s) => { const cx = (s.x0 + s.x1) / 2, cy = (s.top + s.bottom) / 2;
+      return cx > gx0 && cx < gx1 && cy > gy0 - 2 && cy < gy1 + 2 && /\p{L}{3,}/u.test(s.text); });
+  };
+  for (let k = 0; k < merged.length; k++) {
+    for (let changed = true; changed; ) {
+      changed = false;
+      const r = merged[k];
+      for (let i = 0; i < weak.length; i++) {
+        const c = weak[i];
+        const ov = Math.min(r.y1, c.y1) - Math.max(r.y0, c.y0);
+        const gap = Math.max(r.x0, c.x0) - Math.min(r.x1, c.x1);
+        if (ov < 0.5 * Math.min(r.y1 - r.y0, c.y1 - c.y0) || gap > 0.15 * pg.width || !symbolsOnly(r, c)) continue;
+        merged[k] = union(r, c);
+        weak.splice(i, 1);
+        changed = true;
+        break;
+      }
+    }
+  }
   for (const r0 of merged) {
     let r = { ...r0 };
     for (let iter = 0; iter < 4; iter++) {
       let grown = false;
       for (const s of pg.spans) {
         if (centerIn(s, r, 0.5)) { const u = union(r, spanBox(s)); if (area(u) > area(r) + 0.01) { r = u; grown = true; } continue; }
-        // 图边的小字标注：字号明显小于正文、紧贴图框、不是题注
-        if (s.size < 0.9 * bodySize && near(spanBox(s), r, 6) && !CAPTION.test(s.text)) {
+        // 图边的小字标注：字号小于正文（正文 10 pt、图中 9 pt 的 \small 也算）、紧贴图框、不是题注
+        if (s.size < 0.92 * bodySize && near(spanBox(s), r, 6) && !CAPTION.test(s.text)) {
           r = union(r, spanBox(s)); grown = true;
         }
+      }
+      // 坐标轴的竖排标题（旋转文字不转换）：紧贴图框的一并包进图里，渲染时画出来，否则图丢了纵轴标题
+      for (const t of pg.rotated ?? []) {
+        if (inside(t, r, 0.5) || !near(t, r, 8) || t.size > 1.5 * bodySize) continue;
+        r = union(r, t); grown = true;
       }
       if (!grown) break;
     }

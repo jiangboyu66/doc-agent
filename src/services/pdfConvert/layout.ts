@@ -301,8 +301,16 @@ function attachMarks(groups: Array<{ spans: Span[]; top: number; bottom: number;
       const gx0 = Math.min(...g.spans.map((x) => x.x0)), gx1 = Math.max(...g.spans.map((x) => x.x1));
       // 行末的上标（i 的 th）可能略超出正文行
       if (gx0 < hx0 - 2 || gx1 > hx1 + 2.5 * hs) continue;
-      const d = Math.abs(h.baseline - g.baseline);
-      if (d > 0.75 * hs) continue;
+      let d = Math.abs(h.baseline - g.baseline);
+      // 根号的基线比所在行高，可能离上一行更近：与该行的文字横向重叠（压在字上）、而另一行紧接着就是被开方的式子时，
+      // 属于后者（"squared error √‖x − x̂‖²" 的根号被并进上一行，上一行中间出现大段空白、根号与式子分离）
+      let radicand = false;
+      if (allAccent && g.spans.some((x) => isRadical(x.text))) {
+        const clash = g.spans.some((x) => h.spans.some((o) => Math.min(o.x1, x.x1) - Math.max(o.x0, x.x0) > 0.3 * Math.min(o.x1 - o.x0, x.x1 - x.x0)));
+        radicand = g.spans.some((x) => isRadical(x.text) && h.spans.some((o) => o.x0 >= x.x1 - 1.5 && o.x0 <= x.x1 + 2 && o.bottom > x.bottom));
+        if (clash && !radicand) d += hs;
+      }
+      if (d > (radicand ? 1.0 : 0.75) * hs) continue;
       if (d < best) { best = d; host = h; }
     }
     if (!host) continue;
@@ -773,13 +781,20 @@ function lineMeasure(l: Line): { actual: number; natural: number; word: number; 
   let spans = l.spans;
   if (spans.length > 1 && BULLET.test(spans[0].text.trim()) && spans[1].x0 - spans[0].x1 > 0.45 * l.size) spans = spans.slice(1);
   if (spans.some((s) => !s.natural)) return null;
-  let natural = 0, word = 0, chars = 0;
+  let natural = 0, word = 0, chars = 0, tabGaps = 0, reach = -Infinity;
   spans.forEach((s, i) => {
     natural += s.natural!;
     word += s.wordW ?? s.natural!;
     chars += s.text.length;
+    const before = reach;
+    reach = Math.max(reach, s.x1);
     if (i > 0) {
       const gap = s.x0 - spans[i - 1].x1;
+      // 制表间距（并排的几位作者的邮箱、"公式 … 编号"）不是字距：不计入实际宽度，否则整行被算成"加宽"，
+      // 每个字都被加上字符间距、在 Word 里变宽后互相挤到下一行。
+      // 以此前所有文字的最右端为准：与前文重叠的符号（伸进上一行的根号）后面不算空隙
+      const open = s.x0 - before;
+      if (open > Math.max(1.2 * l.size, 12)) { tabGaps += open; return; }
       if (gap > 0.1 * s.size && !/\s$/.test(spans[i - 1].text) && !/^\s/.test(s.text)) {
         natural += Math.min(s.spaceW ?? 0.25 * s.size, spans[i - 1].spaceW ?? 0.25 * s.size);
         word += Math.min(s.wordSpaceW ?? s.spaceW ?? 0.25 * s.size, spans[i - 1].wordSpaceW ?? spans[i - 1].spaceW ?? 0.25 * s.size);
@@ -787,7 +802,7 @@ function lineMeasure(l: Line): { actual: number; natural: number; word: number; 
       }
     }
   });
-  return { actual: spans[spans.length - 1].x1 - spans[0].x0, natural, word, chars };
+  return { actual: spans[spans.length - 1].x1 - spans[0].x0 - tabGaps, natural, word, chars };
 }
 
 /** 行被拉伸的程度：实际宽度 / 自然宽度（无法测量时为 null） */
