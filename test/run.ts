@@ -552,6 +552,49 @@ await test("只转换部分页：页码范围写法；导出 / 会话内转换�
   assert(String(r2.content).includes("第 2–3 页"), `重新转换应沿用页码范围：${r2.content}`);
 });
 
+await test("LaTeX 论文：裁剪图片按 BBox / 裁剪框取可见部分，示意图整体成图，纵轴竖排标题与刻度包进图里，打字机字体的邮箱收紧到原宽度", async () => {
+  const { pdfToDocx } = await import("../src/services/pdfConvert/index.js");
+  const { extractPdf } = await import("../src/services/pdfConvert/extract.js");
+  const pdf = await fixture("texpaper.pdf");
+  // 提取：表单 XObject 的 BBox、带多余 moveto 的裁剪路径都要生效
+  const [pg] = await extractPdf(pdf);
+  const boxes = pg.images.map((im) => [im.x0, im.y0, im.x1, im.y1].map((v) => Math.round(v)));
+  assert(boxes.some((b) => b.join() === "312,320,462,520"), `\\includegraphics[clip] 的图只取 BBox 内的 150 × 200：${JSON.stringify(boxes)}`);
+  for (const x of [182, 343, 432]) assert(boxes.some((b) => b.join() === `${x},610,${x + 20},630`), `节点旁的小图只取裁剪框内的 20 × 20：${JSON.stringify(boxes)}`);
+  assert(boxes.every((b) => b[2] - b[0] <= 201), `没有未裁剪的大图：${JSON.stringify(boxes)}`);
+  const EMU = 12700;
+  for (const mode of ["exact", "flow"] as const) {
+    const { data, report } = await pdfToDocx(pdf, { mode });
+    eq(report.textCoverage, 1, `${mode}：文字完整性`);
+    const xml = new ZipPackage(data).readText("word/document.xml");
+    const texts = (xml.match(/<w:t[^>]*>[^<]*<\/w:t>/g) ?? []).map((t) => t.replace(/<[^>]+>/g, "")).join("|");
+    // 图片尺寸：最宽的是左边 200 pt 的图，裁剪后的图不应比原文大
+    const widths = [...xml.matchAll(/<wp:extent cx="(\d+)"/g)].map((m) => Number(m[1]) / EMU);
+    assert(widths.every((w) => w <= 400), `${mode}：图片宽度 ${widths.map((w) => w.toFixed(0)).join(",")}`);
+    // 示意图整体渲染成一幅图：节点之间的省略号、节点里的字母不再散落成文字
+    assert(!texts.includes("· · ·"), `${mode}：示意图的省略号不应成为正文文字`);
+    // 曲线图：刻度数字不散落到图外
+    assert(!/\|(?:2|4|6|8)\|/.test(texts) && !texts.includes("|200|"), `${mode}：刻度数字应在图里：${texts.slice(-200)}`);
+    // 打字机字体：Courier New 收紧到原宽度（-0.75 pt/字），不能被加宽
+    const mono = (xml.match(/<w:r>(?:(?!<\/w:r>)[\s\S])*Courier New(?:(?!<\/w:r>)[\s\S])*<\/w:r>/g) ?? []).filter((r) => /<w:t[^>]*>[^<]*[@/][^<]*<\/w:t>/.test(r));
+    assert(mono.length >= 4, `${mode}：邮箱与网址应是 Courier New：${mono.length}`);
+    for (const r of mono) {
+      const sp = Number(r.match(/<w:spacing w:val="(-?\d+)"/)?.[1] ?? 0);
+      assert(sp <= -12 && sp >= -18, `${mode}：等宽文字的字符间距应约为 -15（-0.75 pt）：${sp} ${r.replace(/<[^>]+>/g, "")}`);
+    }
+    if (mode === "exact") {
+      // 三个邮箱在同一段、以制表位分隔（不折行）
+      const para = (xml.match(/<w:p [^>]*>(?:(?!<\/w:p>)[\s\S])*alicezhang@(?:(?!<\/w:p>)[\s\S])*<\/w:p>/) ?? [""])[0];
+      assert(para.includes("boli@") && para.includes("carols@") && !para.includes("<w:br"), "exact：三个邮箱在同一行");
+      // 曲线图的图片包含左侧竖排的纵轴标题（x ≈ 148 pt）
+      const anchors = [...xml.matchAll(/<wp:anchor[\s\S]*?<\/wp:anchor>/g)].map((m) => m[0]).filter((a) => /descr="[^"]*200[^"]*400/.test(a));
+      assert(anchors.length === 1, `exact：曲线图应是一幅图：${anchors.length}`);
+      const h = Number(anchors[0].match(/<wp:positionH relativeFrom="page"><wp:posOffset>(-?\d+)</)?.[1] ?? NaN) / EMU;
+      assert(h <= 149, `exact：曲线图左边缘应包含纵轴标题：${h.toFixed(1)}`);
+    }
+  }
+});
+
 await test("期刊里蓝色的引用编号：只有编号是蓝色，同一文字项里后面的黑色正文不被染蓝（两种模式）", async () => {
   const { pdfToDocx } = await import("../src/services/pdfConvert/index.js");
   const pdf = await fixture("citecolor.pdf");
@@ -1145,7 +1188,7 @@ await test("所有夹具 PDF：两种排版方式都不报错、文字完整；L
   const run = promisify(execFile);
   const soffice = process.env.SOFFICE_PATH || "soffice";
   const hasSoffice = await run(soffice, ["--version"]).then(() => true, () => false);
-  const names = ["columns", "journal", "figures", "math", "journal-front", "journal-eq", "journal-fig", "bios", "colstart", "signature", "citecolor"];
+  const names = ["columns", "journal", "figures", "math", "journal-front", "journal-eq", "journal-fig", "bios", "colstart", "signature", "citecolor", "texpaper"];
   const dir = await fs.mkdtemp(path.join(tmp, "pages-"));
   const bad: string[] = [];
   for (const name of names) {

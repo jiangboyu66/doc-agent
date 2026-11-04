@@ -103,6 +103,8 @@ export interface PageModel {
   /** 图像蒙版（Type 3 位图字形等） */
   masks: MaskBox[];
   rotatedText: number;
+  /** 旋转文字（坐标轴的竖排标题等）的外接框：本身不转换，但图区域要把它们包进来，渲染时一并画出 */
+  rotated?: Array<{ x0: number; y0: number; x1: number; y1: number; size: number }>;
 }
 
 type M = [number, number, number, number, number, number];
@@ -445,8 +447,10 @@ async function extractPage(page: any, index: number, OPS: any, Util: any): Promi
       case OPS.endPath: pendingPath = []; break;
       case OPS.clip: case OPS.eoClip: {
         // 裁剪区域只取水平 / 竖直的矩形（照片的取景框）；其他形状的裁剪不处理
-        const pts = pendingPath.flatMap((sp) => sp.pts);
-        const rectLike = pendingPath.length > 0 && pendingPath.every((sp) => sp.kind === "rect" || (!sp.curved && sp.pts.length >= 4 && sp.pts.every((pt, i) => {
+        // 只有一个点的子路径（pdfTeX 在 closepath 之后又写了一个 moveto）不构成形状，忽略
+        const subs = pendingPath.filter((sp) => sp.kind === "rect" || sp.pts.length >= 2);
+        const pts = subs.flatMap((sp) => sp.pts);
+        const rectLike = subs.length > 0 && subs.every((sp) => sp.kind === "rect" || (!sp.curved && sp.pts.length >= 4 && sp.pts.every((pt, i) => {
           const q = sp.pts[(i + 1) % sp.pts.length];
           return Math.abs(pt[0] - q[0]) < 0.05 || Math.abs(pt[1] - q[1]) < 0.05;
         })));
@@ -457,6 +461,26 @@ async function extractPage(page: any, index: number, OPS: any, Util: any): Promi
         }
         break;
       }
+      // 表单 XObject（LaTeX \includegraphics[trim, clip] 插入的 PDF / 图片都包在其中）：自带变换矩阵，
+      // 并按 BBox 裁剪。不处理时，裁剪掉的部分也会被当成图片的一部分，图片比原文大一圈、盖住旁边的图和文字
+      case OPS.paintFormXObjectBegin: {
+        stack.push({ ...gs, ctm: [...gs.ctm] as M });
+        const [matrix, bbox] = (args ?? []) as [ArrayLike<number> | null, ArrayLike<number> | null];
+        if (matrix && matrix.length === 6) gs.ctm = mul(gs.ctm, Array.from(matrix) as M);
+        if (bbox && bbox.length === 4) {
+          const [bx0, by0, bx1, by1] = Array.from(bbox);
+          const cs = [toPage(bx0, by0), toPage(bx1, by0), toPage(bx1, by1), toPage(bx0, by1)];
+          // 只取映射后仍是水平 / 竖直矩形的 BBox（旋转的表单不裁剪）
+          const axis = Math.abs(cs[0][1] - cs[1][1]) < 0.05 || Math.abs(cs[0][0] - cs[1][0]) < 0.05;
+          if (axis) {
+            const c = { x0: Math.min(...cs.map((p) => p[0])), y0: Math.min(...cs.map((p) => p[1])), x1: Math.max(...cs.map((p) => p[0])), y1: Math.max(...cs.map((p) => p[1])) };
+            const o = gs.clip;
+            gs = { ...gs, clip: o ? { x0: Math.max(o.x0, c.x0), y0: Math.max(o.y0, c.y0), x1: Math.min(o.x1, c.x1), y1: Math.min(o.y1, c.y1) } : c };
+          }
+        }
+        break;
+      }
+      case OPS.paintFormXObjectEnd: gs = stack.pop() ?? gs; break;
       case OPS.paintImageMaskXObject: {
         try { addMask(gs.ctm, await maskData(args[0])); } catch { /* 忽略损坏的蒙版 */ }
         break;
@@ -568,6 +592,10 @@ async function extractPage(page: any, index: number, OPS: any, Util: any): Promi
     if (size < 0.5) continue;
     if (Math.abs(t[1]) > 0.01 * size || Math.abs(t[2]) > 0.01 * size) {
       model.rotatedText++;
+      const em = Math.hypot(it.transform[0], it.transform[1]) || size;
+      const wEm = (it.width || em * it.str.length * 0.5) / em;
+      const cs = [apply(t, 0, -0.22), apply(t, wEm, -0.22), apply(t, 0, 0.85), apply(t, wEm, 0.85)];
+      (model.rotated ??= []).push({ x0: Math.min(...cs.map((c) => c[0])), y0: Math.min(...cs.map((c) => c[1])), x1: Math.max(...cs.map((c) => c[0])), y1: Math.max(...cs.map((c) => c[1])), size });
       continue;
     }
     const style = tc.styles[it.fontName] ?? {};
@@ -671,6 +699,13 @@ async function extractPage(page: any, index: number, OPS: any, Util: any): Promi
       const sym = mapSymbolFont(expandLigatures((spaced ? pc.str.replace(/ /g, "") : pc.str).replace(/\u00ad/g, "")), fi.family);
       if (!sym.text.trim()) continue;
       const bold = fi.bold || pc.fakeBold, w = pc.x1 - pc.x0, nat = pc.natural;
+      const wordW = measureWord(sym.text, sym.font, bold, fi.italic, Math.round(size * 2) / 2) ?? undefined;
+      const chars = Math.max(1, sym.text.length);
+      // 等宽字体被替换成更宽的 Courier New（TeX 的打字机字体 CMTT / SFTT 每字 0.525 em，Courier New 是 0.6 em）：
+      // 按差值收紧字符间距，使文字仍占原来的宽度，否则并排的作者邮箱、居中的网址会互相挤压、折到下一行。
+      // 等宽字体每个字的差值相同，同字号的片段收紧量一致，不会把文字切成碎片；比例字体由段落的不折行校验处理
+      const fit = sym.font === "Courier New" && nat && wordW && !spaced && wordW > 1.04 * Math.min(w, nat)
+        ? Math.max(-0.12 * size, (Math.min(w, nat) - wordW) / chars) : undefined;
       model.spans.push({
         text: sym.text,
         x0: pc.x0, x1: pc.x1,
@@ -687,12 +722,12 @@ async function extractPage(page: any, index: number, OPS: any, Util: any): Promi
         rawFont: rawNames.get(it.fontName),
         math: fi.math,
         type3: isType3(it.fontName) || undefined,
-        wordW: measureWord(sym.text, sym.font, bold, fi.italic, Math.round(size * 2) / 2) ?? undefined,
+        wordW,
         wordSpaceW: measureWord(" ", sym.font, bold, fi.italic, Math.round(size * 2) / 2) ?? undefined,
         smallCaps: smallCaps || (isSmallCapsFont(rawNames.get(it.fontName)) && /[a-z]/.test(sym.text) && !/[A-Z]/.test(sym.text)) || undefined,
         // 字距加宽 / 紧缩：pdf.js 插了空格的逐字母排列，或单个词（不受两端对齐的词间距影响）的实际宽度明显偏离自然宽度
         tracking: nat && (spaced || (!/\s/.test(sym.text) && sym.text.length >= 3 && Math.abs(w / nat - 1) > 0.12))
-          ? (w - nat) / Math.max(1, sym.text.length) : undefined,
+          ? (w - (wordW && wordW > 1.04 * nat ? wordW : nat)) / chars : fit,
       });
     }
   }
