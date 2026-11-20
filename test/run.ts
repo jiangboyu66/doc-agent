@@ -1188,7 +1188,7 @@ await test("所有夹具 PDF：两种排版方式都不报错、文字完整；L
   const run = promisify(execFile);
   const soffice = process.env.SOFFICE_PATH || "soffice";
   const hasSoffice = await run(soffice, ["--version"]).then(() => true, () => false);
-  const names = ["columns", "journal", "figures", "math", "journal-front", "journal-eq", "journal-fig", "bios", "colstart", "signature", "citecolor", "texpaper"];
+  const names = ["columns", "journal", "figures", "math", "journal-front", "journal-eq", "journal-fig", "bios", "colstart", "signature", "citecolor", "texpaper", "contract-cn", "scan-letter"];
   const dir = await fs.mkdtemp(path.join(tmp, "pages-"));
   const bad: string[] = [];
   for (const name of names) {
@@ -1269,7 +1269,8 @@ await test("首字下沉与正文同基线时仍识别为首字下沉；多行�
     const xml = new ZipPackage(data).readText("word/document.xml");
     const title = (xml.match(/<w:p [^>]*>(?:(?!<\/w:p>)[\s\S])*?A Physical-Flow-Based Approach(?:(?!<\/w:p>)[\s\S])*?<\/w:p>/) ?? [""])[0];
     assert(/<w:jc w:val="center"\/>/.test(title), `${mode}：两行居中的标题应居中（版心被页码撑宽也不影响）`);
-    assert(/\[2\]\s*(<[^>]+>)*\s*——/.test(xml.replace(/<w:tab\/>/g, " ")), `${mode}：画成短横线的破折号应还原为 "——"`);
+    // 参考文献编号 "[2]" 与正文之间是制表符（悬挂缩进的列表）：编号与破折号之间可以隔着制表符所在的 run
+    assert(/\[2\](\s|<[^>]+>)*——/.test(xml.replace(/<w:tab\/>/g, " ")), `${mode}：画成短横线的破折号应还原为 "——"`);
   }
 });
 
@@ -1318,6 +1319,61 @@ await test("合同签字页：左右并排的签字标签、无框表头不当�
       for (const b of blocks) if (b.bdr) sameInd.set(b.ind, (sameInd.get(b.ind) ?? 0) + 1);
       assert([...sameInd.values()].some((n) => n >= 3), "可编辑排版：三条相同的填写线都应保留");
     }
+  }
+});
+
+await test("中文合同（律所草稿）：1.5 倍行距的条款合成一段、多级编号悬挂缩进；高亮的方括号占位符是可编辑文字；紧贴正文的左右两行页脚；跨页条款", async () => {
+  const { pdfToDocx } = await import("../src/services/pdfConvert/index.js");
+  const pdf = await fixture("contract-cn.pdf");
+  const truth: string[] = JSON.parse(await fs.readFile(path.join(here, "fixtures", "contract-cn.truth.json"), "utf8"));
+  const norm = (s: string) => s.replace(/[\s\u3000\u00a0]/g, "");
+  for (const mode of ["exact", "flow"] as const) {
+    const { data, report } = await pdfToDocx(pdf, { mode });
+    eq(report.textCoverage, 1, `${mode}：文字完整性，缺失：${report.missing}`);
+    // 占位符背后的高亮矩形不是图形：不截成图片
+    eq(report.images + report.figures, 0, `${mode}：占位符不应变成图片`);
+    const pkg = new ZipPackage(data);
+    const xml = pkg.readText("word/document.xml");
+    assert(!xml.includes("<pic:pic>"), `${mode}：文档里不应有图片`);
+    const body = xml.replace(/<w:txbxContent>[\s\S]*?<\/w:txbxContent>/g, "");
+    const paras = (body.match(/<w:p [^>]*>[\s\S]*?<\/w:p>/g) ?? []).map((p) => norm(p.replace(/<[^>]+>/g, ""))).filter(Boolean);
+    // 条款完整：每个条款恰好是一段。逐页保留模式每页独立，跨页的条款（1.5 跨第 1、2 页，第 2、3 页之间还有一条）按页分成两段
+    const left = new Map<string, number>();
+    for (const p of paras) left.set(p, (left.get(p) ?? 0) + 1);
+    const split = truth.filter((t) => { const k = norm(t), n = left.get(k) ?? 0; if (n) left.set(k, n - 1); return !n; });
+    assert(split.length <= (mode === "flow" ? 0 : 2), `${mode}：${split.length} 个条款被切开：${split.map((t) => t.slice(0, 12)).join(" | ")}`);
+    // 占位符是文字（个数与原文一致），并保留黄色突出显示
+    const all = paras.join("");
+    for (const ph of ["[30日]", "[]", "[●]"]) eq(all.split(ph).length - 1, truth.join("").replace(/\s/g, "").split(ph).length - 1, `${mode}：占位符 ${ph} 的个数`);
+    assert((xml.match(/<w:highlight w:val="yellow"\/>/g) ?? []).length >= 8, `${mode}：占位符应保留黄色突出显示`);
+    // 两行页脚（左 "保密文件 · 律师工作草稿"、右 "第 N 页 / 共 3 页"）紧挨着正文末行：是页脚，不留在正文里、不截断跨页的条款
+    assert(!paras.some((p) => p.includes("保密文件") || /第\d页\/共3页/.test(p)), `${mode}：页脚不应留在正文里`);
+    if (mode === "flow") {
+      const foot = pkg.names().filter((n) => /^word\/footer\d*\.xml$/.test(n)).map((n) => pkg.readText(n)).find((t) => t.includes("保密文件")) ?? "";
+      assert(foot, "可编辑排版：页脚应写进页脚部件");
+      // "第 N 页 / 共 3 页"：页码与总页数都是域，重新分页、增删内容后仍然正确
+      assert(/instr=" PAGE "/.test(foot) && /instr=" NUMPAGES "/.test(foot), "可编辑排版：页脚的页码、总页数应为 PAGE / NUMPAGES 域");
+      // 悬挂缩进：编号后是制表符，续行与正文对齐
+      const p11 = (xml.match(/<w:p [^>]*>[\s\S]*?<\/w:p>/g) ?? []).find((p) => />1\.1<\/w:t>/.test(p)) ?? "";
+      assert(/w:hanging="\d+"/.test(p11) && p11.includes("<w:tab/>"), "可编辑排版：条款 1.1 应为悬挂缩进、编号后接制表符");
+    }
+  }
+});
+
+await test("扫描件：整页扫描图按页面坐标铺满原页（不再 3 页变 6 页）；OCR 隐藏文字层不转成正文；上下两条拼成的整页", async () => {
+  const { pdfToDocx } = await import("../src/services/pdfConvert/index.js");
+  const pdf = await fixture("scan-letter.pdf");
+  for (const mode of ["exact", "flow"] as const) {
+    const { data, report } = await pdfToDocx(pdf, { mode });
+    const xml = new ZipPackage(data).readText("word/document.xml");
+    eq((xml.match(/<wp:inline/g) ?? []).length, 0, `${mode}：整页扫描图不应作为行内图片（比版心高，会被挤到下一页）`);
+    eq((xml.match(/<pic:pic>/g) ?? []).length, 4, `${mode}：4 张扫描图（第 3 页上下两条）都保留`);
+    eq((xml.match(/<wp:positionV relativeFrom="page">/g) ?? []).length, 4, `${mode}：扫描图按页面坐标定位`);
+    // 第 2、3 页各从新的一页开始（可编辑排版下扫描页没有文字流，不强制分页会叠在同一页上）
+    eq((xml.match(/w:val="PageStart"/g) ?? []).length, 2, `${mode}：每页扫描图各占一页`);
+    // OCR 识别层看不见：不转成正文（否则与图里的字重叠成两层）
+    eq((xml.match(/<w:t(?: [^>]*)?>[^<]*<\/w:t>/g) ?? []).map((t) => t.replace(/<[^>]+>/g, "")).join("").trim(), "", `${mode}：OCR 识别层不应转成正文`);
+    assert(report.notes.some((n) => n.includes("OCR")), `${mode}：报告应说明 OCR 识别层未转换：${report.notes.join(" | ")}`);
   }
 });
 

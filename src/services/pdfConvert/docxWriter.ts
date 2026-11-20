@@ -24,6 +24,13 @@ const NS =
   'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml" ' +
   'xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape" mc:Ignorable="w14"';
 
+/** Word 突出显示（w:highlight）的颜色 */
+const HIGHLIGHT: Record<string, string> = {
+  FFFF00: "yellow", "00FF00": "green", "00FFFF": "cyan", FF00FF: "magenta", "0000FF": "blue", FF0000: "red",
+  "000080": "darkBlue", "008080": "darkCyan", "008000": "darkGreen", "800080": "darkMagenta", "800000": "darkRed",
+  "808000": "darkYellow", "808080": "darkGray", C0C0C0: "lightGray", "000000": "black",
+};
+
 class Writer {
   private media: Array<{ name: string; data: Buffer; rid: string; part: string }> = [];
   /** 当前正在生成的部件（图片关系写进该部件的 .rels） */
@@ -61,7 +68,11 @@ class Writer {
     if (r.spacing) parts.push(`<w:spacing w:val="${Math.round(r.spacing * 20)}"/>`);
     const hp = Math.max(2, Math.round(r.size * 2));
     parts.push(`<w:sz w:val="${hp}"/><w:szCs w:val="${hp}"/>`);
+    // 底色：Word 突出显示的 16 种颜色写成突出显示（可用"文本突出显示颜色"一键去掉），其余写成字符底纹
+    const hl = r.shade ? HIGHLIGHT[r.shade.toUpperCase()] : undefined;
+    if (hl) parts.push(`<w:highlight w:val="${hl}"/>`);
     if (r.underline) parts.push('<w:u w:val="single"/>');
+    if (r.shade && !hl) parts.push(`<w:shd w:val="clear" w:color="auto" w:fill="${r.shade}"/>`);
     if (r.vertAlign) parts.push(`<w:vertAlign w:val="${r.vertAlign}"/>`);
     return `<w:rPr>${parts.join("")}</w:rPr>`;
   }
@@ -82,7 +93,7 @@ class Writer {
     // 逐行一致模式的排版换行：clear="none"（与普通换行等效）作为标记，编辑时可识别并去掉
     if (r.br) return `<w:r>${this.rPr(r)}<w:br w:clear="none"/></w:r>`;
     if (r.pageMark) return "<w:r><w:lastRenderedPageBreak/></w:r>";
-    if (r.field === "PAGE") return `<w:fldSimple w:instr=" PAGE "><w:r>${this.rPr(r)}<w:t>${esc(r.text)}</w:t></w:r></w:fldSimple>`;
+    if (r.field) return `<w:fldSimple w:instr=" ${r.field} "><w:r>${this.rPr(r)}<w:t>${esc(r.text)}</w:t></w:r></w:fldSimple>`;
     return `<w:r>${this.rPr(r)}<w:t xml:space="preserve">${esc(clean(r.text))}</w:t></w:r>`;
   }
 
