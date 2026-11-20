@@ -44,6 +44,8 @@ export interface Span {
   smallCaps?: boolean;
   /** 字距加宽的文字（"A R T I C L E"）每个字符之后的额外间距（pt） */
   tracking?: number;
+  /** 文字底色（Word 的突出显示 / 字符底纹，PDF 里是紧贴文字的填充矩形），RRGGBB */
+  bg?: string;
 }
 
 /**
@@ -103,6 +105,8 @@ export interface PageModel {
   /** 图像蒙版（Type 3 位图字形等） */
   masks: MaskBox[];
   rotatedText: number;
+  /** 压在扫描图上的不可见文字（OCR 识别层，文字渲染模式 3 / 7）的字符数：不转成正文 */
+  ocrChars?: number;
   /** 旋转文字（坐标轴的竖排标题等）的外接框：本身不转换，但图区域要把它们包进来，渲染时一并画出 */
   rotated?: Array<{ x0: number; y0: number; x1: number; y1: number; size: number }>;
 }
@@ -277,7 +281,7 @@ async function extractPage(page: any, index: number, OPS: any, Util: any): Promi
   interface GState { ctm: M; fill: string; stroke: string; lw: number; trm: number; clip?: { x0: number; y0: number; x1: number; y1: number } }
   let gs: GState = { ctm: [1, 0, 0, 1, 0, 0], fill: "000000", stroke: "000000", lw: 1, trm: 0 };
   const stack: GState[] = [];
-  const textColors: Array<{ ch: string; color: string; fakeBold: boolean; adv: number; spaceBefore: number; font: string }> = [];
+  const textColors: Array<{ ch: string; color: string; fakeBold: boolean; adv: number; spaceBefore: number; font: string; hidden: boolean }> = [];
   const spaceEm = new Map<string, number>(); // 各字体空格的字宽（em）
   let curFont = "";
   // 字形宽度的单位由字体矩阵决定：多数字体是 1/1000 em，但也有 1/2048（Elsevier 排版的 Charis SIL 等）、
@@ -406,7 +410,7 @@ async function extractPage(page: any, index: number, OPS: any, Util: any): Promi
           const u = uni;
           for (let k = 0; k < u.length; k++) {
             if (!u[k].trim()) continue;
-            textColors.push({ ch: u[k], color: gs.trm === 1 ? gs.stroke : gs.fill, fakeBold: gs.trm === 2, adv: k === 0 ? w : 0, spaceBefore: k === 0 ? pendingSpace : 0, font: curFont });
+            textColors.push({ ch: u[k], color: gs.trm === 1 ? gs.stroke : gs.fill, fakeBold: gs.trm === 2, adv: k === 0 ? w : 0, spaceBefore: k === 0 ? pendingSpace : 0, font: curFont, hidden: gs.trm === 3 || gs.trm === 7 });
           }
           pendingSpace = 0;
         }
@@ -607,7 +611,7 @@ async function extractPage(page: any, index: number, OPS: any, Util: any): Promi
     const fi = infoOf(it.fontName);
 
     // 与操作符流中的字符对齐，取得颜色与"伪粗体"（描边加粗）：用前几个字符在操作符字符流里定位
-    let color = "000000", fakeBold = false, smallCaps = false;
+    let color = "000000", fakeBold = false, smallCaps = false, hidden = false;
     let natural: number | undefined;
     // 一个文字项里颜色 / 伪粗体有变化（行首蓝色的引用编号 "[23]" 接着黑色正文）：pdf.js 按字体合并文字项、不看颜色，
     // 整项取第一个字的颜色会把整行正文染成引用的蓝色。按变化处切成几段，各自的颜色、位置、自然字宽
@@ -655,6 +659,8 @@ async function extractPage(page: any, index: number, OPS: any, Util: any): Promi
           matched++;
         }
         ci = pos;
+        // 不可见的文字（渲染模式 3 / 7：扫描件的 OCR 识别层）
+        if (matched > 0) hidden = textColors.slice(at, at + matched).filter((t) => t.hidden).length > 0.5 * matched;
         if (matched === joined.length && em > 0) {
           // 用 TJ 位移代替空格字形的 PDF：按字体空格宽度补上词间空格
           const inner = spaced ? 0 : (it.str.trim().match(/\s+/g) ?? []).length;
@@ -695,6 +701,14 @@ async function extractPage(page: any, index: number, OPS: any, Util: any): Promi
     }
 
     if (!pieces.length) pieces = [{ str: it.str, x0, x1: x0 + width, color, fakeBold, natural }];
+    // 扫描图上的 OCR 识别层：看不见的文字压在整页扫描图上，转成正文会与图里的字重叠成两层；不转换，只计数
+    if (hidden) {
+      const cx = x0 + width / 2, cy = baseline - 0.3 * size;
+      if (model.images.some((im) => cx >= im.x0 && cx <= im.x1 && cy >= im.y0 && cy <= im.y1)) {
+        model.ocrChars = (model.ocrChars ?? 0) + it.str.replace(/\s/g, "").length;
+        continue;
+      }
+    }
     for (const pc of pieces) {
       const sym = mapSymbolFont(expandLigatures((spaced ? pc.str.replace(/ /g, "") : pc.str).replace(/\u00ad/g, "")), fi.family);
       if (!sym.text.trim()) continue;

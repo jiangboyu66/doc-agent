@@ -6,7 +6,7 @@
  * 以页面绝对坐标贴回原位；区域内的文字保存在图片的替代文字里，并计入完整性报告。
  */
 
-import { encodePng, type ImageBox, type MaskBox, type PageModel, type PathBox, type Span } from "./extract.js";
+import { encodePng, type FillRect, type ImageBox, type MaskBox, type PageModel, type PathBox, type Span } from "./extract.js";
 import { measureWord } from "./fonts.js";
 import type { Line } from "./layout.js";
 
@@ -62,6 +62,66 @@ export function removeInside(pg: PageModel, r: Box): Span[] {
   pg.vectorShapes = Math.max(0, pg.vectorShapes - lostCurvy);
   pg.paths = keep;
   return gone;
+}
+
+// ---------------------------------------------------------------------------
+// 文字底色（突出显示 / 字符底纹）
+// ---------------------------------------------------------------------------
+
+/**
+ * Word 的"突出显示"、字符底纹导出成 PDF 后，是每个文字片段背后一个紧贴文字的填充矩形（中英文字体不同，高度也不同）。
+ * 它们是文字的属性，不是图形：合同草稿里高亮的方括号占位符（[ ]、[30 日]、[●]）背后正是这种矩形——
+ * 当成图形时，几块相邻的彩色矩形被识别成"矢量图"、单独一块被识别成"行内小图标"，连同方括号里的文字一起截成图片，
+ * 律师要填写的位置在 Word 里就改不了了。
+ * 这里把它们认出来：从图形中移除，颜色记到所覆盖的文字上（写成 Word 的突出显示 / 字符底纹）。返回识别出的矩形数。
+ *
+ * 判据：轴对齐的填充矩形，高度与里面文字的字号相当（0.6–2.6 倍），左右紧贴文字（不比文字宽出 0.8 个字），
+ * 文字的基线落在矩形内；没有文字、但与已识别的底色矩形同一行紧挨着的（高亮的空格）也算。表格的单元格底纹比文字宽得多，不受影响
+ */
+export function textHighlights(pg: PageModel): number {
+  const spans = pg.spans.filter((s) => s.text.trim() && !s.img);
+  const hl = new Set<FillRect>();
+  const pending: FillRect[] = [];
+  for (const f of pg.fills) {
+    const h = f.y1 - f.y0;
+    if (h > 40 || f.x1 - f.x0 > 0.9 * pg.width) continue;
+    const S = spans.filter((s) => centerIn(s, f, 0.5));
+    if (!S.length) { pending.push(f); continue; }
+    const size = Math.max(...S.map((s) => s.size));
+    if (h > 2.6 * size || h < 0.6 * Math.min(...S.map((s) => s.size))) continue;
+    if (S.some((s) => s.baseline < f.y0 || s.baseline > f.y1 + 0.3 * s.size)) continue;
+    if (f.x0 < Math.min(...S.map((s) => s.x0)) - 0.8 * size || f.x1 > Math.max(...S.map((s) => s.x1)) + 0.8 * size) continue;
+    hl.add(f);
+  }
+  // 高亮的空格（"[      ]" 中间的空白）：同一行、与已识别的底色矩形首尾相接
+  for (let changed = true; changed; ) {
+    changed = false;
+    for (let i = pending.length - 1; i >= 0; i--) {
+      const f = pending[i];
+      const mate = [...hl].find((o) => o.color === f.color && Math.max(o.x0 - f.x1, f.x0 - o.x1) <= 1.5 &&
+        Math.min(o.y1, f.y1) - Math.max(o.y0, f.y0) > 0.6 * Math.min(o.y1 - o.y0, f.y1 - f.y0) && f.y1 - f.y0 <= 1.3 * (o.y1 - o.y0) + 1);
+      if (mate) { hl.add(f); pending.splice(i, 1); changed = true; }
+    }
+  }
+  if (!hl.size) return 0;
+  // 文字底色：文字的水平范围有一半以上落在同色矩形里（基线在矩形内）
+  for (const s of spans) {
+    const w = s.x1 - s.x0;
+    if (w <= 0) continue;
+    const byColor = new Map<string, number>();
+    for (const f of hl) {
+      if (s.baseline < f.y0 || s.baseline > f.y1 + 0.3 * s.size) continue;
+      const ov = Math.min(s.x1, f.x1) - Math.max(s.x0, f.x0);
+      if (ov > 0) byColor.set(f.color, (byColor.get(f.color) ?? 0) + ov);
+    }
+    const best = [...byColor.entries()].sort((a, b) => b[1] - a[1])[0];
+    if (best && best[1] >= 0.5 * w) s.bg = best[0];
+  }
+  const same = (p: Box, f: Box) => Math.abs(p.x0 - f.x0) < 0.1 && Math.abs(p.x1 - f.x1) < 0.1 && Math.abs(p.y0 - f.y0) < 0.1 && Math.abs(p.y1 - f.y1) < 0.1;
+  const rects = [...hl];
+  pg.paths = pg.paths.filter((p) => !(p.filled && !p.curved && !p.diagonal && rects.some((f) => same(p, f))));
+  pg.fills = pg.fills.filter((f) => !hl.has(f));
+  return hl.size;
 }
 
 // ---------------------------------------------------------------------------
