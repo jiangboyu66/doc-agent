@@ -454,15 +454,16 @@ export const DocAddCommentTool = editTool({
 export const DocExportTool = buildTool({
   name: "doc_export",
   category: "export",
-  description: () => `把当前文档导出为文件供用户下载：docx / pdf / html / markdown。
+  description: () => `把当前文档导出为文件供用户下载：docx / doc / pdf / html / markdown。
 - 导出与原文件相同的格式 = 编辑后的原文件本身，未修改部分逐字节不变（推荐）；
+- doc = 旧版 Word 97-2003 格式，由 LibreOffice 另存（用户上传的是 .doc、或明确要 .doc 时使用）；
 - Word 导出 PDF 由 LibreOffice 按 Word 版式渲染；
 - 跨格式导出（如 Word → Markdown）只能近似保留结构，会在结果中注明；
 - PDF 文档可导出为 Word（docx）：pdf_layout = exact 逐行保留原排版（默认，适合表单/表格/论文），flow 段落自动换行（适合大段改写）；
 - 用户只要其中几页（"把前 20 页转成 Word""导出第 3–5 页"）：用 pages 指定页码范围，只转换这些页——不要整份转换后再删段落。
 导出不修改文档本身。`,
   inputSchema: z.object({
-    format: z.enum(["docx", "pdf", "html", "markdown"]),
+    format: z.enum(["docx", "doc", "pdf", "html", "markdown"]),
     filename: z.string().optional(),
     pdf_layout: z.enum(["exact", "flow"]).optional().describe("仅 PDF 导出 Word 时使用"),
     pages: z.string().optional().describe(`仅 PDF 导出 Word / HTML / Markdown 时使用：只转换这些页：如 "1-20"（前 20 页）、"1-5,8,10-12"、"30-"（第 30 页到最后）；省略为整份（单次最多 500 页）`),

@@ -141,7 +141,7 @@ async function main() {
   program
     .name("doc-agent")
     .description("科研文档助手")
-    .argument("[file]", "要编辑的文档（.docx / .md / .html / .pdf）")
+    .argument("[file]", "要编辑的文档（.docx / .doc / .md / .html / .pdf）")
     .option("--resume <id>", "恢复已有会话")
     .option("-p, --print <prompt>", "无人值守模式：执行这条指令后退出")
     .option("--output <file>", "导出到该文件（按扩展名决定格式）；不带 -p 时直接转换导出，例如 PDF → .docx")
@@ -167,6 +167,8 @@ async function main() {
   else if (file) {
     const buf = await fs.readFile(path.resolve(file));
     session = await Session.create(buf, path.basename(file), { mode: runtime.settings.permissionMode, trackChanges: runtime.settings.trackChanges, author: runtime.settings.author });
+    // 旧版 .doc 在打开时已转换为 .docx：显示转换报告
+    if (session.meta.sourceExt && session.meta.origin) console.log((session.meta.origin.coverage >= 0.995 ? chalk.green : chalk.yellow)(session.meta.origin.report));
   } else {
     const list = await Session.list();
     console.log("用法：doc-agent <文件> 或 doc-agent --resume <会话ID>\n\n最近的会话：");

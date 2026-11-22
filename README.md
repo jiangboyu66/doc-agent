@@ -1,6 +1,6 @@
 # 科研文档助手
 
-基于 DeepSeek 的文档编辑 Agent，支持 Word（.docx）、Markdown、HTML；PDF 可在会话内一键转换为 Word 后继续编辑。
+基于 DeepSeek 的文档编辑 Agent，支持 Word（.docx；旧版 .doc 上传时自动转换）、Markdown、HTML；PDF 可在会话内一键转换为 Word 后继续编辑。
 提供 Web 界面和命令行（CLI）两种用法，二者共用同一个引擎。
 
 **核心目标：100% 保真。** 只改你要求改的地方，文档其余部分逐字节保持不变。
@@ -24,7 +24,7 @@ npm run dev                 # 打开 http://localhost:3939
 
 | 工具 | 用途 | 没有它时 |
 | --- | --- | --- |
-| LibreOffice（soffice） | 导出 PDF、Word 的“精确版式”预览 | 这两项不可用，其余功能正常 |
+| LibreOffice（soffice） | 导出 PDF、Word 的“精确版式”预览；旧版 .doc 的首选转换引擎、导出为 .doc | 导出 PDF / .doc 与精确预览不可用；.doc 改用内置引擎转换（Word 97-2003 格式，Word 6.0 / 95 除外），其余功能正常 |
 | pandoc | 跨格式导出（如 Word → HTML） | 跨格式导出不可用；同格式编辑与导出不受影响 |
 
 命令不在 PATH 中时，在 `.env` 里设置 `SOFFICE_PATH` 或 `PANDOC_PATH`。
@@ -38,6 +38,8 @@ npm run cli -- 论文.docx -p "统一术语：智能代理→文档代理" --mod
                                                # 无人值守：执行后导出退出
 npm run cli -- 法规.pdf --pages 1-20 --output 法规前20页.docx
                                                # 只把 PDF 的第 1–20 页转成 Word
+npm run cli -- 合同.doc                         # 旧版 .doc：打开时转换为 .docx，显示转换报告
+npm run cli -- 合同.doc --output 合同.docx      # 只转换不编辑
 ```
 
 ### 测试
@@ -163,6 +165,25 @@ Markdown 和 HTML 采用同样的思路：直接在源文本上按位置拼接�
 
 ---
 
+## 旧版 Word（.doc）
+
+旧版 Word 97-2003 文档（`.doc` / `.dot`）可以直接上传（网页拖入或 `npm run cli -- 合同.doc`）。上传时转换为 `.docx`，之后与普通 Word 文档完全一样：最小修改、修订模式、批注、版本回滚、保真校验都照常可用。
+
+- 会话开头显示转换报告：用了哪个引擎、转换了多少段落 / 表格 / 图片 / 脚注 / 批注 / 修订、**文字完整性**（.doc 正文的可见字符与写进 .docx 的字符逐一核对），以及没能转换的内容；
+- 下载「当前版本」得到 `.docx`；「下载 → 原始文件」取回上传的 `.doc`（原样保存，从未修改）；需要交回 `.doc` 时选「导出为 Word 97-2003（.doc）」或对 Agent 说"导出成 doc"（`doc_export format="doc"`、`/export doc`，由 LibreOffice 另存）；
+- 扩展名写成 `.doc` 的 `.docx` 直接按 Word 打开；加密的 `.doc`、Word 6.0 / 95 文档（没有 LibreOffice 时）、损坏的文件会给出明确提示。
+
+两个转换引擎，`DOC_ENGINE` 可以固定（默认 `auto`：装了 LibreOffice 用它，失败或没装时用内置引擎）：
+
+| 引擎 | 说明 |
+| --- | --- |
+| `libreoffice` | LibreOffice 的 Word 二进制过滤器，最完整：形状组合、艺术字、OLE 对象、Word 6.0 / 95 都能转 |
+| `builtin` | 内置的纯 Node 解析器（`src/services/docConvert/`），不需要任何外部程序：按 [MS-DOC] 读取复合文档、分段表、字符 / 段落 / 节属性、样式、自动编号、表格（合并单元格、底纹、边框）、页眉页脚（奇偶页、首页）、脚注尾注、批注、修订、域（页码、目录、超链接）、书签、行内与浮动图片、文本框、中文字体与语言标记 |
+
+实测：Apache POI 测试语料中可解析的 138 个 Word 97-2003 文件，内置引擎全部转换成功，正文文字完整性 100%，单个文件最长 0.3 秒；与 LibreOffice 自身的转换结果渲染对比，页数相同 131 / 136，按词比对的文字一致率平均 95.5%。五份合同样本（中英文，含 140 页的中文分配协议）由原始 .docx 另存为 .doc 再转回，渲染结果与原文件逐字对齐、页数完全一致。
+
+---
+
 ## 编辑、排版与绘图工具
 
 除了改文字、改格式、插入/删除段落、表格加行、批注之外，Agent 还可以使用下面这些工具（只在当前文档支持时出现）。Word 中全部生成**原生对象**，在 Word 里可以继续编辑；Markdown / HTML 生成等价的源码片段。
@@ -253,6 +274,7 @@ src/
   tools/metaTools.ts      todo_write / exit_plan_mode / skill / agent
   services/fallbackImages.ts  形状与图表的 PNG 后备图（快速预览用）
   services/pdfConvert/    PDF → Word 版面重建（extract 提取 / fonts 字体映射 / layout 重建 / raster 矢量图与公式识别 / render 区域渲染 / docxWriter 生成）
+  services/docConvert/    旧版 Word（.doc）→ .docx（cfb 复合文档 / parse 二进制结构 / sprm 属性指令 / props 属性映射 / writer 生成 OOXML）
   documents/              文档适配器（策略模式）
     docx/                 原生 OOXML 引擎（zip / xml / ooxml / build 构件生成 / DocxDocument）
     markdown/ html/ pdf/
@@ -311,7 +333,7 @@ test/                     自动化测试
 
 - **PDF 需先转换为 Word 才能修改**（会话内一键完成）。可编辑排版（流式）下由 Word 重新断行，个别行尾、分页位置会与 PDF 略有不同；页面上的装饰色块只保留首页的。转换是版面重建：文字 100% 保留、版面高度还原；矢量图与行间公式以高清图片还原（不是可编辑对象），旋转文字不转换；扫描件（整页图片）需要先做 OCR。有原始 Word 文件时，直接上传 Word 效果最好。
 - **公式工具支持常用 LaTeX 子集。** 矩阵、多行对齐（align）等复杂环境暂不支持，可拆成多个公式。
-- **不支持 .doc。** 请先在 Word 中另存为 .docx。
+- **.doc 先转换为 .docx 再编辑。** 编辑和下载的都是 .docx（原 .doc 保留，可导出回 .doc）。内置引擎不转换形状组合、自选图形（线条、箭头、色块）和艺术字，嵌入对象（Excel 表格等）只保留显示的图片，转换报告会列出；需要这些内容时安装 LibreOffice。加密的 .doc 需要先在 Word 中取消密码。
 - **跨格式导出（Word → HTML/Markdown）必然有损。** 需要完全保真请导出原格式。
 - **“快速预览”由浏览器渲染，与 Word 在分页和字体度量上可能略有差异。** 以“精确版式”（LibreOffice）或 Word 为准。下载的文件本身不受影响。快速预览不能显示原生图表与形状本身，显示的是它们的后备图片；公式在快速预览中不显示。
 - **PDF 转换中的公式是图片。** 没有文字编码的公式与符号（Type 3 字体）、行间公式以图片还原，可以移动、缩放，但不能逐字修改；Type 3 矢量字形需要画布（`@napi-rs/canvas`）才能渲染，画布不可用时这类字形会缺失（位图字形不受影响）。

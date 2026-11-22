@@ -17,7 +17,7 @@ import { Session } from "../session/Session.js";
 import { QueryEngine } from "../QueryEngine.js";
 import { processUserInput, getCommands } from "../commands.js";
 import { buildTranscript } from "../session/transcript.js";
-import { toPdfViaOffice, exportDocument, type ExportFormat } from "../services/convert.js";
+import { toPdfViaOffice, exportDocument, EXPORT_FORMATS, type ExportFormat } from "../services/convert.js";
 import { featureTable } from "../config/features.js";
 import type { EngineEvent, PermissionRequest, PermissionResponse } from "../bridge/protocol.js";
 import { PermissionModeSchema } from "../config/settings.js";
@@ -183,6 +183,7 @@ app.post("/api/sessions/:id/rollback", wrap(async (req, res) => {
 
 const MIME: Record<string, string> = {
   docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  doc: "application/msword", dot: "application/msword",
   md: "text/markdown; charset=utf-8", html: "text/html; charset=utf-8", pdf: "application/pdf",
 };
 
@@ -268,7 +269,7 @@ app.post("/api/sessions/:id/convert", wrap(async (req, res) => {
 app.post("/api/sessions/:id/export", wrap(async (req, res) => {
   const l = await getLive(String(req.params.id));
   const fmt = String(req.body?.format ?? l.session.meta.format) as ExportFormat;
-  if (!["docx", "pdf", "html", "markdown"].includes(fmt)) throw new Error("格式可选：docx / pdf / html / markdown");
+  if (!EXPORT_FORMATS.includes(fmt)) throw new Error("格式可选：docx / doc / pdf / html / markdown");
   const pdfMode = req.body?.mode === "flow" ? "flow" : "exact";
   const pdfEngine = ["pdf2docx", "libreoffice"].includes(req.body?.engine) ? req.body.engine : "builtin";
   const pdfPages = l.session.meta.format === "pdf" && typeof req.body?.pages === "string" && req.body.pages.trim() ? req.body.pages.trim().slice(0, 200) : undefined;

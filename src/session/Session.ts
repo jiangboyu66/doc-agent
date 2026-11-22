@@ -4,6 +4,7 @@
  * 持久化布局（data/sessions/<id>/）：
  *   session.json    元数据、模式、待办、成本、会话级权限规则、版本列表
  *   original.<ext>  上传的原始文件（永不修改，是保真校验的基准）
+ *   upload.<ext>    上传时先转换格式的文件（旧版 .doc）：用户上传的原件，original.docx 是转换结果
  *   versions/       每次写操作后的完整快照（支持 /undo、任意版本回滚）
  *   history.json    发给模型的完整消息序列（含 tool_calls / tool 结果 / reasoning_content）
  *   exports/        导出的文件
@@ -12,7 +13,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { nanoid } from "nanoid";
-import { loadDocument, detectFormat, type DocumentAdapter, type DocFormat } from "../documents/index.js";
+import { loadDocument, detectFormat, isLegacyWord, type DocumentAdapter, type DocFormat } from "../documents/index.js";
 import type { ApiMessage } from "../services/api/deepseek.js";
 import type { TodoItem } from "../bridge/protocol.js";
 import type { PermissionMode } from "../config/settings.js";
@@ -54,6 +55,8 @@ export interface SessionMeta {
   /** 会话最初上传的格式与文件名（在会话内把 PDF 转换为 Word 后，用于下载原始文件、读取旧版本） */
   sourceFormat?: DocFormat;
   sourceFile?: string;
+  /** 上传时就转换了格式（旧版 .doc → .docx）：用户上传的原件扩展名（保存为 upload.<ext>），文件名在 sourceFile */
+  sourceExt?: string;
   /** 用户上传的素材（图片）文件名 */
   assets?: string[];
 }
@@ -78,6 +81,15 @@ export class Session {
   private versionFile(v: number) { return path.join(this.dir, "versions", `v${String(v).padStart(4, "0")}.${EXT[this.versionFormat(v)]}`); }
 
   static async create(buf: Buffer, filename: string, defaults: { mode: PermissionMode; trackChanges: boolean; author: string }): Promise<Session> {
+    // 旧版 Word（.doc）：先转换为 .docx，之后与普通 Word 文档完全一样地编辑；上传的 .doc 原样保存，可随时下载
+    let upload: { data: Buffer; filename: string; ext: string; origin: Omit<NonNullable<SessionMeta["origin"]>, "fromSession"> } | undefined;
+    if (isLegacyWord(filename)) {
+      const { convertUploadedDoc } = await import("../services/docConvert/index.js");
+      const r = await convertUploadedDoc(buf, filename);
+      upload = { data: buf, filename, ext: filename.slice(filename.lastIndexOf(".") + 1).toLowerCase(), origin: { fromFile: filename, engine: r.engine, report: r.report, coverage: r.coverage } };
+      buf = r.data;
+      filename = r.filename;
+    }
     const format = detectFormat(filename);
     const doc = await loadDocument(buf, format);
     const id = nanoid(12);
@@ -87,10 +99,17 @@ export class Session {
     const meta: SessionMeta = {
       id, filename, format, createdAt: Date.now(), updatedAt: Date.now(),
       mode: defaults.mode, trackChanges: format === "docx" ? defaults.trackChanges : false, author: defaults.author,
-      todos: [], cost: emptyCost(), sessionRules: [], versions: [{ v: 0, label: "原始文件", at: Date.now(), changedRefs: [] }],
+      todos: [], cost: emptyCost(), sessionRules: [],
+      versions: [{ v: 0, label: upload ? `由 Word 97-2003 格式转换（${upload.filename}）` : "原始文件", at: Date.now(), changedRefs: [] }],
       currentVersion: 0, hasRead: false,
     };
+    if (upload) {
+      meta.sourceFile = upload.filename;
+      meta.sourceExt = upload.ext;
+      meta.origin = { fromSession: id, ...upload.origin };
+    }
     const s = new Session(meta, doc, dir);
+    if (upload) await fs.writeFile(path.join(dir, `upload.${upload.ext}`), upload.data);
     await fs.writeFile(path.join(dir, `original.${s.ext}`), buf);
     await fs.writeFile(s.versionFile(0), buf);
     await s.save();
@@ -137,6 +156,9 @@ export class Session {
 
   /** 用户最初上传的文件（及其文件名、扩展名） */
   async uploaded(): Promise<{ data: Buffer; filename: string; ext: string }> {
+    if (this.meta.sourceExt && /^[a-z]{2,5}$/.test(this.meta.sourceExt)) {
+      return { data: await fs.readFile(path.join(this.dir, `upload.${this.meta.sourceExt}`)), filename: this.meta.sourceFile ?? this.meta.filename, ext: this.meta.sourceExt };
+    }
     const fmt = this.meta.sourceFormat ?? this.meta.format;
     return { data: await fs.readFile(path.join(this.dir, `original.${EXT[fmt]}`)), filename: this.meta.sourceFile ?? this.meta.filename, ext: EXT[fmt] };
   }

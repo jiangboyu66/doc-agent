@@ -51,6 +51,9 @@ export function buildTurnReminder(session: Session, extra?: string): string {
       ? "版式提示：当前 Word 由 PDF 以「逐页保留原排版」方式转换（每行硬换行、逐页固定分页分栏），只适合改字词。用户要求扩写、改写整段、增删大段内容时，先调用 doc_convert_to_word(layout=\"flow\") 从原 PDF 重新转换为可编辑的流式排版（字体字号与分栏不变，文字增减会自动重排；之前的段落修改会自动搬到新文档，旧版本可回滚），再进行修改。"
       : "版式提示：这份 Word 是 PDF 以「逐页保留原排版」方式转换得到的（每行硬换行、逐页固定分页分栏），大幅增删文字会使版式错乱。用户要求扩写或大段改写时，先说明这一点，建议上传原 PDF，用 doc_convert_to_word(layout=\"flow\") 转换为可编辑排版后再改。");
   }
+  if (m.sourceExt === "doc" || m.sourceExt === "dot") {
+    lines.push(`文件来源：用户上传的「${m.sourceFile}」是旧版 Word 97-2003 格式，打开时已转换为 .docx，所有编辑都在 .docx 上进行。用户要拿回 .doc 格式时用 doc_export(format="doc")；原 .doc 文件保留在「下载 → 原始文件」。`);
+  }
   if (m.assets?.length) lines.push(`已上传素材（可用 doc_insert_image 插入）：${m.assets.join("、")}`);
   if (extra) lines.push(extra);
   return `<system-reminder>\n${lines.join("\n")}\n</system-reminder>`;

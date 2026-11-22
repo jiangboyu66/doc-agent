@@ -7,7 +7,7 @@ const FORMAT_LABEL: Record<string, string> = { docx: "Word", markdown: "Markdown
 export function Home({ runtime, onOpen }: { runtime: RuntimeInfo | null; onOpen: (id: string) => void }) {
   const [sessions, setSessions] = useState<SessionMeta[] | null>(null);
   const [drag, setDrag] = useState(false);
-  const [uploading, setUploading] = useState(false);
+  const [uploading, setUploading] = useState<string | false>(false);
   const [err, setErr] = useState("");
   const input = useRef<HTMLInputElement>(null);
 
@@ -17,7 +17,7 @@ export function Home({ runtime, onOpen }: { runtime: RuntimeInfo | null; onOpen:
   const upload = async (file: File | undefined) => {
     if (!file) return;
     setErr("");
-    setUploading(true);
+    setUploading(/\.(doc|dot)$/i.test(file.name) ? "正在把 .doc 转换为 Word（.docx）…" : "正在打开…");
     try {
       const r = await api.upload(file);
       onOpen(r.meta.id);
@@ -53,10 +53,10 @@ export function Home({ runtime, onOpen }: { runtime: RuntimeInfo | null; onOpen:
         onDragLeave={() => setDrag(false)}
         onDrop={(e) => { e.preventDefault(); setDrag(false); upload(e.dataTransfer.files[0]); }}
       >
-        <input ref={input} type="file" hidden accept=".docx,.md,.markdown,.html,.htm,.pdf" onChange={(e) => upload(e.target.files?.[0])} />
+        <input ref={input} type="file" hidden accept=".docx,.doc,.dot,.dotx,.docm,.md,.markdown,.txt,.html,.htm,.pdf" onChange={(e) => upload(e.target.files?.[0])} />
         <div className="drop-icon" aria-hidden>⬆</div>
-        <div className="drop-title">{uploading ? "正在打开…" : "拖入文档，或点击选择文件"}</div>
-        <div className="muted small">Word · Markdown · HTML · PDF</div>
+        <div className="drop-title">{uploading || "拖入文档，或点击选择文件"}</div>
+        <div className="muted small">Word（.docx / .doc）· Markdown · HTML · PDF</div>
       </div>
       {err && <div className="notice error">{err}</div>}
 
