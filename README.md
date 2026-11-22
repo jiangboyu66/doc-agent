@@ -18,7 +18,7 @@ cp .env.example .env        # Windows: copy .env.example .env，然后填写 DEE
 npm run dev                 # 打开 http://localhost:3939
 ```
 
-压缩包里已经带有构建好的前端（`web/dist`）。如果修改了前端代码，运行 `npm run build:web` 重新构建。
+`npm run dev` / `npm start` 启动前会检查前端（`web/dist`）是不是用当前代码构建的：`git pull` 更新了前端代码后会自动重新构建（第一次需要联网安装前端依赖），不用再手动执行 `npm run build:web`。构建失败时会提示原因，并继续用现有的前端启动。
 
 可选的外部工具：
 

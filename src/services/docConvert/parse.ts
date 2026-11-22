@@ -28,7 +28,7 @@ export interface ShapeInfo { spid: number; type: number; props: Map<number, numb
 export interface Story { start: number; end: number }
 export interface Note { ref: number; story: Story; auto: boolean }
 export interface Comment { ref: number; story: Story; author: string; initials: string; range?: Story }
-export interface PicInfo { blip?: Blip; w: number; h: number; crop: [number, number, number, number] }
+export interface PicInfo { blip?: Blip; w: number; h: number; crop: [number, number, number, number]; /** 空的图片框：形状里没有引用任何图片（原文件中就是空的） */ empty?: boolean }
 
 const td1252 = new TextDecoder("windows-1252");
 
@@ -531,6 +531,7 @@ export class DocFile {
     if (mm === 0x66) o += 1 + d[o];
     const end = fc + lcb;
     let blip: Blip | undefined;
+    let empty = false;
     // OfficeArtInlineSpContainer：形状 + 一个或几个 FBSE（内嵌图片）
     if (o + 8 <= end && d.readUInt16LE(o + 2) === 0xf004) {
       let pib = 0;
@@ -548,12 +549,13 @@ export class DocFile {
         q += 8 + len;
       }
       blip = fbses[pib ? pib - 1 : 0] ?? fbses.find(Boolean) ?? (pib ? this.blipAt(pib) : undefined);
+      empty = !pib && !fbses.length;
     } else if (o < end) {
       // 早期的图片：PICF 后面直接是 Windows 图元文件
       const raw = d.subarray(o, end);
       if (raw.length > 18 && (raw.readUInt16LE(0) === 1 || raw.readUInt16LE(0) === 2) && raw.readUInt16LE(2) === 9) blip = { ext: "wmf", data: raw };
     }
-    return { blip, w, h, crop };
+    return { blip, w, h, crop, empty };
   }
 }
 

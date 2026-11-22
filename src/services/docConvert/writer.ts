@@ -436,7 +436,8 @@ class Builder {
             if (pic?.blip) {
               const c = pic.crop;
               el(this.drawing(pic.blip, pic.w, pic.h, undefined, c.some(Boolean) ? [c[0] / (pic.w + c[0] + c[2]), c[1] / (pic.h + c[1] + c[3]), c[2] / (pic.w + c[0] + c[2]), c[3] / (pic.h + c[1] + c[3])] : undefined));
-            } else if (loc) this.note("有图片的格式无法识别，未转换");
+            } else if (pic?.empty) this.note("有图片框在原文件中就是空的（没有图片数据），已略过");
+            else if (loc) this.note("有图片的格式无法识别，未转换");
             break;
           }
           case 0x08: if (spec && !inInstr) { const x = this.floating(cp, kind); if (x) el(x); } break;
