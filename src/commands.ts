@@ -10,7 +10,7 @@
 import type { Session } from "./session/Session.js";
 import type { Runtime } from "./bootstrap.js";
 import { formatCost } from "./services/costTracker.js";
-import { exportDocument, type ExportFormat } from "./services/convert.js";
+import { exportDocument, EXPORT_FORMATS, type ExportFormat } from "./services/convert.js";
 import { convertPdfSession, convertPdfInPlace } from "./session/convertPdf.js";
 import { featureTable } from "./config/features.js";
 import { appendProjectMemory } from "./context.js";
@@ -107,11 +107,11 @@ const BUILTIN: Command[] = [
     },
   },
   {
-    type: "local", name: "export", description: "导出文件（PDF 可导出为 Word，可只转换部分页）", argumentHint: "docx|pdf|html|markdown [exact|flow] [页码范围，如 1-20]",
+    type: "local", name: "export", description: "导出文件（PDF 可导出为 Word，可只转换部分页）", argumentHint: "docx|doc|pdf|html|markdown [exact|flow] [页码范围，如 1-20]",
     async run(a, ctx) {
       const args = a.trim().split(/\s+/).filter(Boolean);
-      const fmt = (args.find((x) => ["docx", "pdf", "html", "markdown"].includes(x)) ?? (ctx.session.meta.format === "pdf" ? "docx" : ctx.session.meta.format)) as ExportFormat;
-      if (!["docx", "pdf", "html", "markdown"].includes(fmt)) return "格式可选：docx / pdf / html / markdown";
+      const fmt = (args.find((x) => (EXPORT_FORMATS as readonly string[]).includes(x)) ?? (ctx.session.meta.format === "pdf" ? "docx" : ctx.session.meta.format)) as ExportFormat;
+      if (!EXPORT_FORMATS.includes(fmt)) return "格式可选：docx / doc / pdf / html / markdown";
       const pages = args.find((x) => /^[\d,，、\-–~]+$/.test(x) && /\d/.test(x));
       const out = await exportDocument(ctx.session.current(), ctx.session.meta.format, fmt, { pdfMode: args.includes("flow") ? "flow" : "exact", pdfPages: ctx.session.meta.format === "pdf" ? pages : undefined });
       const name = `${ctx.session.meta.filename.replace(/\.[^.]+$/, "")}-v${ctx.session.meta.currentVersion}.${out.ext}`;

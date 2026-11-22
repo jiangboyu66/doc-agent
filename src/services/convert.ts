@@ -20,7 +20,8 @@ const SOFFICE = process.env.SOFFICE_PATH || "soffice";
 const PANDOC_TIMEOUT = 60_000;
 const SOFFICE_TIMEOUT = Number(process.env.SOFFICE_TIMEOUT_MS || 120_000);
 
-export type ExportFormat = "docx" | "pdf" | "html" | "markdown";
+export type ExportFormat = "docx" | "doc" | "pdf" | "html" | "markdown";
+export const EXPORT_FORMATS: readonly ExportFormat[] = ["docx", "doc", "pdf", "html", "markdown"];
 
 async function run(cmd: string, args: string[], timeout: number): Promise<void> {
   try {
@@ -49,6 +50,24 @@ export async function toPdfViaOffice(input: Buffer, ext: string): Promise<Buffer
     await fs.writeFile(src, input);
     await run(SOFFICE, ["--headless", "--norestore", "--nolockcheck", `-env:UserInstallation=${pathToFileURL(profile).href}`, "--convert-to", "pdf", "--outdir", dir, src], SOFFICE_TIMEOUT);
     return await fs.readFile(path.join(dir, "input.pdf"));
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+/** 用 LibreOffice 把文件转换成另一种格式（例如旧版 .doc → .docx） */
+export async function convertViaOffice(input: Buffer, ext: string, target: string, filter?: string): Promise<Buffer> {
+  const dir = await tmpDir();
+  const profile = path.join(dir, "lo-profile");
+  try {
+    const src = path.join(dir, `input.${ext}`);
+    await fs.writeFile(src, input);
+    await run(SOFFICE, ["--headless", "--norestore", "--nolockcheck", `-env:UserInstallation=${pathToFileURL(profile).href}`, "--convert-to", filter ? `${target}:${filter}` : target, "--outdir", dir, src], SOFFICE_TIMEOUT);
+    try {
+      return await fs.readFile(path.join(dir, `input.${target}`));
+    } catch {
+      throw new Error(`LibreOffice 未能把这个 .${ext} 文件转换为 .${target}（文件可能已损坏或受密码保护）。`);
+    }
   } finally {
     await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
   }
@@ -91,9 +110,15 @@ export interface ExportOptions {
 }
 
 export async function exportDocument(current: Buffer, from: DocFormat, to: ExportFormat, opts: ExportOptions = {}): Promise<ExportOutcome> {
-  const extOf: Record<ExportFormat, string> = { docx: "docx", pdf: "pdf", html: "html", markdown: "md" };
+  const extOf: Record<ExportFormat, string> = { docx: "docx", doc: "doc", pdf: "pdf", html: "html", markdown: "md" };
   if ((from === to) || (from === "markdown" && to === "markdown")) {
     return { data: current, ext: extOf[to], lossy: false, note: "与原文件同格式：导出的就是编辑后的原文件，未修改部分逐字节保持不变。" };
+  }
+  if (to === "doc") {
+    // 旧版 Word（Word 97-2003）：先得到 .docx，再由 LibreOffice 另存为 .doc
+    const docx = from === "docx" ? current : (await exportDocument(current, from, "docx", opts)).data;
+    const data = await convertViaOffice(docx, "docx", "doc", "MS Word 97");
+    return { data, ext: "doc", lossy: true, note: "由 LibreOffice 另存为 Word 97-2003 格式（.doc）。正文、表格、样式、编号、页眉页脚、脚注、批注、修订都会保留；Word 2007 之后的新功能（内容控件、新式公式与图表等）在 .doc 中会降级。需要完全保真请下载 .docx。" };
   }
   if (from === "pdf") {
     // PDF → Word：内置版面重建引擎；再从 Word 转 HTML / Markdown

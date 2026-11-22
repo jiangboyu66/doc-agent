@@ -57,9 +57,10 @@ export function Workspace({ id, runtime, onBack, onOpen }: { id: string; runtime
     refresh()
       .then((d) => {
         const restored = fromTranscript(d.transcript, d.pending);
-        // 由 PDF 转换而来的会话：先展示转换报告
+        // 由 PDF / 旧版 .doc 转换而来的会话：先展示转换报告
         if (d.meta.origin && !restored.length) {
-          restored.push({ kind: "notice", key: "origin", tone: d.meta.origin.coverage >= 0.995 ? "success" : "warn", text: `已由「${d.meta.origin.fromFile}」转换为 Word。\n${d.meta.origin.report}` });
+          const head = d.meta.sourceExt ? `「${d.meta.origin.fromFile}」已转换为 Word（.docx）。` : `已由「${d.meta.origin.fromFile}」转换为 Word。`;
+          restored.push({ kind: "notice", key: "origin", tone: d.meta.origin.coverage >= 0.995 ? "success" : "warn", text: `${head}\n${d.meta.origin.report}` });
         }
         setItems(restored);
         setViewing(d.meta.currentVersion);
@@ -153,7 +154,9 @@ export function Workspace({ id, runtime, onBack, onOpen }: { id: string; runtime
 
   const readOnly = meta.format === "pdf";
   const thinkingOn = meta.thinking ?? runtime?.thinking === "enabled";
-  const exportTargets = (meta.format === "pdf" ? (["docx", "html", "markdown"] as const) : (["docx", "pdf", "html", "markdown"] as const)).filter((f) => f !== meta.format);
+  // 上传的是旧版 .doc：额外提供"导出为 .doc"（LibreOffice 另存为 Word 97-2003）
+  const legacyDoc = meta.sourceExt === "doc" || meta.sourceExt === "dot";
+  const exportTargets = (meta.format === "pdf" ? (["docx", "html", "markdown"] as const) : legacyDoc ? (["docx", "doc", "pdf", "html", "markdown"] as const) : (["docx", "pdf", "html", "markdown"] as const)).filter((f) => f !== meta.format);
 
   return (
     <div className="workspace">
@@ -199,13 +202,13 @@ export function Workspace({ id, runtime, onBack, onOpen }: { id: string; runtime
                   <span>原格式，未修改部分逐字节保真</span>
                 </a>
                 <a href={api.documentUrl(id, { original: true, download: true })} download onClick={() => setMenu(false)}>
-                  <b>原始文件</b>
-                  <span>上传时的文件，从未被修改</span>
+                  <b>原始文件{legacyDoc ? "（.doc）" : ""}</b>
+                  <span>{legacyDoc ? "上传的 Word 97-2003 文件，从未被修改" : "上传时的文件，从未被修改"}</span>
                 </a>
                 {exportTargets.map((f) => (
                   <button key={f} onClick={() => doExport(f)} disabled={!!exporting}>
-                    <b>导出为 {f === "markdown" ? "Markdown" : f === "docx" ? "Word（.docx）" : f.toUpperCase()}</b>
-                    <span>{meta.format === "pdf" && f === "docx" ? "按原排版重建为 Word（更多选项见页面上方）" : f === "pdf" ? (meta.format === "docx" ? "LibreOffice 按 Word 版式渲染" : "转换后渲染") : "跨格式转换，版式可能有损"}</span>
+                    <b>导出为 {f === "markdown" ? "Markdown" : f === "docx" ? "Word（.docx）" : f === "doc" ? "Word 97-2003（.doc）" : f.toUpperCase()}</b>
+                    <span>{meta.format === "pdf" && f === "docx" ? "按原排版重建为 Word（更多选项见页面上方）" : f === "doc" ? "当前版本由 LibreOffice 另存为旧版格式" : f === "pdf" ? (meta.format === "docx" ? "LibreOffice 按 Word 版式渲染" : "转换后渲染") : "跨格式转换，版式可能有损"}</span>
                   </button>
                 ))}
               </div>

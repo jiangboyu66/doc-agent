@@ -59,6 +59,8 @@ export interface SessionMeta {
   thinking?: boolean;
   sourceFormat?: DocFormat;
   sourceFile?: string;
+  /** 上传时就转换了格式（旧版 .doc → .docx）：上传原件的扩展名 */
+  sourceExt?: string;
 }
 
 export interface DocumentSummary {

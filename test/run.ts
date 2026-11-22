@@ -1378,6 +1378,151 @@ await test("扫描件：整页扫描图按页面坐标铺满原页（不再 3 �
 });
 
 // ---------------------------------------------------------------------------
+console.log("\n旧版 Word（.doc）");
+// ---------------------------------------------------------------------------
+
+const legacyDoc = await fixture("contract-features-cn.doc");
+/** 粗略的良构检查：标签成对、嵌套正确 */
+function wellFormed(xml: string): string | null {
+  const stack: string[] = [];
+  for (const m of xml.replace(/<\?[\s\S]*?\?>|<!--[\s\S]*?-->/g, "").matchAll(/<(\/?)([\w:.-]+)(?:\s[^>]*?)?(\/?)>/g)) {
+    if (m[3]) continue;
+    if (!m[1]) stack.push(m[2]);
+    else if (stack.pop() !== m[2]) return `</${m[2]}> 不匹配`;
+  }
+  return stack.length ? `<${stack[stack.length - 1]}> 未闭合` : null;
+}
+
+await test(".doc 内置引擎：正文文字一字不差；自动编号、表格合并与底纹、脚注、批注、修订、行内 / 浮动图片、页眉页脚域、横向第二节都转成 Word 原生结构", async () => {
+  const { docToDocx } = await import("../src/services/docConvert/index.js");
+  const { data, report } = await docToDocx(legacyDoc, { engine: "builtin" });
+  eq(report.engine, "builtin", "引擎");
+  assert(report.chars > 1000 && report.written === report.chars, `文字完整性：${report.written}/${report.chars}`);
+  eq(report.notes.join("；"), "", "不应有未转换的内容");
+  const pkg = new ZipPackage(data);
+  for (const n of pkg.names().filter((x) => /\.(xml|rels)$/.test(x))) {
+    const bad = wellFormed(pkg.readText(n));
+    assert(!bad, `${n} 不是良构的 XML：${bad}`);
+  }
+  const xml = docXml(data);
+  const text = docText(data);
+  for (const t of ["设备采购合同", "合同总价款为人民币[ ]元（大写：[ ]）", "本合同一式肆份，甲乙双方各执贰份，具有同等法律效力。", "附件二：交货进度表（横向页面）", "三坐标测量机"]) {
+    assert(text.includes(t), `正文应包含「${t}」`);
+  }
+  // 自动编号：第一条 / 1.1 / (a)，仍是 Word 编号（不是写死的文字）
+  const numbering = pkg.readText("word/numbering.xml");
+  for (const lvl of ["第%1条", "%1.%2", "(%3)"]) assert(numbering.includes(`<w:lvlText w:val="${lvl}"/>`), `编号格式 ${lvl}`);
+  assert(count(xml, "<w:numPr>") >= 30, `编号段落：${count(xml, "<w:numPr>")}`);
+  assert(!/>第[一二三四五六]条</.test(xml), "条款编号不应写成文字");
+  // 黄色高亮的方括号占位符
+  eq(count(xml, '<w:highlight w:val="yellow"/>'), 2, "占位符高亮");
+  // 表格：表头底纹、合计行横向合并、纵向合并
+  eq(count(xml, "<w:tbl>"), 2, "表格个数");
+  eq(count(xml, 'w:fill="D9D9D9"'), 4, "表头底纹");
+  assert(xml.includes('<w:gridSpan w:val="3"/>'), "合计行横向合并三列");
+  assert(xml.includes('<w:vMerge w:val="restart"/>') && /<w:vMerge\/>/.test(xml), "纵向合并");
+  // 脚注、批注、修订
+  assert(pkg.readText("word/footnotes.xml").includes("含增值税，税率按开票时适用的法定税率计算。"), "脚注内容");
+  eq(count(xml, "<w:footnoteReference "), 1, "脚注引用");
+  const comments = pkg.readText("word/comments.xml");
+  assert(comments.includes("请客户确认份数。") && comments.includes('w:author="李律师"'), "批注内容与作者");
+  assert(xml.includes("<w:commentRangeStart ") && xml.includes("<w:commentReference "), "批注范围");
+  assert(/<w:del [^>]*w:author="张律师"[^>]*>[\s\S]*?<w:delText[^>]*>有效期一年。<\/w:delText>/.test(xml), "删除修订");
+  assert(/<w:ins [^>]*w:author="张律师"[^>]*>[\s\S]*?有效期至双方义务履行完毕之日止。/.test(xml), "插入修订");
+  // 图片：行内一张，浮动（盖章，压在文字上）一张
+  eq(count(xml, "<pic:pic"), 2, "图片个数");
+  eq(count(xml, "<wp:inline"), 1, "行内图片");
+  eq(count(xml, "<wp:anchor "), 1, "浮动图片");
+  assert(/<wp:anchor [^>]*behindDoc="0"[\s\S]*?<wp:wrapNone\/>/.test(xml), "盖章浮于文字上方、不绕排");
+  // 页眉（下边框）与页脚（第 PAGE 页 共 NUMPAGES 页）
+  const parts = pkg.names();
+  const header = parts.filter((n) => /^word\/header\d+\.xml$/.test(n)).map((n) => pkg.readText(n)).find((t) => t.includes("北京某某律师事务所")) ?? "";
+  assert(header && /<w:pBdr>.*<w:bottom w:val="single"/.test(header), "页眉文字与下边框");
+  const footer = parts.filter((n) => /^word\/footer\d+\.xml$/.test(n)).map((n) => pkg.readText(n)).find((t) => t.includes(" PAGE ")) ?? "";
+  assert(footer.includes(" NUMPAGES "), "页脚的页码与总页数是域");
+  // 两节：第二节横向
+  eq(count(xml, "<w:sectPr"), 2, "节数");
+  assert(/<w:pgSz w:w="16838" w:h="11906" w:orient="landscape"\/>/.test(xml), `第二节横向 A4：${xml.match(/<w:pgSz [^>]*>/g)}`);
+  // 中文字体；语言标记与原文一致（影响中文断行，与原文不同会导致换行位置、页数变化）
+  assert(xml.includes('w:eastAsia="宋体"') && pkg.readText("word/styles.xml").includes("宋体"), "中文字体");
+  assert(/<w:lang w:val="en-US" w:eastAsia="en-US"/.test(xml + pkg.readText("word/styles.xml")), "语言标记");
+});
+
+await test("上传 .doc：自动转换为 Word 会话，上传的原件逐字节保留；编辑、保真校验、回滚、重新加载与普通 Word 一致", async () => {
+  const prev = process.env.DOC_ENGINE;
+  process.env.DOC_ENGINE = "builtin";
+  try {
+    const s = await Session.create(legacyDoc, "设备采购合同.doc", { mode: "bypassPermissions", trackChanges: false, author: "测试" });
+    eq(s.meta.format, "docx", "会话格式");
+    eq(s.meta.filename, "设备采购合同.docx", "文件名");
+    eq(s.meta.sourceFile, "设备采购合同.doc", "原文件名");
+    eq(s.meta.sourceExt, "doc", "原件格式");
+    eq(s.meta.origin?.engine, "builtin", "转换引擎");
+    eq(s.meta.origin?.coverage, 1, "文字完整性");
+    assert(/Word 97-2003/.test(s.meta.origin!.report) && s.meta.origin!.report.includes("文字完整性 100.0%"), `转换报告：${s.meta.origin!.report}`);
+    assert(s.meta.versions[0].label.includes("设备采购合同.doc"), "v0 标注来源");
+    const up = await s.uploaded();
+    eq(up.ext, "doc", "原始文件扩展名");
+    eq(up.filename, "设备采购合同.doc", "原始文件名");
+    assert(up.data.equals(legacyDoc), "上传的 .doc 应逐字节保留");
+    // 模型知道文件来源
+    const { buildTurnReminder } = await import("../src/context.js");
+    assert(buildTurnReminder(s).includes("旧版 Word 97-2003"), "当轮提醒应说明文件由 .doc 转换而来");
+    // 编辑：与普通 .docx 一样，未修改的部件保持不变
+    s.doc.replaceText({ oldText: "本合同一式肆份", newText: "本合同一式陆份" }, O(true));
+    const fid = s.doc.fidelity(await s.original());
+    assert(fid.ok, `保真校验：${fid.problems.join("；")}`);
+    assert(fid.modifiedParts.every((p) => p.name === "word/document.xml"), `只应改动正文：${fid.modifiedParts.map((p) => p.name)}`);
+    await s.commit("改份数", []);
+    const re = await Session.load(s.id);
+    assert(docText(re.current()).includes("本合同一式陆份"), "重新加载后保留修改");
+    assert((await re.uploaded()).data.equals(legacyDoc), "重新加载后原件仍可下载");
+    await re.rollback(0);
+    assert(docText(re.current()).includes("本合同一式肆份"), "回滚到转换结果");
+    eq(re.meta.format, "docx", "回滚后仍是 Word");
+  } finally {
+    if (prev === undefined) delete process.env.DOC_ENGINE; else process.env.DOC_ENGINE = prev;
+  }
+});
+
+await test(".doc 异常情况：加密、Word 6 / 95、不是 Word 的文件给出明确提示；扩展名写错的 .docx 直接打开；有 LibreOffice 时可导出 .doc", async () => {
+  const { convertUploadedDoc, DocFileError } = await import("../src/services/docConvert/index.js");
+  const rejects = async (fn: () => Promise<unknown>, re: RegExp, what: string) => {
+    let err: any;
+    try { await fn(); } catch (e) { err = e; }
+    assert(err instanceof DocFileError && re.test(err.message), `${what}：${err?.message ?? "没有报错"}`);
+  };
+  // FIB 在 WordDocument 流开头（扇区边界上）
+  let fib = -1;
+  for (let o = 512; o + 12 < legacyDoc.length; o += 512) if (legacyDoc.readUInt16LE(o) === 0xa5ec && legacyDoc.readUInt16LE(o + 2) >= 0xc1) { fib = o; break; }
+  assert(fib > 0, "应找到 FIB");
+  const encrypted = Buffer.from(legacyDoc);
+  encrypted.writeUInt16LE(encrypted.readUInt16LE(fib + 0x0a) | 0x0100, fib + 0x0a);
+  await rejects(() => convertUploadedDoc(encrypted, "a.doc", { engine: "builtin" }), /密码/, "加密文档");
+  const word95 = Buffer.from(legacyDoc);
+  word95.writeUInt16LE(0x65, fib + 2);
+  await rejects(() => convertUploadedDoc(word95, "a.doc", { engine: "builtin" }), /Word 6\.0 \/ 95/, "Word 95 文档");
+  await rejects(() => convertUploadedDoc(Buffer.from("{\\rtf1\\ansi hello}"), "a.doc", { engine: "builtin" }), /不是 Word 97-2003 文档/, "不是 Word 文件");
+  // 其实是 .docx：不转换，原样打开
+  const s = await Session.create(sampleDocx, "论文.doc", { mode: "default", trackChanges: false, author: "测试" });
+  eq(s.meta.filename, "论文.docx", "按 .docx 打开");
+  assert(s.current().equals(sampleDocx), "内容不经转换");
+  assert(s.meta.origin!.report.includes("扩展名写成了 .doc"), `报告：${s.meta.origin!.report}`);
+  // 导出为 .doc（LibreOffice 另存为 Word 97-2003），导出的文件内置引擎能读回、文字不丢
+  const { checkExternalTools, exportDocument } = await import("../src/services/convert.js");
+  if ((await checkExternalTools()).soffice) {
+    const { docToDocx } = await import("../src/services/docConvert/index.js");
+    const src = (await docToDocx(legacyDoc, { engine: "builtin" })).data;
+    const out = await exportDocument(src, "docx", "doc");
+    eq(out.ext, "doc", "扩展名");
+    eq(out.data.readUInt32LE(0), 0xe011cfd0, "导出的是 OLE2 复合文档");
+    const back = await docToDocx(out.data, { engine: "builtin" });
+    eq(back.report.written, back.report.chars, "导出的 .doc 文字完整");
+    assert(docText(back.data).includes("本合同一式肆份"), "导出的 .doc 能读回");
+  }
+});
+
+// ---------------------------------------------------------------------------
 
 await fs.rm(tmp, { recursive: true, force: true });
 const failed = results.filter((r) => !r.ok);
