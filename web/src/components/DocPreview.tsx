@@ -14,8 +14,12 @@ const PREVIEW_PAGES = 50;
  *   分页、字体度量与 Word 更接近。
  * - Markdown：渲染 / 源码；HTML：沙箱 iframe（禁用脚本）；PDF：浏览器内置阅读器。
  */
-export function DocPreview({ sessionId, format, version, isCurrent, sofficeAvailable }: { sessionId: string; format: DocFormat; version: number; isCurrent: boolean; sofficeAvailable: boolean }) {
-  const [view, setView] = useState<View>("fast");
+export function DocPreview({ sessionId, format, version, isCurrent, sofficeAvailable, preferLayout }: { sessionId: string; format: DocFormat; version: number; isCurrent: boolean; sofficeAvailable: boolean; preferLayout?: boolean }) {
+  const [view, setViewRaw] = useState<View>("fast");
+  // 由旧版 .doc 转换来的文档：用户最关心版面是否和原来一样，有 LibreOffice 时默认显示"精确版式"（用户切换过就不再干预）
+  const chosen = useRef(false);
+  const setView = (v: View) => { chosen.current = true; setViewRaw(v); };
+  useEffect(() => { if (preferLayout && sofficeAvailable && format === "docx" && !chosen.current) setViewRaw("layout"); }, [preferLayout, sofficeAvailable, format]);
   const [zoom, setZoom] = useState<number | "fit">("fit");
   const [pageInfo, setPageInfo] = useState<{ current: number; total: number; of?: number } | null>(null);
   const onPages = useCallback((p: { current: number; total: number; of?: number }) => setPageInfo((old) => (old && old.current === p.current && old.total === p.total && old.of === p.of ? old : p)), []);

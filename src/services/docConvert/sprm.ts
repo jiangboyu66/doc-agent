@@ -61,6 +61,7 @@ export const S = {
   CFSmallCaps: 0x083a, CFCaps: 0x083b, CFVanish: 0x083c, CKul: 0x2a3e, CDxaSpace: 0x8840, CIco: 0x2a42, CHps: 0x4a43,
   CHpsPos: 0x4845, CIss: 0x2a48, CHighlight: 0x2a0c, CRgFtc0: 0x4a4f, CRgFtc1: 0x4a50, CRgFtc2: 0x4a51, CFtcBi: 0x4a5e,
   CCharScale: 0x4852, CFDStrike: 0x2a53, CFImprint: 0x0854, CFEmboss: 0x0858, CFBoldBi: 0x085c, CFItalicBi: 0x085d,
+  CIdctHint: 0x286f, CHpsKern: 0x484b, CFNoProof: 0x0875,
   CHpsBi: 0x4a61, CCv: 0x6870, CShd80: 0x4866, CShd: 0xca71, CKcd: 0x2a34, CBrc80: 0x6865, CBrc: 0xca72, CRgLid0_80: 0x486d, CRgLid1_80: 0x486e, CRgLid0: 0x4873, CRgLid1: 0x4874, CLidBi: 0x485f,
   // 段落
   PIstd: 0x4600, PJc80: 0x2403, PJc: 0x2461, PFKeep: 0x2405, PFKeepFollow: 0x2406, PFPageBreakBefore: 0x2407,
@@ -73,6 +74,10 @@ export const S = {
   PBrcTop: 0xc64e, PBrcLeft: 0xc64f, PBrcBottom: 0xc650, PBrcRight: 0xc651, PBrcBetween: 0xc652,
   PShd80: 0x442d, PShd: 0xc64d, PItap: 0x6649, PFInnerTableCell: 0x244b, PFInnerTtp: 0x244c, PHugePapx: 0x6646,
   PFNoAutoHyph: 0x242a,
+  // 图文框（定位段落）与东亚排版
+  PDxaAbs: 0x8418, PDyaAbs: 0x8419, PDxaWidth: 0x841a, PPc: 0x261b, PWr: 0x2423, PWHeightAbs: 0x442b, PDcs: 0x442c,
+  PDyaFromText: 0x842e, PDxaFromText: 0x842f, PFLocked: 0x2430, PFNoLineNumb: 0x240c,
+  PFWordWrap: 0x2434, PFOverflowPunct: 0x2435, PFTopLinePunct: 0x2436, PWAlignFont: 0x4439, PFUsePgsuSettings: 0x2447, PFAdjustRight: 0x2448,
   // 表格
   TDefTable: 0xd608, TDxaGapHalf: 0x9602, TDyaRowHeight: 0x9407, TTableHeader: 0x3404, TFCantSplit: 0x3403, TFCantSplit90: 0x3466,
   TJc90: 0x5400, TJc: 0x548a, TDxaLeft: 0x9601, TTableBorders80: 0xd605, TTableBorders: 0xd613,

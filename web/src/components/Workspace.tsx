@@ -254,6 +254,7 @@ export function Workspace({ id, runtime, onBack, onOpen }: { id: string; runtime
                 version={viewing}
                 isCurrent={viewing === meta.currentVersion}
                 sofficeAvailable={!!runtime?.external.soffice}
+                preferLayout={meta.sourceExt === "doc" || meta.sourceExt === "dot"}
               />
             )}
             {tab === "outline" && <OutlinePanel summary={summary} onAsk={send} />}

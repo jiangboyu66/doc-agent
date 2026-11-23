@@ -11,7 +11,7 @@
 
 import { createZip } from "../../documents/docx/zip.js";
 import { DocFile, type Anchor, type Blip, type ListLevel, type ShapeInfo, type StyleDef, type Story } from "./parse.js";
-import { charXml, esc, NUMFMT, paraXml, sectXml, border, shading, cv, type CharCtx } from "./props.js";
+import { charXml, esc, NUMFMT, paraXml, sectXml, border, shading, cv, FRAME_SPRMS, type CharCtx } from "./props.js";
 import { S, last, type Sprm } from "./sprm.js";
 
 const NS =
@@ -19,7 +19,9 @@ const NS =
   'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" ' +
   'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture" ' +
   'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml" ' +
-  'xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape" mc:Ignorable="w14"';
+  'xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape" xmlns:wpg="http://schemas.microsoft.com/office/word/2010/wordprocessingGroup" mc:Ignorable="w14"';
+const WPS = "http://schemas.microsoft.com/office/word/2010/wordprocessingShape";
+const WPG = "http://schemas.microsoft.com/office/word/2010/wordprocessingGroup";
 const XML = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n';
 const R_IMAGE = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image";
 const EMU = 635; // 每 twip
@@ -31,6 +33,8 @@ export interface DocConvertReport {
   images: number;
   floating: number;
   textBoxes: number;
+  /** 自选图形与形状组合（含组合内的形状） */
+  shapes: number;
   footnotes: number;
   endnotes: number;
   comments: number;
@@ -78,7 +82,7 @@ class Builder {
     this.fonts = d.fonts.map((f) => f.name);
     this.sectEnds = new Set(d.sections.map((s) => s.cpEnd));
     this.hddStart = d.storyStarts().hdd;
-    this.report = { engine: "builtin", paragraphs: 0, tables: 0, images: 0, floating: 0, textBoxes: 0, footnotes: d.footnotes.length, endnotes: d.endnotes.length,
+    this.report = { engine: "builtin", paragraphs: 0, tables: 0, images: 0, floating: 0, textBoxes: 0, shapes: 0, footnotes: d.footnotes.length, endnotes: d.endnotes.length,
       comments: d.comments.length, revisions: 0, sections: d.sections.length, chars: 0, written: 0, notes: [...d.notes] };
     this.charCtx = { fonts: this.fonts, styleIds: this.styleIds, styleToggle: () => false };
     d.footnotes.forEach((n, i) => this.footnoteAt.set(n.ref, i + 1));
@@ -235,7 +239,7 @@ class Builder {
     this.report.tables++;
 
     // 每行的单元格边界（twips）与单元格属性
-    interface Cell { x0: number; x1: number; tcgrf: number; brc: Array<string | undefined>; shd?: string; paras: Para[]; vAlign?: number }
+    interface Cell { x0: number; x1: number; tcgrf: number; brc: Array<string | undefined>; shd?: string; paras: Para[]; vAlign?: number; mar?: string }
     const rowInfo = rows.map((r) => {
       const sp = r.ttp?.sprms ?? [];
       const def = last(sp, S.TDefTable);
@@ -265,6 +269,18 @@ class Builder {
           for (let k = 0; k + 10 <= s.arg.length; k += 10) shds[base + k / 10] = shading(s.arg, k, true);
         }
       }
+      // 单元格边距：表格默认（sprmTCellPaddingDefault）与单个单元格（sprmTCellPadding）
+      const pad: Record<string, number> = {};
+      const cellPad: Array<Record<string, number>> = [];
+      for (const s of sp) {
+        if ((s.op !== S.TCellPaddingDefault && s.op !== S.TCellPadding) || s.arg.length < 6 || s.arg[3] !== 3) continue;
+        const [f, l, sides, w] = [s.arg[0], s.arg[1], s.arg[2], s.arg.readInt16LE(4)];
+        ["top", "left", "bottom", "right"].forEach((side, q) => {
+          if (!(sides & (1 << q))) return;
+          if (s.op === S.TCellPaddingDefault) pad[side] = w;
+          else for (let k = f; k < l; k++) (cellPad[k] ??= {})[side] = w;
+        });
+      }
       // 单独设置的单元格边框、竖直对齐、竖直合并
       const vAligns: Array<number | undefined> = [];
       for (const s of sp) {
@@ -283,7 +299,9 @@ class Builder {
       for (let k = 0; k < r.cells.length; k++) {
         const x0 = centers[Math.min(k, centers.length - 2)], x1 = centers[Math.min(k + 1, centers.length - 1)];
         const tc = tcs[k] ?? { tcgrf: 0, brc: [] };
-        out.push({ x0, x1: Math.max(x1, x0 + 1), tcgrf: tc.tcgrf, brc: tc.brc, shd: shds[k], paras: r.cells[k], vAlign: vAligns[k] });
+        const cm = cellPad[k];
+        const mar = cm ? ["top", "left", "bottom", "right"].filter((x) => cm[x] !== undefined).map((x) => `<w:${x} w:w="${cm[x]}" w:type="dxa"/>`).join("") : "";
+        out.push({ x0, x1: Math.max(x1, x0 + 1), tcgrf: tc.tcgrf, brc: tc.brc, shd: shds[k], paras: r.cells[k], vAlign: vAligns[k], mar: mar ? `<w:tcMar>${mar}</w:tcMar>` : undefined });
       }
       // 旧式横向合并：首格 + 若干被合并的格 → 一个跨列的格
       const merged: Cell[] = [];
@@ -297,7 +315,9 @@ class Builder {
       const cantSplit = !!last(sp, S.TFCantSplit, S.TFCantSplit90)?.arg[0];
       const jc = last(sp, S.TJc, S.TJc90)?.arg.readUInt16LE(0) ?? 0;
       const tb = last(sp, S.TTableBorders, S.TTableBorders80);
-      return { cells: merged, gap, height, header, cantSplit, jc, tb, left: centers[0] };
+      const autofit = !!last(sp, S.TFAutofit)?.arg[0];
+      const tw = last(sp, S.TTableWidth);
+      return { cells: merged, gap, height, header, cantSplit, jc, tb, left: centers[0], pad, autofit, tw };
     });
 
     // 表格网格：所有行的单元格边界合并去重
@@ -313,10 +333,17 @@ class Builder {
       tblBorders = `<w:tblBorders>${["top", "left", "bottom", "right", "insideH", "insideV"].map((tag, q) => border(tag, first.tb!.arg, q * step, wide) ?? "").join("")}</w:tblBorders>`;
     }
     const jc = ["left", "center", "right"][first.jc] ?? "left";
+    // 左右边距：Word 2000 起的单元格边距优先，否则用 dxaGapHalf
+    const padL = first.pad.left ?? first.gap, padR = first.pad.right ?? first.gap;
+    const mar = [["top", first.pad.top], ["left", padL], ["bottom", first.pad.bottom], ["right", padR]]
+      .filter(([, v]) => v !== undefined).map(([k, v]) => `<w:${k} w:w="${v}" w:type="dxa"/>`).join("");
+    // 表格宽度（ftsWidth：1 自动、2 百分比（1/50 %）、3 twips）；"自动调整"与原文一致
+    const tw = first.tw && first.tw.arg.length >= 3 ? { fts: first.tw.arg[0], w: first.tw.arg.readInt16LE(1) } : undefined;
+    const tblW = tw?.fts === 3 ? `<w:tblW w:w="${tw.w}" w:type="dxa"/>` : tw?.fts === 2 ? `<w:tblW w:w="${tw.w}" w:type="pct"/>` : '<w:tblW w:w="0" w:type="auto"/>';
     const tblPr =
-      `<w:tblPr><w:tblW w:w="0" w:type="auto"/>${first.jc ? `<w:jc w:val="${jc}"/>` : ""}` +
-      `<w:tblInd w:w="${first.left + first.gap}" w:type="dxa"/>${tblBorders}<w:tblLayout w:type="fixed"/>` +
-      `<w:tblCellMar><w:left w:w="${first.gap}" w:type="dxa"/><w:right w:w="${first.gap}" w:type="dxa"/></w:tblCellMar>` +
+      `<w:tblPr>${tblW}${first.jc ? `<w:jc w:val="${jc}"/>` : ""}` +
+      `<w:tblInd w:w="${first.left + padL}" w:type="dxa"/>${tblBorders}${first.autofit ? "" : '<w:tblLayout w:type="fixed"/>'}` +
+      `<w:tblCellMar>${mar}</w:tblCellMar>` +
       `<w:tblLook w:val="0000" w:firstRow="0" w:lastRow="0" w:firstColumn="0" w:lastColumn="0" w:noHBand="0" w:noVBand="0"/></w:tblPr>`;
     const tblGrid = `<w:tblGrid>${grid.slice(1).map((x, k) => `<w:gridCol w:w="${Math.max(1, x - grid[k])}"/>`).join("")}</w:tblGrid>`;
     const rowsXml = rowInfo.map((r) => {
@@ -331,7 +358,7 @@ class Builder {
         const va = c.vAlign ?? (c.tcgrf >> 7) & 3;
         const tcPr = `<w:tcPr><w:tcW w:w="${c.x1 - c.x0}" w:type="dxa"/>${b - a > 1 ? `<w:gridSpan w:val="${b - a}"/>` : ""}` +
           (vm === 3 ? '<w:vMerge w:val="restart"/>' : vm ? "<w:vMerge/>" : "") +
-          (brc ? `<w:tcBorders>${brc}</w:tcBorders>` : "") + (c.shd ?? "") + (va ? `<w:vAlign w:val="${["top", "center", "bottom"][va] ?? "top"}"/>` : "") + `</w:tcPr>`;
+          (brc ? `<w:tcBorders>${brc}</w:tcBorders>` : "") + (c.shd ?? "") + (c.mar ?? "") + (va ? `<w:vAlign w:val="${["top", "center", "bottom"][va] ?? "top"}"/>` : "") + `</w:tcPr>`;
         let inner = this.blocks(c.paras, depth, kind);
         if (!inner.includes("<w:p>") && !inner.includes("<w:p ") || inner.endsWith("</w:tbl>")) inner += "<w:p/>";
         return `<w:tc>${tcPr}${inner}</w:tc>`;
@@ -346,11 +373,20 @@ class Builder {
   // ---------------------------------------------------------------------------
 
   private fieldDepth: Array<{ instr: boolean }> = [];
+  /** 正在写的段落（浮动图形换算定位时要用到它的缩进） */
+  private curPara?: Para;
 
   private para(p: Para, kind: StoryKind): string {
     this.report.paragraphs++;
-    const ppr = paraXml(p.sprms, { styleIds: this.styleIds, numId: (ilfo) => this.numId(ilfo) }, p.istd);
+    // 图文框：段落自己只改了部分属性时，其余沿用样式里的（<w:framePr> 是整体替换的）
+    let sprms = p.sprms;
+    if (sprms.some((x) => FRAME_SPRMS.has(x.op))) {
+      const inherited = this.styleChainPapx(p.istd).filter((x) => FRAME_SPRMS.has(x.op));
+      if (inherited.length) sprms = [...inherited, ...sprms];
+    }
+    const ppr = paraXml(sprms, { styleIds: this.styleIds, numId: (ilfo) => this.numId(ilfo) }, p.istd);
     this.charCtx.styleToggle = (op) => this.styleToggle(p.istd, op);
+    this.curPara = p;
     const runs = this.runs(p.start, p.mark ? p.end - 1 : p.end, kind);
     // 段落标记的字符格式（空段落的行高由它决定）
     const markRuns = p.mark ? this.d.charRuns(p.end - 1, p.end) : [];
@@ -364,6 +400,20 @@ class Builder {
     if (!m) return "";
     this.marks.delete(cp);
     return m.join("");
+  }
+
+  /** 样式继承链上的段落属性（基准样式在前） */
+  private styleChainPapx(istd: number): Sprm[] {
+    const chain: Sprm[][] = [];
+    const seen = new Set<number>();
+    for (let i: number | undefined = istd; i !== undefined && i < 0x0fff && !seen.has(i); ) {
+      seen.add(i);
+      const st: StyleDef | undefined = this.d.styles[i];
+      if (!st) break;
+      chain.unshift(st.papx);
+      i = st.base;
+    }
+    return chain.flat();
   }
 
   /** 段落样式 / 字符样式里开关属性（粗体、斜体……）的值：0x81 表示"与样式相反" */
@@ -427,6 +477,8 @@ class Builder {
             const sym = last(sp, S.CSymbol)!;
             const font = this.fonts[sym.arg.readUInt16LE(0)] ?? "Symbol";
             el(`<w:sym w:font="${esc(font)}" w:char="${sym.arg.readUInt16LE(2).toString(16).toUpperCase().padStart(4, "0")}"/>`);
+            // 符号字符也是正文文字（核对文字完整性时计入）
+            if (kind === "main" && !inInstr) this.report.written++;
             break;
           }
           case 0x01: {
@@ -436,7 +488,7 @@ class Builder {
             if (pic?.blip) {
               const c = pic.crop;
               el(this.drawing(pic.blip, pic.w, pic.h, undefined, c.some(Boolean) ? [c[0] / (pic.w + c[0] + c[2]), c[1] / (pic.h + c[1] + c[3]), c[2] / (pic.w + c[0] + c[2]), c[3] / (pic.h + c[1] + c[3])] : undefined));
-            } else if (pic?.empty) this.note("有图片框在原文件中就是空的（没有图片数据），已略过");
+            } else if (pic?.empty) el(this.placeholder(pic.w, pic.h));
             else if (loc) this.note("有图片的格式无法识别，未转换");
             break;
           }
@@ -510,17 +562,34 @@ class Builder {
     }
     this.report.images++;
     this.report.floating++;
-    return `<w:drawing>${this.anchorOpen(anchor.a, id, cx, cy)}${graphic}</wp:anchor></w:drawing>`;
+    return `<w:drawing>${this.anchorOpen(anchor.a, id, cx, cy, anchor.shape)}${graphic}</wp:anchor></w:drawing>`;
   }
 
-  private anchorOpen(a: Anchor, id: number, cx: number, cy: number): string {
-    const rh = ["margin", "page", "column"][a.bx] ?? "column";
-    const rv = ["margin", "page", "paragraph"][a.by] ?? "paragraph";
+  /**
+   * 空的行内图片框：原文件里只用来占位（Word 2003 的"绘图画布"就是这样：画布本身是浮动的形状组合，
+   * 叠在一个同样大小的空行内图片上，由这个空图片撑开版面）。保留同样大小的空白，版面才不会上移。
+   */
+  private placeholder(wTw: number, hTw: number): string {
+    const id = this.drawingId++;
+    const cx = Math.max(1, Math.round(wTw * EMU)), cy = Math.max(1, Math.round(hTw * EMU));
+    return `<w:drawing><wp:inline distT="0" distB="0" distL="0" distR="0"><wp:extent cx="${cx}" cy="${cy}"/><wp:effectExtent l="0" t="0" r="0" b="0"/>` +
+      `<wp:docPr id="${id}" name="占位 ${id}"/><wp:cNvGraphicFramePr/><a:graphic><a:graphicData uri="http://schemas.microsoft.com/office/word/2010/wordprocessingShape">` +
+      `<wps:wsp><wps:cNvSpPr/><wps:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="${cx}" cy="${cy}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom><a:noFill/><a:ln><a:noFill/></a:ln></wps:spPr>` +
+      `<wps:bodyPr/></wps:wsp></a:graphicData></a:graphic></wp:inline></w:drawing>`;
+  }
+
+  private anchorOpen(a: Anchor, id: number, cx: number, cy: number, shape?: ShapeInfo): string {
+    // 形状自己的定位属性（posrelh / posrelv）比 SPA 更细：可以相对字符、行
+    const prh = shape?.props.get(0x390), prv = shape?.props.get(0x392);
+    const rh = (prh !== undefined ? ["margin", "page", "column", "character"][prh] : undefined) ?? ["margin", "page", "column"][a.bx] ?? "column";
+    const rv = (prv !== undefined ? ["margin", "page", "paragraph", "line"][prv] : undefined) ?? ["margin", "page", "paragraph"][a.by] ?? "paragraph";
+    const ah = ["", "left", "center", "right", "inside", "outside"][shape?.props.get(0x38f) ?? 0];
+    const av = ["", "top", "center", "bottom", "inside", "outside"][shape?.props.get(0x391) ?? 0];
     const behind = a.below && a.wr === 3;
     const wrap = a.wr === 3 ? "<wp:wrapNone/>" : a.wr === 1 ? "<wp:wrapTopAndBottom/>" : '<wp:wrapSquare wrapText="bothSides"/>';
     return `<wp:anchor distT="0" distB="0" distL="114300" distR="114300" simplePos="0" relativeHeight="${251658240 + id}" behindDoc="${behind ? 1 : 0}" locked="0" layoutInCell="1" allowOverlap="1">` +
-      `<wp:simplePos x="0" y="0"/><wp:positionH relativeFrom="${rh}"><wp:posOffset>${Math.round(a.x0 * EMU)}</wp:posOffset></wp:positionH>` +
-      `<wp:positionV relativeFrom="${rv}"><wp:posOffset>${Math.round(a.y0 * EMU)}</wp:posOffset></wp:positionV>` +
+      `<wp:simplePos x="0" y="0"/><wp:positionH relativeFrom="${rh}">${ah ? `<wp:align>${ah}</wp:align>` : `<wp:posOffset>${Math.round(a.x0 * EMU)}</wp:posOffset>`}</wp:positionH>` +
+      `<wp:positionV relativeFrom="${rv}">${av ? `<wp:align>${av}</wp:align>` : `<wp:posOffset>${Math.round(a.y0 * EMU)}</wp:posOffset>`}</wp:positionV>` +
       `<wp:extent cx="${cx}" cy="${cy}"/><wp:effectExtent l="0" t="0" r="0" b="0"/>${wrap}`;
   }
 
@@ -532,7 +601,7 @@ class Builder {
     const rel = hdr ? cp - this.hddStart : cp;
     const a = list.find((x) => x.cp === rel);
     if (!a) return undefined;
-    const shape = this.d.shapes.get(a.spid);
+    let shape = this.d.shapes.get(a.spid);
     if (!shape) { this.note("部分浮动图形缺少绘图数据，未转换"); return undefined; }
     const pib = shape.props.get(0x104);
     const txid = shape.props.get(0x80);
@@ -540,22 +609,62 @@ class Builder {
     if (pib && !shape.group) {
       const blip = this.d.blipAt(pib);
       if (!blip) { this.note("部分浮动图片的数据缺失，未转换"); return undefined; }
-      const f = (k: number) => { const v = shape.props.get(k); return v ? (v | 0) / 65536 : 0; };
+      const f = (k: number) => { const v = shape!.props.get(k); return v ? (v | 0) / 65536 : 0; };
       return this.drawing(blip, w, h, { a, shape }, [f(0x102), f(0x100), f(0x103), f(0x101)]);
     }
-    if (txid !== undefined && !shape.group) {
-      const map = hdr ? this.d.txbx.hdr : this.d.txbx.main;
-      const story = map.get(a.spid) ?? (hdr ? this.d.txbx.hdrList : this.d.txbx.mainList)[(txid >>> 16) - 1];
+    if (txid !== undefined && !shape.group && (shape.type === 1 || shape.type === 202)) {
+      const story = this.storyOf(shape, hdr);
       if (story) return this.textBox(a, shape, story);
     }
-    this.note(shape.group ? "形状组合（多个图形组合在一起）未转换" : "自选图形（线条、箭头、色块等）未转换");
-    return undefined;
+    // 形状组合（含 Word 2003 的绘图画布）与其他自选图形：线条、箭头、连接线、流程图、自由曲线……
+    if (isWordArt(shape.type)) { this.note("艺术字未转换"); return undefined; }
+    const id = this.drawingId++;
+    const box = rotatedBox([a.x0, a.y0, a.x1, a.y1], shape);
+    const cx = Math.max(1, Math.round((box[2] - box[0]) * EMU)), cy = Math.max(1, Math.round((box[3] - box[1]) * EMU));
+    const pos = { ...a, x0: box[0], y0: box[1], x1: box[2], y1: box[3] };
+    shape = this.lineStartAnchor(cp, pos, shape);
+    this.report.shapes++;
+    if (shape.flags & 1 && shape.children) {
+      // 组合内的坐标一律换算成 EMU（有的程序把子形状坐标直接当 EMU 用，文字会错位）
+      const tf = mapRect(shape.coords ?? [0, 0, cx, cy], [0, 0, cx, cy]);
+      const kids = shape.children.map((k) => this.shapeChild(k, hdr, tf)).join("");
+      return `<w:drawing>${this.anchorOpen(pos, id, cx, cy, shape)}<wp:docPr id="${id}" name="组合 ${id}"/><wp:cNvGraphicFramePr/>` +
+        `<a:graphic><a:graphicData uri="${WPG}"><wpg:wgp><wpg:cNvGrpSpPr/><wpg:grpSpPr>${xfrm([0, 0, cx, cy], shape, [0, 0, cx, cy], true)}</wpg:grpSpPr>${kids}</wpg:wgp></a:graphicData></a:graphic></wp:anchor></w:drawing>`;
+    }
+    return `<w:drawing>${this.anchorOpen(pos, id, cx, cy, shape)}<wp:docPr id="${id}" name="形状 ${id}"/><wp:cNvGraphicFramePr/>` +
+      `<a:graphic><a:graphicData uri="${WPS}">${this.wsp(shape, [0, 0, cx, cy], hdr, false, true)}</a:graphicData></a:graphic></wp:anchor></w:drawing>`;
   }
 
-  private textBox(a: Anchor, shape: ShapeInfo, story: Story): string {
+  /**
+   * 相对"字符 / 行"定位、锚点又在段落开头时，换成等价的"栏 / 段落"定位（加上段落缩进）。
+   * Word 两种都认；LibreOffice 对组合里文本框的"字符 / 行"定位处理有误（文字和形状会错开）。
+   */
+  private lineStartAnchor(cp: number, pos: Anchor, shape: ShapeInfo): ShapeInfo {
+    const p = this.curPara, prh = shape.props.get(0x390), prv = shape.props.get(0x392);
+    if (!p || (prh !== 3 && prv !== 3) || shape.props.get(0x38f) || shape.props.get(0x391)) return shape;
+    for (let k = p.start; k < cp; k++) if (!"\x08\x01".includes(this.d.text[k])) return shape;
+    const sp = [...this.styleChainPapx(p.istd), ...p.sprms];
+    const jc = last(sp, S.PJc, S.PJc80)?.arg[0] ?? 0;
+    if (jc !== 0 && jc !== 3) return shape;
+    const props = new Map(shape.props);
+    if (prh === 3) {
+      pos.x0 += (last(sp, S.PDxaLeft, S.PDxaLeft80)?.arg.readInt16LE(0) ?? 0) + (last(sp, S.PDxaLeft1, S.PDxaLeft180)?.arg.readInt16LE(0) ?? 0);
+      props.set(0x390, 2);
+    }
+    if (prv === 3) props.set(0x392, 2);
+    return { ...shape, props };
+  }
+
+  /** 文本框形状对应的文字（按形状 ID，或按 lTxid 的序号） */
+  private storyOf(shape: ShapeInfo, hdr: boolean): Story | undefined {
+    const txid = shape.props.get(0x80);
+    if (txid === undefined) return undefined;
+    return (hdr ? this.d.txbx.hdr : this.d.txbx.main).get(shape.spid) ?? (hdr ? this.d.txbx.hdrList : this.d.txbx.mainList)[(txid >>> 16) - 1];
+  }
+
+  /** 文本框里的段落 */
+  private storyXml(story: Story): string {
     this.report.textBoxes++;
-    const id = this.drawingId++;
-    const cx = Math.max(1, Math.round((a.x1 - a.x0) * EMU)), cy = Math.max(1, Math.round((a.y1 - a.y0) * EMU));
     const prev = this.inTextBox;
     this.inTextBox = true;
     const saved = this.fieldDepth;
@@ -567,6 +676,58 @@ class Builder {
     if (!inner) inner = "<w:p/>";
     this.fieldDepth = saved;
     this.inTextBox = prev;
+    return inner;
+  }
+
+  /** 组合里的一个形状（tf：把组合坐标系换算成 EMU） */
+  private shapeChild(spid: number, hdr: boolean, tf: (r: Rect) => Rect): string {
+    const sh = this.d.shapes.get(spid);
+    if (!sh || sh.flags & 8) return "";
+    this.report.shapes++;
+    const r = tf(sh.child ?? [0, 0, 1, 1]);
+    if (sh.flags & 1 && sh.children) {
+      const inner = mapRect(sh.coords ?? sh.child ?? [0, 0, 1, 1], r);
+      return `<wpg:grpSp><wpg:cNvGrpSpPr/><wpg:grpSpPr>${xfrm(r, sh, r, true)}</wpg:grpSpPr>${sh.children.map((k) => this.shapeChild(k, hdr, inner)).join("")}</wpg:grpSp>`;
+    }
+    if (isWordArt(sh.type)) { this.note("艺术字未转换"); return ""; }
+    const pib = sh.props.get(0x104);
+    const blip = pib ? this.d.blipAt(pib) : undefined;
+    if (blip) {
+      this.report.images++;
+      const rid = this.rel(this.part, R_IMAGE, this.mediaTarget(blip));
+      const id = this.drawingId++;
+      return `<pic:pic><pic:nvPicPr><pic:cNvPr id="${id}" name="图片 ${id}"/><pic:cNvPicPr/></pic:nvPicPr><pic:blipFill><a:blip r:embed="${rid}"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill>` +
+        `<pic:spPr>${xfrm(r, sh)}<a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr></pic:pic>`;
+    }
+    return this.wsp(sh, r, hdr, true);
+  }
+
+  /** 一个形状：几何、填充、线条、文字 */
+  private wsp(sh: ShapeInfo, r: [number, number, number, number], hdr: boolean, inGroup: boolean, topLevel = false): string {
+    const p = sh.props;
+    const line = CONNECTORS.has(sh.type) || sh.type === 20;
+    const story = this.storyOf(sh, hdr);
+    const txbx = story ? `<wps:txbx><w:txbxContent>${this.storyXml(story)}</w:txbxContent></wps:txbx>` : "";
+    const at = p.get(0x87) ?? 0;
+    if (story && at === 0 && invisible(p)) {
+      // 看不见的文字框：按段落数留够高度（约每段一行 + 段后距），免得排版程序把放不下的文字裁掉
+      let paras = 0;
+      for (let k = story.start; k < story.end; k++) if (this.d.text[k] === "\r") paras++;
+      const need = Math.max(1, paras - 1) * 26.4 * 12700;
+      if (r[3] - r[1] < need) r = [r[0], r[1], r[2], r[1] + need];
+    }
+    const ins = (k: number, d: number) => p.get(k) ?? d;
+    const body = `<wps:bodyPr rot="0" vert="horz" wrap="${p.get(0x85) === 2 ? "none" : "square"}" lIns="${ins(0x81, 91440)}" tIns="${ins(0x82, 45720)}" rIns="${ins(0x83, 91440)}" bIns="${ins(0x84, 45720)}" ` +
+      `anchor="${["t", "ctr", "b", "t", "ctr", "b"][at] ?? "t"}" anchorCtr="${at >= 3 && at <= 5 ? 1 : 0}">${invisible(p) ? "<a:spAutoFit/>" : "<a:noAutofit/>"}</wps:bodyPr>`;
+    const id = inGroup ? this.drawingId++ : 0;
+    return `<wps:wsp>${inGroup ? `<wps:cNvPr id="${id}" name="形状 ${id}"/>` : ""}${line ? "<wps:cNvCnPr/>" : `<wps:cNvSpPr${sh.type === 202 ? ' txBox="1"' : ""}/>`}` +
+      `<wps:spPr>${topLevel ? xfrm(r, sh, undefined, true) : xfrm(r, sh)}${geometry(sh, r)}${line ? "<a:noFill/>" : fillXml(p)}${lineXml(p)}</wps:spPr>${txbx}${body}</wps:wsp>`;
+  }
+
+  private textBox(a: Anchor, shape: ShapeInfo, story: Story): string {
+    const id = this.drawingId++;
+    const cx = Math.max(1, Math.round((a.x1 - a.x0) * EMU)), cy = Math.max(1, Math.round((a.y1 - a.y0) * EMU));
+    const inner = this.storyXml(story);
     const p = shape.props;
     const bools = p.get(0x1bf), lineBools = p.get(0x1ff);
     const filled = bools === undefined || !(bools & 0x100000) || (bools & 0x10) !== 0;
@@ -579,7 +740,7 @@ class Builder {
     const fill = filled ? `<a:solidFill><a:srgbClr val="${col(p.get(0x181), "FFFFFF")}"/></a:solidFill>` : "<a:noFill/>";
     const line = lined ? `<a:ln w="${p.get(0x1cb) ?? 9525}"><a:solidFill><a:srgbClr val="${col(p.get(0x1c0), "000000")}"/></a:solidFill></a:ln>` : "<a:ln><a:noFill/></a:ln>";
     const ins = (k: number, d: number) => p.get(k) ?? d;
-    return `<w:drawing>${this.anchorOpen(a, id, cx, cy)}<wp:docPr id="${id}" name="文本框 ${id}"/><wp:cNvGraphicFramePr/>` +
+    return `<w:drawing>${this.anchorOpen(a, id, cx, cy, shape)}<wp:docPr id="${id}" name="文本框 ${id}"/><wp:cNvGraphicFramePr/>` +
       `<a:graphic><a:graphicData uri="http://schemas.microsoft.com/office/word/2010/wordprocessingShape"><wps:wsp><wps:cNvSpPr txBox="1"/>` +
       `<wps:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="${cx}" cy="${cy}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom>${fill}${line}</wps:spPr>` +
       `<wps:txbx><w:txbxContent>${inner}</w:txbxContent></wps:txbx>` +
@@ -683,7 +844,7 @@ class Builder {
     const xml = `${XML}<w:settings xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">` +
       `<w:defaultTabStop w:val="${d.dop.dxaTab}"/>${d.dop.facingPages ? "<w:evenAndOddHeaders/>" : ""}` +
       `<w:characterSpacingControl w:val="doNotCompress"/>${notes}` +
-      `<w:compat><w:compatSetting w:name="compatibilityMode" w:uri="http://schemas.microsoft.com/office/word" w:val="11"/></w:compat></w:settings>`;
+      `<w:compat>${compatXml(d.dop.compat)}<w:compatSetting w:name="compatibilityMode" w:uri="http://schemas.microsoft.com/office/word" w:val="11"/></w:compat></w:settings>`;
     this.files.push({ name: "word/settings.xml", data: Buffer.from(xml, "utf8") });
     this.rel("word/document.xml", "http://schemas.openxmlformats.org/officeDocument/2006/relationships/settings", "settings.xml");
   }
@@ -857,4 +1018,175 @@ export function visibleChars(t: string): number {
     n++;
   }
   return n;
+}
+
+/** <w:compat> 子元素必须按架构顺序排列 */
+const COMPAT_ORDER = [
+  "useSingleBorderforContiguousCells", "wpJustification", "noTabHangInd", "noLeading", "spaceForUL", "noColumnBalance",
+  "balanceSingleByteDoubleByteWidth", "noExtraLineSpacing", "doNotLeaveBackslashAlone", "ulTrailSpace", "doNotExpandShiftReturn",
+  "spacingInWholePoints", "lineWrapLikeWord6", "printBodyTextBeforeHeader", "printColBlack", "wpSpaceWidth", "showBreaksInFrames",
+  "subFontBySize", "suppressBottomSpacing", "suppressTopSpacing", "suppressSpacingAtTopOfPage", "suppressTopSpacingWP",
+  "suppressSpBfAfterPgBrk", "swapBordersFacingPages", "convMailMergeEsc", "truncateFontHeightsLikeWP6", "mwSmallCaps",
+  "usePrinterMetrics", "doNotSuppressParagraphBorders", "wrapTrailSpaces", "footnoteLayoutLikeWW8", "shapeLayoutLikeWW8",
+  "alignTablesRowByRow", "forgetLastTabAlignment", "adjustLineHeightInTable", "autoSpaceLikeWord95", "noSpaceRaiseLower",
+  "doNotUseHTMLParagraphAutoSpacing", "layoutRawTableWidth", "layoutTableRowsApart", "useWord97LineBreakRules",
+  "doNotBreakWrappedTables", "doNotSnapToGridInCell", "selectFldWithFirstOrLastChar", "applyBreakingRules",
+  "doNotWrapTextWithPunct", "doNotUseEastAsianBreakRules", "useWord2002TableStyleRules", "growAutofit", "useFELayout",
+  "useNormalStyleForList", "doNotUseIndentAsNumberingTabStop", "useAltKinsokuLineBreakRules", "allowSpaceOfSameStyleInTable",
+  "doNotSuppressIndentation", "doNotAutofitConstrainedTables", "autofitToFirstFixedWidthCell", "underlineTabInNumList",
+  "displayHangulFixedWidth", "splitPgBreakAndParaMark", "doNotVertAlignCellWithSp", "doNotBreakConstrainedForcedTable",
+  "doNotVertAlignInTxbx", "useAnsiKerningPairs", "cachedColBalance",
+];
+function compatXml(flags: string[]): string {
+  return flags.filter((f) => COMPAT_ORDER.includes(f)).sort((a, b) => COMPAT_ORDER.indexOf(a) - COMPAT_ORDER.indexOf(b)).map((f) => `<w:${f}/>`).join("");
+}
+
+// ---------------------------------------------------------------------------
+// 自选图形（OfficeArt → DrawingML）
+// ---------------------------------------------------------------------------
+
+/** OfficeArt 预设形状编号 → DrawingML 预设几何 */
+const PRESET: Record<number, string> = {
+  1: "rect", 2: "roundRect", 3: "ellipse", 4: "diamond", 5: "triangle", 6: "rtTriangle", 7: "parallelogram", 8: "trapezoid",
+  9: "hexagon", 10: "octagon", 11: "plus", 12: "star5", 13: "rightArrow", 15: "homePlate", 16: "cube", 20: "line", 21: "plaque",
+  22: "can", 23: "donut", 32: "straightConnector1", 33: "bentConnector2", 34: "bentConnector3", 35: "bentConnector4", 36: "bentConnector5",
+  37: "curvedConnector2", 38: "curvedConnector3", 39: "curvedConnector4", 40: "curvedConnector5", 55: "chevron", 56: "pentagon",
+  61: "wedgeRectCallout", 62: "wedgeRoundRectCallout", 63: "wedgeEllipseCallout", 64: "wave", 65: "foldedCorner", 66: "leftArrow",
+  67: "downArrow", 68: "upArrow", 69: "leftRightArrow", 70: "upDownArrow", 73: "lightningBolt", 74: "heart", 75: "rect", 76: "quadArrow",
+  84: "bevel", 85: "leftBracket", 86: "rightBracket", 87: "leftBrace", 88: "rightBrace", 96: "smileyFace", 109: "flowChartProcess",
+  110: "flowChartDecision", 111: "flowChartInputOutput", 112: "flowChartPredefinedProcess", 113: "flowChartInternalStorage",
+  114: "flowChartDocument", 115: "flowChartMultidocument", 116: "flowChartTerminator", 117: "flowChartPreparation",
+  118: "flowChartManualInput", 119: "flowChartManualOperation", 120: "flowChartConnector", 121: "flowChartPunchedCard",
+  122: "flowChartPunchedTape", 123: "flowChartSummingJunction", 124: "flowChartOr", 125: "flowChartCollate", 126: "flowChartSort",
+  127: "flowChartExtract", 128: "flowChartMerge", 130: "flowChartOnlineStorage", 131: "flowChartMagneticTape", 132: "flowChartMagneticDisk",
+  133: "flowChartMagneticDrum", 134: "flowChartDisplay", 135: "flowChartDelay", 176: "flowChartAlternateProcess", 177: "flowChartOffpageConnector",
+  183: "sun", 184: "moon", 185: "bracketPair", 186: "bracePair", 202: "rect",
+};
+const CONNECTORS = new Set([32, 33, 34, 35, 36, 37, 38, 39, 40]);
+/** 艺术字（msosptTextPlainText … msosptTextCanDown） */
+const isWordArt = (t: number) => t >= 136 && t <= 175;
+const ARROW = ["none", "triangle", "stealth", "diamond", "oval", "arrow"];
+const ARROW_SIZE = ["sm", "med", "lg"];
+const DASH = ["solid", "sysDash", "sysDot", "sysDashDot", "sysDashDotDot", "dot", "dash", "lgDash", "dashDot", "lgDashDot", "lgDashDotDot"];
+
+type Rect = [number, number, number, number];
+/** 线性换算：坐标系 from 的矩形 → 坐标系 to */
+function mapRect(from: Rect, to: Rect): (r: Rect) => Rect {
+  const sx = (to[2] - to[0]) / Math.max(1, from[2] - from[0]), sy = (to[3] - to[1]) / Math.max(1, from[3] - from[1]);
+  return (r) => [to[0] + (r[0] - from[0]) * sx, to[1] + (r[1] - from[1]) * sy, to[0] + (r[2] - from[0]) * sx, to[1] + (r[3] - from[1]) * sy];
+}
+
+/** OfficeArt 颜色（RGB + 标志字节）；系统色、方案色等取默认值 */
+function artColor(v: number | undefined, def: string): string {
+  if (v === undefined || v >>> 24 > 0x10 || (v >>> 24) & 0x18) return def;
+  const b = Buffer.alloc(4);
+  b.writeUInt32LE(v >>> 0);
+  b[3] = 0;
+  return cv(b);
+}
+
+/** 旋转 45°–135°、225°–315° 时，存的是旋转后的外框：换回未旋转的形状（中心不变，宽高互换） */
+function rotatedBox(r: [number, number, number, number], sh: ShapeInfo): [number, number, number, number] {
+  const deg = (((sh.props.get(4) ?? 0) | 0) / 65536 % 360 + 360) % 360;
+  if (!((deg >= 45 && deg < 135) || (deg >= 225 && deg < 315))) return r;
+  const cx = (r[0] + r[2]) / 2, cy = (r[1] + r[3]) / 2, hw = (r[3] - r[1]) / 2, hh = (r[2] - r[0]) / 2;
+  return [cx - hw, cy - hh, cx + hw, cy + hh];
+}
+
+function xfrm(r: [number, number, number, number], sh: ShapeInfo, ch?: [number, number, number, number], exact = false): string {
+  const [l, t, rr, b] = exact ? r : rotatedBox(r, sh);
+  const deg = ((sh.props.get(4) ?? 0) | 0) / 65536;
+  const attrs = (deg ? ` rot="${Math.round(deg * 60000)}"` : "") + (sh.flags & 0x40 ? ' flipH="1"' : "") + (sh.flags & 0x80 ? ' flipV="1"' : "");
+  const kids = ch ? `<a:chOff x="${ch[0]}" y="${ch[1]}"/><a:chExt cx="${Math.max(1, ch[2] - ch[0])}" cy="${Math.max(1, ch[3] - ch[1])}"/>` : "";
+  return `<a:xfrm${attrs}><a:off x="${Math.round(l)}" y="${Math.round(t)}"/><a:ext cx="${Math.max(1, Math.round(rr - l))}" cy="${Math.max(1, Math.round(b - t))}"/>${kids}</a:xfrm>`;
+}
+
+/** 没有填充也没有边框的文字框（只是放文字的容器）：文字超出时不裁掉（Word 里这类标注文字会露出框外） */
+function invisible(p: Map<number, number>): boolean {
+  const fb = p.get(0x1bf), lb = p.get(0x1ff);
+  return fb !== undefined && (fb & 0x100000) !== 0 && !(fb & 0x10) && lb !== undefined && (lb & 0x80000) !== 0 && !(lb & 0x8);
+}
+
+function fillXml(p: Map<number, number>): string {
+  const bools = p.get(0x1bf);
+  const filled = bools === undefined || !(bools & 0x100000) || (bools & 0x10) !== 0;
+  if (!filled) return "<a:noFill/>";
+  const op = p.get(0x182);
+  const alpha = op !== undefined && op < 65536 ? `<a:alpha val="${Math.round((op / 65536) * 100000)}"/>` : "";
+  return `<a:solidFill><a:srgbClr val="${artColor(p.get(0x181), "FFFFFF")}">${alpha}</a:srgbClr></a:solidFill>`;
+}
+
+function lineXml(p: Map<number, number>): string {
+  const lb = p.get(0x1ff);
+  const lined = lb === undefined || !(lb & 0x80000) || (lb & 0x8) !== 0;
+  if (!lined) return "<a:ln><a:noFill/></a:ln>";
+  const dash = p.get(0x1ce) ?? 0;
+  const end = (tag: string, k: number, kw: number, kl: number) => {
+    const t = p.get(k) ?? 0;
+    return t ? `<a:${tag} type="${ARROW[t] ?? "triangle"}" w="${ARROW_SIZE[p.get(kw) ?? 1] ?? "med"}" len="${ARROW_SIZE[p.get(kl) ?? 1] ?? "med"}"/>` : "";
+  };
+  return `<a:ln w="${p.get(0x1cb) ?? 9525}"><a:solidFill><a:srgbClr val="${artColor(p.get(0x1c0), "000000")}"/></a:solidFill>` +
+    (dash ? `<a:prstDash val="${DASH[dash] ?? "dash"}"/>` : "") + end("headEnd", 0x1d0, 0x1d2, 0x1d3) + end("tailEnd", 0x1d1, 0x1d4, 0x1d5) + "</a:ln>";
+}
+
+/** IMsoArray：元素个数、元素大小、数据 */
+function msoArray(b: Buffer | undefined): { n: number; size: number; data: Buffer } | undefined {
+  if (!b || b.length < 6) return undefined;
+  const cb = b.readUInt16LE(4);
+  return { n: b.readUInt16LE(0), size: cb === 0xfff0 ? 4 : cb, data: b.subarray(6) };
+}
+
+function geometry(sh: ShapeInfo, r: Rect): string {
+  // 自由曲线（0），以及没有预设几何、只靠顶点描述的形状（如 LibreOffice 写的 0xFFF）
+  if (sh.type === 0 || PRESET[sh.type] === undefined) {
+    const g = customGeometry(sh);
+    if (g) return g;
+  }
+  // 认不出的形状：几乎没有高度（或宽度）的当作线条，其余当作矩形
+  const w = Math.abs(r[2] - r[0]), h = Math.abs(r[3] - r[1]);
+  const prst = PRESET[sh.type] ?? (Math.min(w, h) < Math.max(w, h) * 0.02 ? "line" : "rect");
+  const adj = sh.props.get(0x147);
+  if (adj !== undefined && (CONNECTORS.has(sh.type) || sh.type === 2)) {
+    return `<a:prstGeom prst="${prst}"><a:avLst><a:gd name="${sh.type === 2 ? "adj" : "adj1"}" fmla="val ${Math.round(((adj | 0) * 100000) / 21600)}"/></a:avLst></a:prstGeom>`;
+  }
+  return `<a:prstGeom prst="${prst}"><a:avLst/></a:prstGeom>`;
+}
+
+/** 自由曲线：顶点（pVertices）+ 路径段（pSegmentInfo）→ custGeom */
+function customGeometry(sh: ShapeInfo): string | undefined {
+  const v = msoArray(sh.complex.get(0x145));
+  if (!v || (v.size !== 4 && v.size !== 8)) return undefined;
+  const pts: Array<[number, number]> = [];
+  for (let k = 0; k < v.n && (k + 1) * v.size <= v.data.length; k++) {
+    const o = k * v.size;
+    pts.push(v.size === 8 ? [v.data.readInt32LE(o), v.data.readInt32LE(o + 4)] : [v.data.readInt16LE(o), v.data.readInt16LE(o + 2)]);
+  }
+  // 顶点引用公式（0x80000000 + 序号）的形状无法直接画：交给预设几何
+  if (!pts.length || pts.some(([x, y]) => x < -1e6 || y < -1e6)) return undefined;
+  const p = sh.props;
+  const gl = (p.get(0x140) ?? 0) | 0, gt = (p.get(0x141) ?? 0) | 0;
+  let gr = (p.get(0x142) ?? 21600) | 0, gb = (p.get(0x143) ?? 21600) | 0;
+  if (gr <= gl) gr = Math.max(gl + 1, ...pts.map(([x]) => x));
+  if (gb <= gt) gb = Math.max(gt + 1, ...pts.map(([, y]) => y));
+  const pt = ([x, y]: [number, number]) => `<a:pt x="${x - gl}" y="${y - gt}"/>`;
+  const out: string[] = [];
+  let i = 0;
+  const segs = msoArray(sh.complex.get(0x146));
+  if (!segs || segs.size !== 2 || !segs.n) {
+    out.push(`<a:moveTo>${pt(pts[0])}</a:moveTo>`);
+    for (i = 1; i < pts.length; i++) out.push(`<a:lnTo>${pt(pts[i])}</a:lnTo>`);
+  } else {
+    for (let k = 0; k < segs.n && k * 2 + 2 <= segs.data.length; k++) {
+      const sv = segs.data.readUInt16LE(k * 2), type = sv >> 13, cnt = sv & 0x1fff;
+      if (type === 0) for (let j = 0; j < Math.max(1, cnt) && i < pts.length; j++) out.push(`<a:lnTo>${pt(pts[i++])}</a:lnTo>`);
+      else if (type === 1) for (let j = 0; j < Math.max(1, cnt) && i + 2 < pts.length; j++, i += 3) out.push(`<a:cubicBezTo>${pt(pts[i])}${pt(pts[i + 1])}${pt(pts[i + 2])}</a:cubicBezTo>`);
+      else if (type === 2) { if (i < pts.length) out.push(`<a:moveTo>${pt(pts[i++])}</a:moveTo>`); }
+      else if (type === 3) out.push("<a:close/>");
+      else if (type === 5 || type === 6) i += sv & 0xff;
+    }
+  }
+  if (!out.length) return undefined;
+  if (!out[0].startsWith("<a:moveTo>")) out.unshift(`<a:moveTo>${pt(pts[0])}</a:moveTo>`);
+  return `<a:custGeom><a:avLst/><a:gdLst/><a:ahLst/><a:cxnLst/><a:rect l="0" t="0" r="r" b="b"/>` +
+    `<a:pathLst><a:path w="${Math.max(1, gr - gl)}" h="${Math.max(1, gb - gt)}">${out.join("")}</a:path></a:pathLst></a:custGeom>`;
 }
