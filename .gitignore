@@ -5,3 +5,4 @@ data/
 .env
 .doc-agent/settings.local.json
 *.log
+/dist/

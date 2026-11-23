@@ -1,0 +1,48 @@
+# 发布 pdf2word（doc-agent 内置 PDF → Word 引擎的命令行发布包，见 cli/pdf2word.ts 与 README 的"pdf2word"一节）
+# 推送标签 pdf2word-v<版本> 时：类型检查、测试、构建并冒烟测试、核对可复现，然后把压缩包与摘要附到同名 Release。
+# 发布包是纯 JS，一个包同时适用于 x64 与 arm64，只在这一个平台上构建。
+name: pdf2word release
+
+on:
+  push:
+    tags: ["pdf2word-v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - name: Build and smoke-test
+        run: npm run build:pdf2word
+      - name: Check the tag matches the version, and a second build has the same digest
+        run: |
+          version="${GITHUB_REF_NAME#pdf2word-v}"
+          if [ ! -f "dist/pdf2word-$version.tgz" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match VERSION in scripts/build-pdf2word.mjs" >&2
+            exit 1
+          fi
+          cp "dist/pdf2word-$version.tgz.sha256" "$RUNNER_TEMP/first.sha256"
+          npm run build:pdf2word -- --no-smoke
+          cmp "$RUNNER_TEMP/first.sha256" "dist/pdf2word-$version.tgz.sha256"
+          echo "PDF2WORD_VERSION=$version" >> "$GITHUB_ENV"
+      - name: Attach to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          files="dist/pdf2word-$PDF2WORD_VERSION.tgz dist/pdf2word-$PDF2WORD_VERSION.tgz.sha256"
+          if gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" $files --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" $files --title "pdf2word $PDF2WORD_VERSION" \
+              --notes "sha256 $(cut -d' ' -f1 "dist/pdf2word-$PDF2WORD_VERSION.tgz.sha256")"
+          fi
