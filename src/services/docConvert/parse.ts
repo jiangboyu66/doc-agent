@@ -24,11 +24,25 @@ export interface Section { cpEnd: number; sprms: Sprm[] }
 export interface Blip { ext: "png" | "jpeg" | "emf" | "wmf" | "bmp" | "tiff"; data: Buffer }
 /** 浮动图形的锚点（SPA） */
 export interface Anchor { cp: number; spid: number; x0: number; y0: number; x1: number; y1: number; bx: number; by: number; wr: number; wrk: number; below: boolean }
-export interface ShapeInfo { spid: number; type: number; props: Map<number, number>; group: boolean }
+export interface ShapeInfo {
+  spid: number; type: number; props: Map<number, number>;
+  /** 是组合本身，或在组合里 */
+  group: boolean;
+  /** FSP 标志：0x1 组合、0x2 组合内的形状、0x40 水平翻转、0x80 垂直翻转 */
+  flags: number;
+  /** 组合内形状在组合坐标系里的位置（左、上、右、下） */
+  child?: [number, number, number, number];
+  /** 组合的坐标系（左、上、右、下） */
+  coords?: [number, number, number, number];
+  /** 组合内的形状（按绘制顺序） */
+  children?: number[];
+  /** 复杂属性（如自由曲线的顶点、路径） */
+  complex: Map<number, Buffer>;
+}
 export interface Story { start: number; end: number }
 export interface Note { ref: number; story: Story; auto: boolean }
 export interface Comment { ref: number; story: Story; author: string; initials: string; range?: Story }
-export interface PicInfo { blip?: Blip; w: number; h: number; crop: [number, number, number, number] }
+export interface PicInfo { blip?: Blip; w: number; h: number; crop: [number, number, number, number]; /** 空的图片框：形状里没有引用任何图片（原文件中就是空的） */ empty?: boolean }
 
 const td1252 = new TextDecoder("windows-1252");
 
@@ -54,7 +68,7 @@ export class DocFile {
   readonly endnotes: Note[];
   readonly comments: Comment[];
   readonly rmarkAuthors: string[];
-  readonly dop: { dxaTab: number; facingPages: boolean };
+  readonly dop: { dxaTab: number; facingPages: boolean; compat: string[] };
   /** 文本框故事（正文 / 页眉）：FTXBXS 里的形状 id → 故事 */
   readonly txbx: { main: Map<number, Story>; hdr: Map<number, Story>; mainList: Story[]; hdrList: Story[] };
   readonly anchorsMain: Anchor[];
@@ -202,7 +216,7 @@ export class DocFile {
 
     // 文档属性
     const dop = tbl(31);
-    this.dop = { dxaTab: dop.length >= 12 ? dop.readUInt16LE(10) || 720 : 720, facingPages: dop.length > 0 && (dop[0] & 1) === 1 };
+    this.dop = { dxaTab: dop.length >= 12 ? dop.readUInt16LE(10) || 720 : 720, facingPages: dop.length > 0 && (dop[0] & 1) === 1, compat: readCompat(dop) };
 
     // 文本框故事、浮动图形
     this.txbx = { main: new Map(), hdr: new Map(), mainList: [], hdrList: [] };
@@ -483,13 +497,18 @@ export class DocFile {
       if (buf.readUInt16LE(o + 2) !== 0xf002) break;
       const len = buf.readUInt32LE(o + 4);
       // 形状组：最外层（depth 0）是整页的"总组"，其中的形状都是顶层形状；
-      // 嵌套的组（depth ≥ 1）第一个形状是组本身（锚点指向它），其余是组内形状
-      const spgr = (s: number, e: number, depth: number) => {
-        let first = true;
+      // 嵌套的组（depth ≥ 1）第一个形状是组本身（锚点指向它），其余是组内形状（含更深的组）
+      const spgr = (s: number, e: number, depth: number): number | undefined => {
+        let self: number | undefined;
         walk(s, e, (t3, _i3, s3, l3) => {
-          if (t3 === 0xf004) { this.readShape(buf, s3, l3, walk, depth > 1 || (depth === 1 && !first)); first = false; }
-          else if (t3 === 0xf003) spgr(s3, s3 + l3, depth + 1);
+          let id: number | undefined;
+          if (t3 === 0xf004) id = this.readShape(buf, s3, l3, walk, depth > 1 || (depth === 1 && self !== undefined));
+          else if (t3 === 0xf003) id = spgr(s3, s3 + l3, depth + 1);
+          if (id === undefined || depth === 0) return;
+          if (self === undefined) self = id;
+          else this.shapes.get(self)?.children?.push(id);
         });
+        return self;
       };
       walk(o + 8, o + 8 + len, (type, _inst, s2, l2) => {
         if (type === 0xf003) spgr(s2, s2 + l2, 0);
@@ -499,16 +518,41 @@ export class DocFile {
     }
   }
 
-  private readShape(buf: Buffer, s: number, l: number, walk: (s: number, e: number, fn: (type: number, inst: number, o: number, len: number) => void) => void, inGroup: boolean): void {
-    let spid = -1, type = 0, group = false;
+  private readShape(buf: Buffer, s: number, l: number, walk: (s: number, e: number, fn: (type: number, inst: number, o: number, len: number) => void) => void, inGroup: boolean): number | undefined {
+    let spid = -1, type = 0, flags = 0;
+    let child: ShapeInfo["child"], coords: ShapeInfo["coords"];
     const props = new Map<number, number>();
+    const complex = new Map<number, Buffer>();
+    const rect = (o: number): [number, number, number, number] => [buf.readInt32LE(o), buf.readInt32LE(o + 4), buf.readInt32LE(o + 8), buf.readInt32LE(o + 12)];
     walk(s, s + l, (t, inst, o, len) => {
-      if (t === 0xf00a && len >= 8) { spid = buf.readUInt32LE(o); type = inst; group = (buf.readUInt32LE(o + 4) & 1) === 1; }
+      if (t === 0xf00a && len >= 8) { spid = buf.readUInt32LE(o); type = inst; flags = buf.readUInt32LE(o + 4); }
+      else if (t === 0xf009 && len >= 16) coords = rect(o);
+      else if (t === 0xf00f && len >= 16) child = rect(o);
       else if (t === 0xf00b || t === 0xf121 || t === 0xf122) {
-        for (let k = 0; k < inst && k * 6 + 6 <= len; k++) props.set(buf.readUInt16LE(o + k * 6) & 0x3fff, buf.readUInt32LE(o + k * 6 + 2));
+        // 属性表：每项 6 字节；带 fComplex 标志的属性，数据按顺序接在表后面
+        let data = o + inst * 6;
+        for (let k = 0; k < inst && k * 6 + 6 <= len; k++) {
+          const pid = buf.readUInt16LE(o + k * 6), val = buf.readUInt32LE(o + k * 6 + 2);
+          props.set(pid & 0x3fff, val);
+          if (pid & 0x8000) {
+            // 几何数组（IMsoArray）：有的程序写的长度不含 6 字节的数组头
+            let size = val;
+            const id = pid & 0x3fff;
+            if (id >= 0x145 && id <= 0x158 && data + 6 <= o + len) {
+              const n = buf.readUInt16LE(data), cb = buf.readUInt16LE(data + 4);
+              if (n * (cb === 0xfff0 ? 4 : cb) === val && data + val + 6 <= o + len) size = val + 6;
+            }
+            if (data + size <= o + len) complex.set(id, buf.subarray(data, data + size));
+            data += size;
+          }
+        }
       }
     });
-    if (spid >= 0 && !this.shapes.has(spid)) this.shapes.set(spid, { spid, type, props, group: group || inGroup });
+    if (spid < 0) return undefined;
+    if (!this.shapes.has(spid)) {
+      this.shapes.set(spid, { spid, type, props, group: (flags & 1) === 1 || inGroup, flags, child, coords, children: flags & 1 ? [] : undefined, complex });
+    }
+    return spid;
   }
 
   blipAt(index1: number): Blip | undefined {
@@ -531,6 +575,7 @@ export class DocFile {
     if (mm === 0x66) o += 1 + d[o];
     const end = fc + lcb;
     let blip: Blip | undefined;
+    let empty = false;
     // OfficeArtInlineSpContainer：形状 + 一个或几个 FBSE（内嵌图片）
     if (o + 8 <= end && d.readUInt16LE(o + 2) === 0xf004) {
       let pib = 0;
@@ -548,12 +593,13 @@ export class DocFile {
         q += 8 + len;
       }
       blip = fbses[pib ? pib - 1 : 0] ?? fbses.find(Boolean) ?? (pib ? this.blipAt(pib) : undefined);
+      empty = !pib && !fbses.length;
     } else if (o < end) {
       // 早期的图片：PICF 后面直接是 Windows 图元文件
       const raw = d.subarray(o, end);
       if (raw.length > 18 && (raw.readUInt16LE(0) === 1 || raw.readUInt16LE(0) === 2) && raw.readUInt16LE(2) === 9) blip = { ext: "wmf", data: raw };
     }
-    return { blip, w, h, crop };
+    return { blip, w, h, crop, empty };
   }
 }
 
@@ -681,4 +727,31 @@ function placeableWmf(data: Buffer, l: number, t: number, r: number, b: number, 
   for (let i = 0; i < 20; i += 2) x ^= h.readUInt16LE(i);
   h.writeUInt16LE(x, 20);
   return Buffer.concat([h, data]);
+}
+
+/**
+ * 兼容性选项（Dop2000 起的 Copts，位于 Dop 第 508 字节；其中的 copts80 必须与 Dop97 第 84 字节处相同，用来校验）。
+ * 只取 Copts 中 copts80 之后的 33 个开关，按位序对应 OOXML 的 <w:compat> 子元素；
+ * fDontAdjustLineHeightInTable 的含义与 adjustLineHeightInTable 相反。这些开关决定 Word 的排版细节
+ * （编号后的制表位、表格自动调整、东亚断行等），丢掉会让同一份文档在 Word 里重新排版。
+ */
+const COPTS = [
+  "shapeLayoutLikeWW8", "footnoteLayoutLikeWW8", "doNotUseHTMLParagraphAutoSpacing", "!adjustLineHeightInTable", "forgetLastTabAlignment",
+  "autoSpaceLikeWord95", "alignTablesRowByRow", "layoutRawTableWidth", "layoutTableRowsApart", "useWord97LineBreakRules",
+  "doNotBreakWrappedTables", "doNotSnapToGridInCell", "selectFldWithFirstOrLastChar", "applyBreakingRules", "doNotWrapTextWithPunct",
+  "doNotUseEastAsianBreakRules", "useWord2002TableStyleRules", "growAutofit", "useNormalStyleForList", "doNotUseIndentAsNumberingTabStop",
+  "useAltKinsokuLineBreakRules", "allowSpaceOfSameStyleInTable", "doNotSuppressIndentation", "doNotAutofitConstrainedTables",
+  "autofitToFirstFixedWidthCell", "underlineTabInNumList", "displayHangulFixedWidth", "splitPgBreakAndParaMark", "doNotVertAlignCellWithSp",
+  "doNotBreakConstrainedForcedTable", "doNotVertAlignInTxbx", "useAnsiKerningPairs", "cachedColBalance",
+];
+export function readCompat(dop: Buffer): string[] {
+  if (dop.length < 544 || dop.readUInt32LE(84) !== dop.readUInt32LE(508)) return [];
+  const lo = dop.readUInt32LE(512), hi = dop.readUInt32LE(516);
+  const out: string[] = [];
+  COPTS.forEach((name, i) => {
+    const on = i < 32 ? (lo >>> i) & 1 : (hi >>> (i - 32)) & 1;
+    if (name.startsWith("!")) { if (!on) out.push(name.slice(1)); }
+    else if (on) out.push(name);
+  });
+  return out;
 }

@@ -2,10 +2,11 @@
  * 旧版 Word 文档（.doc，Word 97-2003 二进制格式）→ .docx。
  *
  * 两个引擎：
- *   libreoffice  LibreOffice 的 Word 二进制格式过滤器：最完整（形状组合、艺术字、OLE 对象、Word 6 / 95 都能转），需要安装 LibreOffice；
  *   builtin      内置的纯 Node 解析器（parse.ts + writer.ts）：不依赖任何外部程序，覆盖正文、表格、样式、编号、页眉页脚、
- *                脚注尾注、批注、修订、域、书签、行内与浮动图片、文本框。
- * 默认 auto：装了 LibreOffice 用它，没装或转换失败时用内置引擎。也可用环境变量 DOC_ENGINE=builtin|libreoffice 固定。
+ *                脚注尾注、批注、修订、域、书签、图文框、兼容性选项、行内与浮动图片、文本框、自选图形与形状组合；
+ *                与 Word 自己"另存为 .docx"的结果逐页核对，分页与换行位置一致。
+ *   libreoffice  LibreOffice 的 Word 二进制格式过滤器：能读 Word 6.0 / 95 和艺术字，但图文框、兼容性选项等会丢，版面走样。
+ * 默认 auto：内置引擎优先，读不了的（Word 6.0 / 95、损坏）交给 LibreOffice。也可用环境变量 DOC_ENGINE=builtin|libreoffice 固定。
  */
 
 import { DocFile, DocFileError } from "./parse.js";
@@ -46,20 +47,20 @@ export async function docToDocx(buf: Buffer, opts: { engine?: DocEngine } = {}):
     if (engine !== "builtin" && (await hasOffice())) return viaOffice(buf, "这个 .doc 文件其实是 RTF / 网页等其他格式，已由 LibreOffice 转换。");
     throw new DocFileError("不是 Word 97-2003 文档（文件可能是改了扩展名的 RTF、网页或已损坏）。", "not-ole");
   }
-  if (engine === "builtin") return docToDocxBuiltin(buf);
-  if (engine === "libreoffice" || (engine === "auto" && (await hasOffice()))) {
-    try {
-      return await viaOffice(buf);
-    } catch (e) {
-      if (engine === "libreoffice") throw e;
-      const r = docToDocxBuiltin(buf);
-      r.report.notes.unshift(`LibreOffice 转换失败（${(e as Error).message.slice(0, 120)}），已改用内置引擎。`);
-      return r;
-    }
-  }
+  if (engine === "libreoffice") return viaOffice(buf);
+  // 内置引擎优先：与 Word 自己"另存为 .docx"的结果逐页核对过（分页、换行位置一致）；
+  // LibreOffice 的转换会丢掉图文框、兼容性选项等，版面明显走样。内置引擎读不了的（Word 6.0 / 95、损坏）再交给 LibreOffice。
   try {
     return docToDocxBuiltin(buf);
   } catch (e) {
+    if (engine === "builtin") throw e;
+    if (e instanceof DocFileError && (e.code === "old-version" || e.code === "corrupt") && (await hasOffice())) {
+      try {
+        const r = await viaOffice(buf);
+        r.report.notes.unshift(e.code === "old-version" ? "这是 Word 6.0 / 95 格式，已由 LibreOffice 转换。" : `内置引擎读取失败（${e.message.replace(/[。.]$/, "")}），已由 LibreOffice 转换。`);
+        return r;
+      } catch { /* LibreOffice 也不行：给出内置引擎的说明 */ }
+    }
     if (e instanceof DocFileError && e.code === "old-version") throw new DocFileError("这是 Word 6.0 / 95 或更早版本的文档：内置引擎只支持 Word 97-2003 格式。请安装 LibreOffice（服务器上）后重新上传，或在 Word 中另存为 .docx。", "old-version");
     if (e instanceof DocFileError && e.code === "corrupt" && !e.message.includes("另存")) throw new DocFileError(`${e.message.replace(/[。.]$/, "")}。可以在 Word 中打开后另存为 .docx 再上传。`, "corrupt");
     throw e;
@@ -73,7 +74,7 @@ async function viaOffice(buf: Buffer, note?: string): Promise<{ data: Buffer; re
   try { const d = new DocFile(buf); chars = visibleChars(d.text.slice(0, d.ccp.text)); } catch { /* 旧版本或其他格式：不核对 */ }
   return {
     data,
-    report: { engine: "libreoffice", paragraphs: 0, tables: 0, images: 0, floating: 0, textBoxes: 0, footnotes: 0, endnotes: 0, comments: 0, revisions: 0, sections: 0, chars, written: 0, notes: note ? [note] : [] },
+    report: { engine: "libreoffice", paragraphs: 0, tables: 0, images: 0, floating: 0, textBoxes: 0, shapes: 0, footnotes: 0, endnotes: 0, comments: 0, revisions: 0, sections: 0, chars, written: 0, notes: note ? [note] : [] },
   };
 }
 
@@ -84,7 +85,7 @@ export function describeDocReport(r: DocConvertReport, coverage?: number): strin
   else {
     const what = [
       `${r.paragraphs} 个段落`, r.tables ? `${r.tables} 个表格` : "", r.images ? `${r.images} 张图片${r.floating ? `（其中浮动 ${r.floating} 张）` : ""}` : "",
-      r.textBoxes ? `${r.textBoxes} 个文本框` : "", r.footnotes ? `${r.footnotes} 个脚注` : "", r.endnotes ? `${r.endnotes} 个尾注` : "",
+      r.textBoxes ? `${r.textBoxes} 个文本框` : "", r.shapes ? `${r.shapes} 个图形` : "", r.footnotes ? `${r.footnotes} 个脚注` : "", r.endnotes ? `${r.endnotes} 个尾注` : "",
       r.comments ? `${r.comments} 条批注` : "", r.revisions ? `${r.revisions} 处修订` : "", r.sections > 1 ? `${r.sections} 节` : "",
     ].filter(Boolean).join("、");
     parts.push(`原文件是 Word 97-2003 格式（.doc），已由内置引擎转换为 .docx（${what}）`);

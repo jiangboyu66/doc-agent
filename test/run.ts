@@ -1522,6 +1522,46 @@ await test(".doc 异常情况：加密、Word 6 / 95、不是 Word 的文件给�
   }
 });
 
+await test(".doc 版面细节：图文框（页脚里定位的页码）、东亚排版开关、字体提示、字距调整、兼容性选项与 Word 自己的转换一致", async () => {
+  const { paraXml, charXml } = await import("../src/services/docConvert/props.js");
+  const { S } = await import("../src/services/docConvert/sprm.js");
+  const { readCompat } = await import("../src/services/docConvert/parse.js");
+  const sp = (op: number, hex: string) => ({ op, arg: Buffer.from(hex, "hex") });
+  // 一份真实合同页脚里的页码段落：右侧定位的图文框，文字环绕（Word 另存为 .docx 的结果是同样的 framePr）
+  const ppr = paraXml([sp(S.PDxaAbs, "3e23"), sp(S.PDyaAbs, "6100"), sp(S.PDxaWidth, "b005"), sp(S.PPc, "a0"), sp(S.PWr, "02"),
+    sp(S.PFOverflowPunct, "00"), sp(S.PFAdjustRight, "00"), sp(S.PWAlignFont, "0200")], { styleIds: new Map(), numId: () => undefined });
+  assert(ppr.includes('<w:framePr w:w="1456" w:wrap="around" w:hAnchor="page" w:vAnchor="text" w:x="9022" w:y="97"/>'), `图文框：${ppr}`);
+  assert(/<w:framePr [^>]*\/><w:overflowPunct w:val="0"\/><w:adjustRightInd w:val="0"\/><w:textAlignment w:val="baseline"\/>/.test(ppr), `东亚排版开关与元素顺序：${ppr}`);
+  // 对齐方式：XAS / YAS 的负数
+  const centered = paraXml([sp(S.PDxaAbs, "fcff"), sp(S.PDyaAbs, "f4ff"), sp(S.PPc, "50")], { styleIds: new Map(), numId: () => undefined });
+  assert(centered.includes('w:hAnchor="margin" w:vAnchor="page" w:xAlign="center" w:yAlign="bottom"'), `对齐方式：${centered}`);
+  const rpr = charXml([sp(S.CRgFtc0, "0000"), sp(S.CIdctHint, "01"), sp(S.CHpsKern, "0200")], { fonts: ["Times New Roman"], styleIds: new Map(), styleToggle: () => false });
+  assert(rpr.includes('<w:rFonts w:ascii="Times New Roman" w:hint="eastAsia"/>') && rpr.includes('<w:kern w:val="2"/>'), `字体提示与字距：${rpr}`);
+  // 兼容性选项：同一份合同的 Dop（Word 2007 写的），Word 另存为 .docx 时输出的就是这些开关
+  const dop = Buffer.alloc(674);
+  dop.writeUInt32LE(0x0010f000, 84); dop.writeUInt32LE(0x0010f000, 508); dop.writeUInt32LE(0xfdfc0008, 512); dop.writeUInt32LE(1, 516);
+  eq(readCompat(dop).join(","), "useNormalStyleForList,doNotUseIndentAsNumberingTabStop,useAltKinsokuLineBreakRules,allowSpaceOfSameStyleInTable," +
+    "doNotSuppressIndentation,doNotAutofitConstrainedTables,autofitToFirstFixedWidthCell,displayHangulFixedWidth,splitPgBreakAndParaMark," +
+    "doNotVertAlignCellWithSp,doNotBreakConstrainedForcedTable,doNotVertAlignInTxbx,useAnsiKerningPairs,cachedColBalance", "兼容性选项");
+  dop.writeUInt32LE(0, 508);
+  eq(readCompat(dop).length, 0, "copts80 对不上时不读（不是 Word 2000 以后的 Dop）");
+});
+
+await test(".doc 形状组合：矩形、带箭头的连接线、自由曲线都转成 Word 的组合图形，组内坐标换算成 EMU", async () => {
+  const { docToDocx } = await import("../src/services/docConvert/index.js");
+  const { data, report } = await docToDocx(await fixture("shapes-group.doc"), { engine: "builtin" });
+  const xml = docXml(data);
+  eq(count(xml, "<wpg:wgp>"), 1, "形状组合");
+  const group = xml.slice(xml.indexOf("<wpg:wgp>"), xml.indexOf("</wpg:wgp>"));
+  eq(count(group, "<wps:wsp>"), 3, "组内三个形状");
+  assert(/<a:chOff x="0" y="0"\/><a:chExt cx="(\d+)" cy="(\d+)"\/>/.test(group), "组的坐标系与外框一致（EMU）");
+  assert(/<a:custGeom>.*<a:moveTo><a:pt x="0" y="100"\/><\/a:moveTo><a:lnTo><a:pt x="50" y="0"\/><\/a:lnTo><a:lnTo><a:pt x="100" y="100"\/><\/a:lnTo>/.test(group), "自由曲线三角形的路径");
+  assert(group.includes('<a:prstGeom prst="line">') && group.includes('<a:tailEnd type="triangle"'), "带箭头的连接线");
+  assert(group.includes('<a:srgbClr val="00FF00">'), "填充色");
+  assert(report.shapes >= 4 && !report.notes.some((n) => n.includes("未转换")), `报告：${report.shapes} 个图形；${report.notes.join("；")}`);
+  for (const t of ["示意图如下。", "图后的正文。"]) assert(docText(data).includes(t), `正文：${t}`);
+});
+
 // ---------------------------------------------------------------------------
 
 await fs.rm(tmp, { recursive: true, force: true });

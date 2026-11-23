@@ -103,6 +103,7 @@ export function charXml(sprms: Sprm[], ctx: CharCtx, opts: { skipStyle?: boolean
   const fonts: Record<string, string> = {};
   const lang: Record<string, string> = {};
   let color: string | undefined;
+  let hint: string | undefined;
   for (const s of sprms) {
     const a = s.arg;
     const tog = TOGGLES.find(([op]) => op === s.op);
@@ -127,6 +128,9 @@ export function charXml(sprms: Sprm[], ctx: CharCtx, opts: { skipStyle?: boolean
       case S.CRgFtc1: fonts.eastAsia = ctx.fonts[a.readUInt16LE(0)] ?? ""; break;
       case S.CRgFtc2: fonts.hAnsi = ctx.fonts[a.readUInt16LE(0)] ?? ""; break;
       case S.CFtcBi: fonts.cs = ctx.fonts[a.readUInt16LE(0)] ?? ""; break;
+      case S.CIdctHint: hint = a[0] === 1 ? "eastAsia" : a[0] === 2 ? "cs" : undefined; break;
+      case S.CHpsKern: m.set("kern", `<w:kern w:val="${a.readUInt16LE(0)}"/>`); break;
+      case S.CFNoProof: if (a[0] !== 0x80) m.set("noProof", a[0] === 1 || a[0] === 0x81 ? "<w:noProof/>" : '<w:noProof w:val="0"/>'); break;
       case S.CDxaSpace: m.set("spacing", `<w:spacing w:val="${a.readInt16LE(0)}"/>`); break;
       case S.CHpsPos: m.set("position", `<w:position w:val="${a.readInt16LE(0)}"/>`); break;
       case S.CCharScale: m.set("w", `<w:w w:val="${a.readUInt16LE(0)}"/>`); break;
@@ -138,8 +142,10 @@ export function charXml(sprms: Sprm[], ctx: CharCtx, opts: { skipStyle?: boolean
       case S.CLidBi: { const t = LCID[a.readUInt16LE(0)]; if (t) lang.bidi = t; break; }
     }
   }
-  const fa = Object.entries(fonts).filter(([, v]) => v);
-  if (fa.length) m.set("rFonts", `<w:rFonts ${fa.map(([k, v]) => `w:${k}="${esc(v)}"`).join(" ")}/>`);
+  // 字体与"按东亚文字处理"的提示（引号、破折号等中西文共用的字符用哪种字体，影响字宽与断行）
+  const fa: Array<[string, string]> = Object.entries(fonts).filter(([, v]) => v).map(([k, v]) => [k, esc(v)]);
+  if (hint) fa.push(["hint", hint]);
+  if (fa.length) m.set("rFonts", `<w:rFonts ${fa.map(([k, v]) => `w:${k}="${v}"`).join(" ")}/>`);
   if (color) m.set("color", `<w:color w:val="${color}"/>`);
   const la = Object.entries(lang);
   if (la.length) m.set("lang", `<w:lang ${la.map(([k, v]) => `w:${k}="${v}"`).join(" ")}/>`);
@@ -153,8 +159,34 @@ export interface ParaCtx {
 }
 
 /** 段落格式 → pPr 子元素（不含外层 <w:pPr>，不含 rPr / sectPr） */
+/** 图文框（定位段落）的属性：出现任意一个就是图文框 */
+export const FRAME_SPRMS = new Set<number>([S.PDxaAbs, S.PDyaAbs, S.PDxaWidth, S.PPc, S.PWr, S.PWHeightAbs, S.PDcs, S.PDyaFromText, S.PDxaFromText, S.PFLocked]);
+
+/** 图文框 → <w:framePr>（XAS / YAS 的负数是对齐方式） */
+function framePr(fr: Record<string, number>): string | undefined {
+  const dcs = fr.dcs !== undefined && fr.dcs & 7 ? fr.dcs : undefined;
+  if (dcs === undefined && [fr.x, fr.y, fr.w, fr.pc, fr.wr, fr.h].every((v) => v === undefined)) return undefined;
+  const at: string[] = [];
+  if (dcs !== undefined) at.push(`w:dropCap="${["none", "drop", "margin"][dcs & 7] ?? "drop"}"`, `w:lines="${Math.max(1, (dcs >> 3) & 0x1f)}"`);
+  if (fr.w) at.push(`w:w="${fr.w}"`);
+  if (fr.h) at.push(`w:h="${fr.h & 0x7fff}"`, `w:hRule="${fr.h & 0x8000 ? "atLeast" : "exact"}"`);
+  if (fr.vSpace) at.push(`w:vSpace="${fr.vSpace}"`);
+  if (fr.hSpace) at.push(`w:hSpace="${fr.hSpace}"`);
+  if (fr.wr !== undefined) at.push(`w:wrap="${["auto", "notBeside", "around", "none", "tight", "through"][fr.wr] ?? "auto"}"`);
+  const pc = fr.pc ?? 0, pv = (pc >> 4) & 3, ph = (pc >> 6) & 3;
+  if (ph !== 3) at.push(`w:hAnchor="${["text", "margin", "page"][ph]}"`);
+  if (pv !== 3) at.push(`w:vAnchor="${["margin", "page", "text"][pv]}"`);
+  const xa: Record<number, string> = { [-4]: "center", [-8]: "right", [-12]: "inside", [-16]: "outside" };
+  const ya: Record<number, string> = { [-4]: "top", [-8]: "center", [-12]: "bottom", [-16]: "inside", [-20]: "outside" };
+  if (fr.x !== undefined) at.push(xa[fr.x] ? `w:xAlign="${xa[fr.x]}"` : `w:x="${fr.x}"`);
+  if (fr.y !== undefined) at.push(ya[fr.y] ? `w:yAlign="${ya[fr.y]}"` : `w:y="${fr.y}"`);
+  if (fr.lock) at.push('w:anchorLock="1"');
+  return `<w:framePr ${at.join(" ")}/>`;
+}
+
 export function paraXml(sprms: Sprm[], ctx: ParaCtx, istd?: number): string {
   const m = new Map<string, string>();
+  const fr: Record<string, number> = {};
   const ind: Record<string, number> = {};
   const sp: Record<string, string | number> = {};
   const bdr: Record<string, string> = {};
@@ -177,6 +209,23 @@ export function paraXml(sprms: Sprm[], ctx: ParaCtx, istd?: number): string {
       case S.PFBiDi: flag("bidi", a[0]); break;
       case S.PFContextualSpacing: flag("contextualSpacing", a[0]); break;
       case S.PFNoAutoHyph: flag("suppressAutoHyphens", a[0]); break;
+      case S.PFNoLineNumb: flag("suppressLineNumbers", a[0]); break;
+      case S.PFWordWrap: flag("wordWrap", a[0]); break;
+      case S.PFOverflowPunct: flag("overflowPunct", a[0]); break;
+      case S.PFTopLinePunct: flag("topLinePunct", a[0]); break;
+      case S.PFAdjustRight: flag("adjustRightInd", a[0]); break;
+      case S.PFUsePgsuSettings: flag("snapToGrid", a[0]); break;
+      case S.PWAlignFont: m.set("textAlignment", `<w:textAlignment w:val="${["top", "center", "baseline", "bottom", "auto"][a.readUInt16LE(0)] ?? "auto"}"/>`); break;
+      case S.PDxaAbs: fr.x = a.readInt16LE(0); break;
+      case S.PDyaAbs: fr.y = a.readInt16LE(0); break;
+      case S.PDxaWidth: fr.w = a.readInt16LE(0); break;
+      case S.PPc: fr.pc = a[0]; break;
+      case S.PWr: fr.wr = a[0]; break;
+      case S.PWHeightAbs: fr.h = a.readUInt16LE(0); break;
+      case S.PDcs: fr.dcs = a.readUInt16LE(0); break;
+      case S.PDyaFromText: fr.vSpace = a.readInt16LE(0); break;
+      case S.PDxaFromText: fr.hSpace = a.readInt16LE(0); break;
+      case S.PFLocked: fr.lock = a[0]; break;
       case S.POutLvl: if (a[0] < 9) m.set("outlineLvl", `<w:outlineLvl w:val="${a[0]}"/>`); break;
       case S.PIlvl: ilvl = a[0]; break;
       case S.PIlfo: ilfo = a.readInt16LE(0); break;
@@ -230,6 +279,8 @@ export function paraXml(sprms: Sprm[], ctx: ParaCtx, istd?: number): string {
       .filter((k) => sp[k] !== undefined).map((k) => `w:${k}="${sp[k]}"`);
     m.set("spacing", `<w:spacing ${at.join(" ")}/>`);
   }
+  const frame = framePr(fr);
+  if (frame) m.set("framePr", frame);
   const bk = ["top", "left", "bottom", "right", "between"].filter((k) => bdr[k]);
   if (bk.length) m.set("pBdr", `<w:pBdr>${bk.map((k) => bdr[k]).join("")}</w:pBdr>`);
   if (tabs?.size) m.set("tabs", `<w:tabs>${[...tabs.entries()].sort((x, y) => x[0] - y[0]).map(([, v]) => v).join("")}</w:tabs>`);
