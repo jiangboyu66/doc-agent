@@ -134,6 +134,7 @@ async function runBuiltin(buf: Buffer, title: string, pages: PageModel[], mode: 
   if (model.stats.vectorShapes) notes.push(`${model.stats.vectorShapes} 处零散的矢量图形（不构成完整的图）未能转换。`);
   if (model.stats.rotatedText) notes.push(`${model.stats.rotatedText} 段旋转文字未转换。`);
   if (model.stats.columnPages) notes.push(`${model.stats.columnPages} 页检测到双栏排版，已用 Word 分栏还原。`);
+  if (model.notes) notes.push(...model.notes);
   return { data, stats: model.stats, notes, rasterText: model.rasterText };
 }
 

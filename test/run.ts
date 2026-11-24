@@ -1188,7 +1188,7 @@ await test("所有夹具 PDF：两种排版方式都不报错、文字完整；L
   const run = promisify(execFile);
   const soffice = process.env.SOFFICE_PATH || "soffice";
   const hasSoffice = await run(soffice, ["--version"]).then(() => true, () => false);
-  const names = ["columns", "journal", "figures", "math", "journal-front", "journal-eq", "journal-fig", "bios", "colstart", "signature", "citecolor", "texpaper", "contract-cn", "scan-letter"];
+  const names = ["columns", "journal", "figures", "math", "journal-front", "journal-eq", "journal-fig", "bios", "colstart", "signature", "citecolor", "texpaper", "contract-cn", "scan-letter", "furniture-cn", "bates"];
   const dir = await fs.mkdtemp(path.join(tmp, "pages-"));
   const bad: string[] = [];
   for (const name of names) {
@@ -1358,6 +1358,55 @@ await test("中文合同（律所草稿）：1.5 倍行距的条款合成一段�
       assert(/w:hanging="\d+"/.test(p11) && p11.includes("<w:tab/>"), "可编辑排版：条款 1.1 应为悬挂缩进、编号后接制表符");
     }
   }
+});
+
+await test("页眉页脚只收 Word 能逐页再现的行：页首的条款标题、附件标题留在正文；页眉里的版本号不写成页码域；Bates 号不写成固定号码", async () => {
+  const { pdfToDocx } = await import("../src/services/pdfConvert/index.js");
+  const norm = (s: string) => s.replace(/[\s\u3000\u00a0]/g, "");
+  const parts = (pkg: InstanceType<typeof ZipPackage>, re: RegExp) => pkg.names().filter((n) => re.test(n)).map((n) => pkg.readText(n));
+  const textOf = (xml: string) => norm(xml.replace(/<w:instrText[^>]*>[^<]*<\/w:instrText>/g, "").replace(/<[^>]+>/g, ""));
+  // 第 2、3 页页首 "第4条"、"第5条"，第 4–6 页页首 "附件1"–"附件3"：数字逐页加一，但只在一页出现，是正文
+  {
+    const { data, report } = await pdfToDocx(await fixture("furniture-cn.pdf"), { mode: "flow" });
+    eq(report.textCoverage, 1, `文字完整性，缺失：${report.missing}`);
+    eq(report.notes.length, 0, `不应有页眉页脚说明：${report.notes.join(" | ")}`);
+    const pkg = new ZipPackage(data);
+    const paras = (pkg.readText("word/document.xml").match(/<w:p [^>]*>[\s\S]*?<\/w:p>/g) ?? []).map(textOf);
+    for (const h of ["第4条", "第5条", "附件1", "附件2", "附件3"]) eq(paras.filter((p) => p === h).length, 1, `正文里应有单独成段的 "${h}"`);
+    const heads = parts(pkg, /^word\/header\d*\.xml$/), feet = parts(pkg, /^word\/footer\d*\.xml$/);
+    assert(heads.length && heads.every((h) => !/第\d条|附件/.test(textOf(h))), `页眉里不应有条款或附件标题：${heads.map(textOf).join(" | ")}`);
+    // "第3版" 是版本号：恰好等于第 3 页的页码，也不写成 PAGE 域
+    assert(heads.some((h) => textOf(h).includes("设备采购合同（第3版）")) && heads.every((h) => !/instr=" ?PAGE/.test(h)), "页眉应原样是 设备采购合同（第3版），不含页码域");
+    assert(feet.some((f) => /instr=" PAGE "/.test(f) && /instr=" NUMPAGES "/.test(f)), "页脚的页码、总页数应为 PAGE / NUMPAGES 域");
+  }
+  // Bates 号逐页加一、却不是页码：Word 页脚只能写一个固定号码——不写进页脚、不回正文，notes 里说明
+  {
+    const { data, report } = await pdfToDocx(await fixture("bates.pdf"), { mode: "flow" });
+    eq(report.textCoverage, 1, `文字完整性，缺失：${report.missing}`);
+    const pkg = new ZipPackage(data);
+    assert(!textOf(pkg.readText("word/document.xml")).includes("ABC000"), "Bates 号不应回到正文");
+    assert(parts(pkg, /^word\/(header|footer)\d*\.xml$/).every((x) => !textOf(x).includes("ABC000")), "Bates 号不应写成固定号码的页脚");
+    assert(parts(pkg, /^word\/header\d*\.xml$/).some((h) => textOf(h).includes("ProductionVolume1")), "页眉应保留");
+    assert(report.notes.some((n) => n.includes("ABC0001234") && n.includes("没有写进页脚")), `notes 应说明 Bates 号没有写进页脚：${report.notes.join(" | ")}`);
+  }
+});
+
+await test("页眉页脚取舍（settleFurniture）：另一节的页眉三页以上不回正文并说明、两页时留在正文；完整性校验只认 Word 实际显示的页眉页脚", async () => {
+  const { settleFurniture } = await import("../src/services/pdfConvert/furniture.js");
+  const line = (text: string, top: number) => ({ spans: [{ text, x0: 72, x1: 72 + 5 * text.length, size: 9 }], x0: 72, x1: 72 + 5 * text.length, top, bottom: top + 9, baseline: top + 7, size: 9 }) as any;
+  const doc = (n: number, sched: number[]) => Array.from({ length: n }, (_, i) => [
+    line(sched.includes(i) ? "Schedule 1 — Pricing" : "Master Services Agreement", 30),
+    line(`Page ${i + 1}`, 780),
+  ]);
+  const three = settleFurniture(doc(8, [5, 6, 7]), Array(8).fill(396), [1, 2, 3, 4, 5, 6, 7, 8]);
+  eq(three.hidden.flat().map((l: any) => l.spans[0].text).join("|"), "Schedule 1 — Pricing|Schedule 1 — Pricing|Schedule 1 — Pricing", "另一节的页眉（三页）：写不进去，不回正文");
+  assert(three.notes.length === 1 && three.notes[0].includes("第 6–8 页的页眉"), `应说明第 6–8 页的页眉没有写进去：${three.notes.join(" | ")}`);
+  eq(three.keep.flat().length, 8 + 5, "其余页的页眉与全部页码写进页眉页脚");
+  eq([...three.pageNumberLines].length, 8, "只有页码行带页码位");
+  const two = settleFurniture(doc(8, [6, 7]), Array(8).fill(396), [1, 2, 3, 4, 5, 6, 7, 8]);
+  eq(two.hidden.flat().length, 0, "只有两页的不同页眉：证据不足，留在正文");
+  eq(two.keep.flat().length, 6 + 8, "两页的不同页眉既不写进页眉，也不隐藏");
+  eq(two.notes.length, 0, "留在正文的不需要说明");
 });
 
 await test("扫描件：整页扫描图按页面坐标铺满原页（不再 3 页变 6 页）；OCR 隐藏文字层不转成正文；上下两条拼成的整页", async () => {
