@@ -12,6 +12,7 @@
 
 import type { FillRect, ImageBox, PageModel, PathBox, Seg, Span } from "./extract.js";
 import { collectHyphenated, collectWords, isSoftHyphen, wordCounts } from "../../documents/hyphen.js";
+import { settleFurniture, type Furniture, type FurniturePick } from "./furniture.js";
 import { detectDropCaps, detectEquations, detectIconPaths, detectFigures, detectImageGrids, detectMaskInk, rawBase, rasterBox, removeInside, spansText, textHighlights, type Box, type MathCtx } from "./raster.js";
 
 export interface Run {
@@ -148,6 +149,8 @@ export interface DocModel {
   footerDist?: number;
   /** 第一页的页码（PDF 中印刷的页码不从 1 开始时） */
   pageNumStart?: number;
+  /** 需要告诉用户的版面取舍（如写不进 Word 页眉页脚的内容） */
+  notes?: string[];
 }
 
 // ---------------------------------------------------------------------------
@@ -1684,14 +1687,17 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
       for (let k = 0; k < byY.length && byY[k].bottom <= 0.2 * H && (repeated.has(byY[k]) || fl.has(byY[k])); k++) take(byY[k]);
     });
   }
-  // 流式模式：只有在多页重复出现的（页眉、页码、刊名卷期）才写进页眉页脚；只在一页出现的栏底标题、正文末行等放回正文
+  // 流式模式：只有 Word 页眉页脚能在该页原样再现的行才写进页眉页脚（数字逐位比较，只有页码位可以逐页不同）；
+  // 只在一页出现的栏底标题、页首的条款标题、附件标题放回正文。见 furniture.ts
+  let furniture: Furniture | undefined;
   if (flow && pages.length > 1) {
-    const seen = new Map<string, Set<number>>();
-    floating.forEach((ls, i) => { for (const l of ls) { const k = norm(l); if (!seen.has(k)) seen.set(k, new Set()); seen.get(k)!.add(i); } });
-    floating.forEach((ls, i) => { floating[i] = ls.filter((l) => (seen.get(norm(l))?.size ?? 0) >= 2); });
+    furniture = settleFurniture(floating, pre.map((x) => x.pg.height / 2), pre.map((x) => x.pg.index + 1));
+    floating.forEach((_, i) => { floating[i] = furniture!.keep[i]; });
+    // 写不进 Word 页眉页脚的页眉页脚（另一节的页眉、Bates 号）：不回正文，文字计入完整性校验，notes 里说明
+    for (const ls of furniture.hidden) for (const l of ls) rasterText.push(l.spans.map((sp) => sp.text).join(""));
   }
   pageLines.forEach((ls, i) => {
-    const f = new Set(floating[i]);
+    const f = new Set([...floating[i], ...(furniture?.hidden[i] ?? [])]);
     pageLines[i] = ls.filter((l) => !f.has(l));
   });
   ctx.pitch = dominantPitch(pageLines);
@@ -1761,8 +1767,6 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
     if (ht.length) headerDist = Math.max(4, Math.min(...ht) - 1);
     if (fb.length) footerDist = Math.max(4, pageH - Math.max(...fb) - 1);
   }
-  // 流式模式：每页的页眉页脚文字由页眉页脚部件（含页码域）统一表示，计入完整性校验
-  if (flow) for (const fl of floating) for (const l of fl) rasterText.push(l.spans.map((sp) => sp.text).join(""));
   // 全文正文的上下界（按页统计会被"整页大图 + 一行图注"的页面误导）
   const allBody = pageLines.flat();
   const bodyTop = allBody.length ? Math.min(...allBody.map((l) => l.top)) : 0;
@@ -2253,7 +2257,17 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
   }
 
   // 流式模式：页眉页脚
-  const hfOut = flow ? buildHeaders(hf, notes, notesBottom, { x0: left, x1: right }, right, ctx, headerDist ?? mTop / 2) : undefined;
+  const hfOut = flow ? buildHeaders(hf, notes, notesBottom, { x0: left, x1: right }, right, ctx, headerDist ?? mTop / 2, furniture) : undefined;
+  // 完整性校验：每页计入 Word 在这一页实际显示的页眉页脚（页码域按该页的页码展开），而不是判成页眉页脚的原文——
+  // 判错的行若没有写进去，缺的字会如实计为未转换
+  if (hfOut) {
+    const shown = (ps: Para[] | undefined, i: number) => (ps ?? []).map((p) => p.runs.map((r) =>
+      r.field === "PAGE" ? String(i + hfOut.start) : r.field === "NUMPAGES" ? String(pre.length) : r.tab ? "" : r.text).join("")).join("\n");
+    pre.forEach((_, i) => {
+      const part = i === 0 && hfOut.headers.first ? "first" : hfOut.headers.even && (i + hfOut.start) % 2 === 0 ? "even" : "default";
+      rasterText.push(shown(hfOut.headers[part], i), shown(hfOut.footers[part], i));
+    });
+  }
   // 去掉的排版断词连字符：计入完整性校验
   if (ctx.softHyphens) rasterText.push("-".repeat(ctx.softHyphens));
 
@@ -2267,6 +2281,7 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
     rasterText: rasterText.join("\n"),
     mode: ctx.mode,
     ...(hfOut ? { headers: hfOut.headers, footers: hfOut.footers, pageNumStart: hfOut.pageNumStart, headerDist, footerDist } : {}),
+    ...(furniture?.notes.length ? { notes: furniture.notes } : {}),
   };
 }
 
@@ -2337,14 +2352,17 @@ function mergeSplitParagraphs(blocks: Block[], ctx: Ctx) {
 }
 
 /** 流式模式：由每页的页眉页脚行生成首页 / 奇数页 / 偶数页的页眉页脚，页码改为 PAGE 域 */
-function buildHeaders(hf: Array<{ head: Line[]; foot: Line[]; imgs: ImageBox[]; mid: number }>, notes: Para[], notesBottom: number, body: Region, right: number, ctx: Ctx, headerTop: number):
-  { headers: HeaderSet; footers: HeaderSet; pageNumStart?: number } | undefined {
+function buildHeaders(hf: Array<{ head: Line[]; foot: Line[]; imgs: ImageBox[]; mid: number }>, notes: Para[], notesBottom: number, body: Region, right: number, ctx: Ctx, headerTop: number,
+  furniture?: Furniture):
+  { headers: HeaderSet; footers: HeaderSet; pageNumStart?: number; start: number } | undefined {
   const n = hf.length;
   if (!hf.some((x) => x.head.length || x.foot.length || x.imgs.length) && !notes.length) return undefined;
   const lineText = (l: Line) => l.spans.map((s) => s.text).join(" ");
   // 页码：印刷的数字 - 页序号 在多数页上一致
   let pageNumStart: number | undefined;
-  if (n >= 2) {
+  const pick: FurniturePick | undefined = furniture?.pick;
+  if (pick) pageNumStart = pick.pageNumStart;
+  else if (n >= 2) {
     const off = new Map<number, Set<number>>();
     hf.forEach((x, i) => {
       for (const l of [...x.head, ...x.foot]) for (const m of lineText(l).matchAll(/(?<![\d.,])\d{1,4}(?![\d.,]?\d)/g)) {
@@ -2410,7 +2428,8 @@ function buildHeaders(hf: Array<{ head: Line[]; foot: Line[]; imgs: ImageBox[]; 
       cur = top + p.lineHeight;
       // 先标总页数（最后一页的页码与总页数相同，总数在后）
       if (totalPages && TOTAL.test(p.runs.map((r) => r.text).join("").replace(/\s+/g, " "))) markPage(p, n, "NUMPAGES");
-      if (pageNumStart !== undefined) markPage(p, printed(i));
+      // 页码域只放在真正的页码位上（furniture.ts 逐位确认过的行）；页眉里恰好等于该页页码的版本号、条款号保持原文
+      if (pageNumStart !== undefined && (!furniture || furniture.pageNumberLines.has(l))) markPage(p, printed(i));
       delete p.lineFits;
       out.push(p);
     }
@@ -2429,11 +2448,12 @@ function buildHeaders(hf: Array<{ head: Line[]; foot: Line[]; imgs: ImageBox[]; 
     for (const i of ids) { const k = sigAt(i); if (!n.has(k)) n.set(k, []); n.get(k)!.push(i); }
     return [...n.values()].sort((a, b) => b.length - a.length)[0]?.[0];
   };
-  const oddRep = major(odd), evenRep = major(even);
-  const evenOdd = oddRep !== undefined && evenRep !== undefined && sigAt(oddRep) !== sigAt(evenRep);
-  const defPage = evenOdd ? oddRep! : major(rest) ?? 0;
+  // 代表页：furniture.ts 已按文字身份选定（其余页只留下了与代表页相同的行，每一行都能原样再现）
+  const oddRep = pick ? pick.defPage : major(odd), evenRep = pick ? pick.evenRep : major(even);
+  const evenOdd = pick ? pick.evenOdd : oddRep !== undefined && evenRep !== undefined && sigAt(oddRep) !== sigAt(evenRep);
+  const defPage = pick ? pick.defPage : evenOdd ? oddRep! : major(rest) ?? 0;
   const rep0 = evenOdd && printed(0) % 2 === 0 ? evenRep! : defPage;
-  const titlePg = notes.length > 0 || (n > 1 && sigAt(0) !== sigAt(rep0));
+  const titlePg = notes.length > 0 || (pick ? pick.titlePg : n > 1 && sigAt(0) !== sigAt(rep0));
   const headers: HeaderSet = { default: mk(hf[defPage].head, defPage) };
   const footers: HeaderSet = { default: mk(hf[defPage].foot, defPage, "foot") };
   if (evenOdd) { headers.even = mk(hf[evenRep!].head, evenRep!); footers.even = mk(hf[evenRep!].foot, evenRep!, "foot"); }
@@ -2446,7 +2466,7 @@ function buildHeaders(hf: Array<{ head: Line[]; foot: Line[]; imgs: ImageBox[]; 
     }
     footers.first = [...notes, ...f0];
   }
-  return { headers, footers, pageNumStart: pageNumStart !== undefined && pageNumStart !== 1 ? pageNumStart : undefined };
+  return { headers, footers, pageNumStart: pageNumStart !== undefined && pageNumStart !== 1 ? pageNumStart : undefined, start: pageNumStart ?? 1 };
 }
 
 type PageItem = { side: "full" | "L" | "R" } & (
