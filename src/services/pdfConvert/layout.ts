@@ -242,11 +242,19 @@ export function buildLines(spans: Span[]): Line[] {
       if (Math.abs(gSize - s.size) < 0.6 ? d0 > 0.2 * s.size : d0 > 0.5 * Math.max(gSize, s.size)) continue;
       // 重音符号（ȳ 的横线）与它下面的字母横向重叠，但属于同一行：不算冲突，成行后并成组合字符
       const accentLike = (x: Span) => ACCENT_ONLY.test(x.text) && !x.img;
-      const clash = g.spans.some((o) => Math.min(o.x1, s.x1) - Math.max(o.x0, s.x0) > 0.3 * Math.min(o.x1 - o.x0, s.x1 - s.x0) && !(accentLike(o) !== accentLike(s) && Math.abs(o.baseline - s.baseline) <= 0.45 * Math.max(o.size, s.size)));
+      // 单独一个标点的片段与别的字横向重叠不算冲突：扫描件 OCR 的标点字框偏大，"（" 压在后面的 "S" 上、"：" 压在
+      // 下一个词 "frame" 的开头上。算作冲突的话同一行被拆成两行，在 Word 里只能一上一下，后面的内容整块下移。
+      // 同一个标点叠在自己的副本上（重复绘制的文字层）仍算冲突
+      const lonePunct = (x: Span) => !x.img && LONE_PUNCT.test(x.text.trim());
+      const punctOverlap = (o: Span) => (lonePunct(o) || lonePunct(s)) && o.text.trim() !== s.text.trim();
+      const clash = g.spans.some((o) => Math.min(o.x1, s.x1) - Math.max(o.x0, s.x0) > 0.3 * Math.min(o.x1 - o.x0, s.x1 - s.x0) && !punctOverlap(o) && !(accentLike(o) !== accentLike(s) && Math.abs(o.baseline - s.baseline) <= 0.45 * Math.max(o.size, s.size)));
       if (clash) continue;
       // 上下标优先并入左右紧挨着它的那一行：另一栏恰好同基线的行不能把它抢走（左栏的 M_θ* 并进右栏那一行）
       const small = s.size < 0.85 * gSize;
       const adjacent = !small || g.spans.some((o) => Math.max(o.x0 - s.x1, s.x0 - o.x1) < 1.5 * gSize);
+      // 不挨着、基线也不同的小字不是这一行的上下标：扫描件首页的大号公开号（14 pt）纵跨左边上下两行小字
+      // （"(43) 国際公開日" / "2017 年 3 月 9 日"），按上下标并进来会把这两行搅成一行
+      if (small && !adjacent && d0 > 0.2 * s.size) continue;
       const d = Math.abs(g.baseline - s.baseline) + (adjacent ? 0 : 0.6 * gSize);
       if (d < bestD) { bestD = d; best = g; }
     }
@@ -269,6 +277,8 @@ export function buildLines(spans: Span[]): Line[] {
   return groups.map((g) => finishLine(g.spans)).sort((a, b) => a.baseline - b.baseline || a.x0 - b.x0);
 }
 
+// 单独一个标点符号（Unicode 标点类，不含重音、数学符号）
+const LONE_PUNCT = /^\p{P}$/u;
 // 重音符号：独立的修饰字符，或组合用重音（BLEX 等大型定界符字体里的 ̂ ̃，U+0300–U+036F）
 const ACCENT_ONLY = /^[ˆ^˜~¯˙¨´`ˇ→⃗\u0300-\u036f\s]+$/;
 /** 根号（BLEX 的 √，字号与正文相同、垂直位置略高）：与重音一样要并回它所在的正文行 */
@@ -638,7 +648,10 @@ function detectSideBySide(page: PageModel, used: Set<Seg>, taken: Set<Span>): Ta
       const chars = (left: boolean) => run.reduce((n, l) => n + side(l, left).reduce((m, sp) => m + sp.text.trim().length, 0), 0);
       const nL = run.filter((l) => side(l, true).length).length, nR = run.filter((l) => side(l, false).length).length;
       const onColumns = !!pageGutter && (Math.abs(rEdge - pageGutter.g1) <= 4 || Math.abs(lEdge - pageGutter.g0) <= 4);
-      if (nL >= 3 && nR >= 3 && chars(true) >= 40 && chars(false) >= 40 && !onColumns) {
+      // 整块都落在本页双栏的某一栏里（没有一行跨过栏间距）：这条空白是栏内的（著录项目"标签 · 值"之间的空隙），
+      // 不是两个并排的文字块。拆成两格表格会把左右两栏的文字搅在一起
+      const withinColumns = !!pageGutter && run.every((l) => classify(l, pageGutter.x) !== "cross");
+      if (nL >= 3 && nR >= 3 && chars(true) >= 40 && chars(false) >= 40 && !onColumns && !withinColumns) {
         const spans = run.flatMap((l) => l.spans);
         const x0 = Math.min(...spans.map((sp) => sp.x0)) - CELL_MARGIN, x1 = Math.max(...spans.map((sp) => sp.x1)) + CELL_MARGIN;
         const y0 = Math.min(...spans.map((sp) => sp.top)) - 1, y1 = Math.max(...spans.map((sp) => sp.bottom)) + 1;
@@ -893,6 +906,8 @@ interface Ctx {
   softHyphens: number;
   /** 全文各字号正文的主流行距（基线间距，pt）：判断段内换行的上限 */
   pitch?: Map<number, number>;
+  /** 逐行一致模式：本页页首锚点段落上的文本框（排不进文字流原位置的行放在这里） */
+  boxes?: NonNullable<Para["textBoxes"]>;
 }
 
 const pitchKey = (size: number) => Math.round(size * 2) / 2;
@@ -942,8 +957,11 @@ function buildPara(lines: Line[], r: Region, blockEdge: number, ctx: Ctx): Para 
   const first = lines[0];
   const size = median(lines.map((l) => l.size));
   const pitch = lines.length >= 2 ? median(lines.slice(1).map((l, i) => l.baseline - lines[i].baseline)) : 0;
-  // 多行段落：行距就是 PDF 实测的基线间距；单行：按字号的常规单倍行距
-  const lineHeight = pitch || size * 1.17;
+  // 多行段落：行距就是 PDF 实测的基线间距；单行：按字号的常规单倍行距。
+  // 单行按本行最大的字号算（著录项目里编号 8.5 pt、内容 6.5 pt 混排）：按中位字号算的行高放不下大字，
+  // 只能写成"最小值"行距，排版时行高按字体实际高度撑开（CJK 回退字体更高），一行行累积下移，压到底图里的横线
+  const big = lines.length === 1 ? Math.max(size, ...first.spans.filter((s) => s.text.trim() && !s.img).map((s) => s.size)) : size;
+  const lineHeight = pitch || big * 1.17;
 
   let align: Para["align"] = "left";
   // 段落自身的右边界（缩进的段落如摘要，右边界在版心之内）
@@ -1113,6 +1131,10 @@ function buildPara(lines: Line[], r: Region, blockEdge: number, ctx: Ctx): Para 
     const lead = Math.round((indLeft + firstLine) * 20) / 20;
     if (!tabs.some((t) => Math.abs(t.pos - lead) < 1) && tabs.every((t) => t.pos > lead)) {
       tabs.push({ pos: lead, align: "left" });
+      // 编号后的制表符原本停在悬挂缩进处（没有另设制表位）：缩进归零后这个位置要补成制表位，
+      // 否则编号后的文字跳到行尾的右对齐制表位上，最后一段被挤到下一行
+      const hang = Math.round(indLeft * 20) / 20;
+      if (hangTab && !labelTab && !tabs.some((t) => Math.abs(t.pos - hang) < 1)) tabs.push({ pos: hang, align: "left" });
       runs.unshift({ text: "", tab: true, ...plainFmt(spanFormat(first.spans[0], first.size, first.baseline)), underline: undefined, strike: undefined });
       lineFits.forEach((f) => { f.start++; f.end++; });
       indLeft = 0; firstLine = 0;
@@ -1135,8 +1157,27 @@ function buildPara(lines: Line[], r: Region, blockEdge: number, ctx: Ctx): Para 
 const baselineOffset = (lineHeight: number, size: number) => lineHeight - 0.22 * size;
 
 /** 把一组行在给定区域里排成段落，并按实测位置计算段前距。返回段落与结束位置 */
-function layoutLines(lines: Line[], r: Region, cursor: number, ctx: Ctx, floats?: Map<Line, ImageBox[]>): { paras: Para[]; cursor: number } {
+function layoutLines(lines: Line[], r: Region, cursor: number, ctx: Ctx, floats?: Map<Line, ImageBox[]>, boxes?: NonNullable<Para["textBoxes"]>): { paras: Para[]; cursor: number } {
   const paras: Para[] = [];
+  // 逐行一致模式：原文里处于同一高度、却没能成为同一行的两行（扫描件 OCR 识别出的徽标碎字、叠在正文行首的杂点
+  // "："、并排的两个小块）。排进文字流只能一前一后，后一行连同下面的内容整块往下挤，压到底图里的横线、图上。
+  // 字少的那一行改为按原位置的文本框（与页眉页脚一样不参与文字流），字多的留在文字流里
+  if (boxes) {
+    const byTop = [...lines].sort((a, b) => a.top - b.top);
+    const minor = new Set<Line>();
+    for (let i = 0; i < byTop.length; i++) {
+      for (let j = i + 1; j < byTop.length && byTop[j].top < byTop[i].bottom; j++) {
+        const a = byTop[i], b = byTop[j];
+        if (minor.has(a) || minor.has(b) || !sameRow(a, b)) continue;
+        const m = lineChars(a) <= lineChars(b) ? a : b;
+        if (lineChars(m) <= 12 && !floats?.get(m)?.length) minor.add(m);
+      }
+    }
+    if (minor.size) {
+      for (const l of minor) boxes.push(...lineBoxes(l, ctx));
+      lines = lines.filter((l) => !minor.has(l));
+    }
+  }
   for (const { lines: group, edge } of groupParagraphs(lines, r, ctx)) {
     const p = buildPara(group, r, edge, ctx);
     const top = group[0].baseline - baselineOffset(p.lineHeight, p.size);
@@ -1147,6 +1188,32 @@ function layoutLines(lines: Line[], r: Region, cursor: number, ctx: Ctx, floats?
     cursor = Math.max(cursor, top) + p.lineHeight * group.length;
   }
   return { paras, cursor };
+}
+
+/** 一行的可见字符数 */
+const lineChars = (l: Line) => l.spans.reduce((n, sp) => n + (sp.img ? 1 : sp.text.replace(/\s/g, "").length), 0);
+/** 两行在原文里处于同一高度（纵向重叠超过较矮一行的一半） */
+const sameRow = (a: Line, b: Line) => Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top) >= 0.5 * Math.min(a.bottom - a.top, b.bottom - b.top);
+
+/** 一行文字 → 按页面坐标定位的文本框（按大间距切开，每一段一个） */
+function lineBoxes(l: Line, ctx: Ctx): NonNullable<Para["textBoxes"]> {
+  const groups: Span[][] = [];
+  for (const sp of l.spans) {
+    const g = groups[groups.length - 1];
+    if (g && sp.x0 - g[g.length - 1].x1 < 3 * l.size) g.push(sp);
+    else groups.push([sp]);
+  }
+  return groups.map((g) => {
+    const gl = finishLine(g);
+    const w = gl.x1 - gl.x0 + 6;
+    const p = buildPara([gl], { x0: gl.x0, x1: gl.x0 + w }, gl.x0 + w, ctx);
+    p.align = "left"; p.indLeft = 0; p.indRight = 0; p.firstLine = 0; p.tabs = [];
+    // 行高按最大的字号：混排的大字（叠在 "input image" 后面的 9 pt "："）超过固定行高时 Word 改用"最小值"行距，文字下沉
+    const big = Math.max(gl.size, ...g.filter((sp) => sp.text.trim() && !sp.img).map((sp) => sp.size));
+    const lh = big * 1.17;
+    p.lineHeight = lh;
+    return { x: gl.x0, y: gl.baseline - baselineOffset(lh, big), w, h: lh, para: p };
+  });
 }
 
 /** 独占一段的行内图片：段前距 = 与上一块的实测间距，左缩进 = 图片的横坐标（并排的多张图用制表位定位） */
@@ -1314,31 +1381,51 @@ export function detectGutter(lines: Line[], r: Region): { g0: number; g1: number
   const W = r.x1 - r.x0;
   // 逐点打分：左侧整行都在 x 左边的"长行"数、右侧整行都在 x 右边的"长行"数取较小者，减去跨越 x 的行数。
   // 不要求左右两栏的基线对齐（很多双栏文档两栏基线并不对齐），取最高分区间的中点作为分栏线。
-  const scores: Array<{ x: number; two: number }> = [];
+  const scores: Array<{ x: number; two: number; eff: number }> = [];
   for (let x = r.x0 + 0.3 * W; x <= r.x0 + 0.7 * W; x += 1) {
     let L = 0, R = 0, cross = 0, two = 0;
     for (const l of lines) {
       const k = classify(l, x);
       if (k === "cross") { cross++; continue; }
-      if (k === "two") two++;
       const left = l.spans.filter((s) => (s.x0 + s.x1) / 2 < x), right = l.spans.filter((s) => (s.x0 + s.x1) / 2 >= x);
+      // 左边只有紧挨着 x 的一小段（右栏里按网格对齐的国家代码清单 "AE, AG, AL…"，第一个代码落在 x 左边）：
+      // 这是从 x 左边不远处起头、跨过 x 的一行，不是左右两栏各有文字
+      if (k === "two" && Math.min(...left.map((s) => s.x0)) > r.x0 + 0.5 * (x - r.x0)) { cross++; continue; }
+      if (k === "two") two++;
       if (left.length && Math.max(...left.map((s) => s.x1)) - r.x0 > 0.2 * W) L++;
       if (right.length && r.x1 - Math.min(...right.map((s) => s.x0)) > 0.2 * W) R++;
     }
-    // 两种证据取其大：两侧同行都有文字的行数（页首有通栏内容时可靠），或左右长行数减去跨栏行数（两栏基线不对齐时可靠）
-    scores.push({ x, two: Math.max(two, Math.min(L, R) - cross) });
+    // 两种证据取其大：两侧同行都有文字的行数（页首有通栏内容时可靠），或左右长行数减去跨栏行数（两栏基线不对齐时可靠）。
+    // eff：再减去横跨这里的行数。扫描件的 OCR 文字字距很宽、日文按字格排版、国家代码这类清单按网格对齐，
+    // 栏内的字距空隙也会连成一条"竖向空白"，两侧都有文字的行数甚至比真正的栏间距还多——但总有大量的行横跨它；
+    // 真正的栏间距只被通栏的标题等少数行跨越
+    scores.push({ x, two: Math.max(two, Math.min(L, R) - cross), eff: Math.max(two, Math.min(L, R)) - cross });
   }
   const top = Math.max(0, ...scores.map((s) => s.two));
   if (top < 4 || top < 0.15 * lines.length) return null;
-  let bestRun: { a: number; b: number } | null = null;
+  // 候选：eff 接近最高的位置；其中取离版心中线最近的（两栏版式大多对称；右栏的条目编号与正文之间的空隙也几乎不被跨越，
+  // 但它偏在一侧），再取 eff 高的、连续区间长的
+  const maxEff = Math.max(...scores.map((sc) => sc.eff));
+  const nearEff = (sc: { eff: number }) => sc.eff >= maxEff - Math.max(2, 0.2 * Math.abs(maxEff));
+  const mid = (r.x0 + r.x1) / 2;
+  type Run = { a: number; b: number; two: number; eff: number };
+  const center = (c: Run) => Math.abs((scores[c.a].x + scores[c.b].x) / 2 - mid);
+  const better = (c: Run, o: Run) => {
+    if (Math.abs(center(c) - center(o)) > 4) return center(c) < center(o);
+    return c.eff !== o.eff ? c.eff > o.eff : c.b - c.a > o.b - o.a;
+  };
+  let bestRun: Run | null = null;
   for (let i = 0; i < scores.length; ) {
-    if (scores[i].two !== top) { i++; continue; }
+    const sc = scores[i];
+    if (!nearEff(sc)) { i++; continue; }
     let j = i;
-    while (j + 1 < scores.length && scores[j + 1].two === top) j++;
-    if (!bestRun || j - i > bestRun.b - bestRun.a) bestRun = { a: i, b: j };
+    while (j + 1 < scores.length && scores[j + 1].two === sc.two && scores[j + 1].eff === sc.eff) j++;
+    const run = { a: i, b: j, two: sc.two, eff: sc.eff };
+    if (!bestRun || better(run, bestRun)) bestRun = run;
     i = j + 1;
   }
-  const best = { x: (scores[bestRun!.a].x + scores[bestRun!.b].x) / 2, two: top };
+  if (!bestRun || bestRun.two < 4 || bestRun.two < 0.15 * lines.length) return null;
+  const best = { x: (scores[bestRun.a].x + scores[bestRun.b].x) / 2, two: bestRun.two };
   // 不跨栏的行：分栏线左侧 / 右侧的文字片段
   const parts: Array<{ l: Line; L: Span[]; R: Span[] }> = [];
   for (const l of lines) {
@@ -1553,8 +1640,20 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
   const tableX0: number[] = [], tableX1: number[] = [];
   for (const { pg, tables, free } of pre) {
     // 以"行"为单位统计左右边界（片段级统计会被行内的词间断开干扰）
-    for (const l of buildLines(free)) { xs0.push(l.x0); xs1.push(l.x1); }
+    const pls = buildLines(free);
+    for (const l of pls) { xs0.push(l.x0); xs1.push(l.x1); }
     for (const t of tables) { tableX0.push(t.x0); tableX1.push(t.x1); }
+    // 双栏的页面：两栏都必须落在版心里（栏宽 = 栏间距到版心边界）。只有一页是双栏时（扫描件首页的著录项目），
+    // 全文统计会把它比正文宽的左右边界当成离群值滤掉，左栏从版心外起排、整页错乱。和表格一样把两栏的外边界算进版心
+    if (pls.length >= 6) {
+      const g = detectGutter(pls, { x0: Math.min(...pls.map((l) => l.x0)), x1: Math.max(...pls.map((l) => l.x1)) });
+      if (g) {
+        const side = (l: Line) => classify(l, g.x);
+        const lx = pls.filter((l) => side(l) === "L" || side(l) === "two").map((l) => l.x0);
+        const rx = pls.filter((l) => side(l) === "R" || side(l) === "two").map((l) => l.x1);
+        if (lx.length >= 4 && rx.length >= 4) { tableX0.push(edgeOf(lx, "min")); tableX1.push(edgeOf(rx, "max")); }
+      }
+    }
     const ys = [...free.map((s) => s.top), ...tables.map((t) => t.y0), ...pg.images.map((i) => i.y0)];
     const ye = [...free.map((s) => s.bottom), ...tables.map((t) => t.y1)];
     if (ys.length) tops.push(Math.min(...ys));
@@ -1705,7 +1804,10 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
   // 分栏在整篇文档中通常一致：先逐页检测，再用最常见的栏间距补全"只有一栏有文字"的页面
   const gutters = pageLines.map((ls) => detectGutter(ls, body));
   const known = gutters.filter((g): g is NonNullable<typeof g> => !!g);
-  if (known.length) {
+  // 全文共识只在分栏确实是本文的版式时才用：100 页里只有 1 页测出"栏间距"（字距很宽的单栏正文的误检），
+  // 不能拿它去切其他页（扫描件首页的著录项目被这样从左栏中间切开，两栏文字交错、撑高版面，压到底图里的横线）
+  const textPages = pageLines.filter((ls) => ls.length >= 6).length;
+  if (known.length && known.length >= 0.2 * textPages) {
     // 全文共识：栏间距位置取中位数；栏边界取各页中最宽的左栏右边界 / 最靠左的右栏左边界的中位数
     const med = (xs: number[]) => [...xs].sort((a, b) => a - b)[Math.floor(xs.length / 2)];
     const docG = { x: med(known.map((g) => g.x)), g0: med(known.map((g) => g.g0)), g1: med(known.map((g) => g.g1)) };
@@ -1851,24 +1953,9 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
       hf.push({ head: floating[pi].filter((l) => l.top < pg.height / 2), foot: floating[pi].filter((l) => l.top >= pg.height / 2), imgs: [], mid: pg.height / 2 });
     } else {
       // 页眉页脚：每一段（按大间距切开）一个绝对定位的文字框
-      for (const l of floating[pi]) {
-        const groups: Span[][] = [];
-        for (const sp of l.spans) {
-          const g = groups[groups.length - 1];
-          if (g && sp.x0 - g[g.length - 1].x1 < 3 * l.size) g.push(sp);
-          else groups.push([sp]);
-        }
-        for (const g of groups) {
-          const gl = finishLine(g);
-          const w = gl.x1 - gl.x0 + 6;
-          const p = buildPara([gl], { x0: gl.x0, x1: gl.x0 + w }, gl.x0 + w, ctx);
-          p.align = "left"; p.indLeft = 0; p.indRight = 0; p.firstLine = 0; p.tabs = [];
-          const lh = gl.size * 1.17;
-          p.lineHeight = lh;
-          anchor.textBoxes!.push({ x: gl.x0, y: gl.baseline - baselineOffset(lh, gl.size), w, h: lh, para: p });
-        }
-      }
+      for (const l of floating[pi]) anchor.textBoxes!.push(...lineBoxes(l, ctx));
     }
+    ctx.boxes = flow ? undefined : anchor.textBoxes;
 
     // 条目：行 / 表格 / 分隔线 / 图片，按纵向位置排序后切成"通栏带"与"分栏带"
     type Item = PageItem;
@@ -2098,6 +2185,27 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
           notes.push(b);
         }
         notesBottom = Math.max(notesBottom, ...moved.map((it) => (it.kind === "line" ? it.line.bottom : it.top)));
+      }
+    }
+
+    // 逐行一致模式：与分栏行处于同一高度的通栏行（扫描件首页：徽标下跨过栏间的 "P O | P C T"，与左栏的
+    // "2017 年 3 月 9 日"、"W 画" 同高）。按带排版只能一带接一带，同一高度的几行被排成上下几行，
+    // 后面的带整块下移，压到底图里的横线上。两行中字少的改为按原位置的文本框，不参与文字流
+    if (ctx.boxes) {
+      type LineItem = Extract<Item, { kind: "line" }> & { top: number };
+      const lineItems = items.filter((it): it is LineItem => it.kind === "line");
+      const gone = new Set<LineItem>();
+      for (const a of lineItems) {
+        if (a.side !== "full") continue;
+        for (const b of lineItems) {
+          if (b.side === "full" || !sameRow(a.line, b.line)) continue;
+          const m = lineChars(a.line) <= lineChars(b.line) ? a : b;
+          if (lineChars(m.line) <= 12) gone.add(m);
+        }
+      }
+      for (const m of gone) {
+        ctx.boxes.push(...lineBoxes(m.line, ctx));
+        items.splice(items.indexOf(m), 1);
       }
     }
 
@@ -2488,7 +2596,7 @@ function layoutItems(items: Array<PageItem & { top: number }>, r: Region, cursor
   let waiting: ImageBox[] = [];
   const flush = () => {
     if (!pending.length) return;
-    const out = layoutLines(pending, r, cursor, ctx, floats);
+    const out = layoutLines(pending, r, cursor, ctx, floats, ctx.boxes);
     blocks.push(...out.paras);
     cursor = out.cursor;
     pending = [];

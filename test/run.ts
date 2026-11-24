@@ -1426,6 +1426,69 @@ await test("扫描件：整页扫描图按页面坐标铺满原页（不再 3 �
   }
 });
 
+await test("扫描件首页（看得见的 OCR 文字层）：著录项目的两栏不被栏内空隙、网格对齐的代码清单搅乱；大号公开号不吞并两侧小字；与左栏同高、跨过栏间的徽标碎字按原位置成文本框；OCR 标点字框压住下一个字不拆行", async () => {
+  const { buildLines, detectGutter, buildDocModel } = await import("../src/services/pdfConvert/layout.js");
+  // OCR 文字的字框偏高（上沿约一个字号）
+  const sp = (text: string, x0: number, x1: number, bl: number, size: number) => ({ text, x0, x1, top: bl - size, bottom: bl + 0.27 * size, baseline: bl, size, font: "MS-Mincho", bold: false, italic: false, color: "000000" });
+  const text = (p: any) => p.runs.map((r: any) => (r.tab ? "\t" : r.br ? "\n" : r.text)).join("");
+
+  // 标点的字框压住下一个字（"（" 压在 "S" 上、"：" 压在 "frame" 上）仍是同一行：拆成两行时 Word 里只能一上一下，
+  // 后面的内容整块下移；同一个标点叠在自己的副本上（重复绘制的文字层）仍要拆开
+  eq(buildLines([sp("ステップ", 115, 160, 605, 10), sp("（", 165.2, 175.4, 605, 10), sp("S", 171.7, 178.5, 605, 10), sp("1 0 8", 185.4, 213.6, 605, 10), sp("）", 215, 225, 605, 10)] as any).length, 1, "（S108）应在同一行");
+  eq(buildLines([sp("input image", 335.5, 375, 616, 6.5), sp("：", 381, 389.3, 616, 6.5), sp("frame so that the subject", 381.6, 470, 616, 6.5)] as any).length, 1, "input image ：frame … 应在同一行");
+  const dup = buildLines([sp("abc", 50, 70, 100, 10), sp("abc", 50.2, 70.2, 100, 10), sp("，", 70, 76, 100, 10), sp("，", 70.2, 76.2, 100, 10)] as any);
+  assert(dup.length === 2 && dup.every((l) => l.spans.filter((s) => s.text === "，").length === 1), `重复绘制的两层文字各成一行、各带一个逗号：${dup.map((l) => l.spans.map((s) => s.text).join("")).join(" | ")}`);
+
+  // 栏间距：右栏是按网格对齐的国家代码清单（第一个代码与后面的代码之间连成一条竖向空白，两侧都有文字的行比真正的
+  // 栏间距还多），左右两栏基线不对齐。真正的栏间距只被个别行跨过；网格空白则被每一个标题行跨过、且左侧只有一个代码
+  const codes = "AE AG AL AM AO AT AU AZ BA BB BG BH BN BR BW BY BZ CA CH CL CN CO CR CU CZ DE DK DM DO DZ EC EE EG ES FI GB GD GE".split(" ");
+  const gs: any[] = [];
+  for (let i = 0; i < 10; i++) gs.push(sp(`(${21 + i})`, 74.2, 90, 160 + 16.3 * i, 6.5), sp("国際出願番号：", 96, 160, 160 + 16.3 * i, 8.5), sp("PCT/JP2099/012345", 240, 309.6, 160 + 16.3 * i, 6.5));
+  for (let i = 0, c = 0; i < 24; i++) {
+    const bl = 164.5 + 10.2 * i;
+    if (i % 6 === 0) gs.push(sp(`(8${i % 10})`, 318.5, 336, bl, 6.5), sp("指定国（表示のない限り、全ての種類の国内保", 340, 552, bl, 8.5));
+    else for (let k = 0; k < 12; k++) gs.push(sp(codes[c++ % codes.length] + ",", 339 + 18 * k, 350 + 18 * k, bl, 6.5));
+  }
+  const g = detectGutter(buildLines(gs), { x0: 74.2, x1: 552 });
+  assert(g && Math.abs(g.x - 314) < 3, `栏间距应在两栏之间（x≈314），实际：${JSON.stringify(g)}`);
+
+  // 整页：页首左栏两行小字、右栏大号公开号（纵跨左边两行）；徽标下的 "W 画"（栏间左侧）与 "P O | P C T"（跨过栏间距）
+  // 与左栏的日期同高；下面是左右两栏的著录项目。正文行从 x = 72 起，标签行从 74.2 起（编号前有 2pt 的缩进）
+  const spans: any[] = [
+    sp("(43)", 128.2, 143, 116.6, 8.5), sp("国際公開日", 147, 197.3, 116.6, 8.5),
+    sp("2099", 95.5, 120, 128.9, 9.5), sp("年", 124, 133.5, 128.9, 9.5), sp("3", 137, 142, 128.9, 9.5), sp("月", 146, 155.5, 128.9, 9.5), sp("日", 170, 179.5, 128.9, 9.5), sp("（09.03.2099)", 183, 226.4, 128.9, 9.5),
+    sp("(10)", 406.8, 422, 109, 8.5), sp("国際公開番号", 426, 484.6, 109, 8.5), sp("W O 2099/012345 A 1", 376.1, 517.1, 125.5, 14),
+    sp("W", 251.8, 258.4, 134.6, 8.5), sp("画", 262.6, 275.8, 134.6, 8.5), sp("P", 272.9, 279.6, 134.6, 9.5), sp("O", 282.5, 289.5, 134.6, 9.5), sp("|", 296, 298, 134.6, 9.5), sp("P C T", 305.3, 331.9, 134.6, 9.5),
+  ];
+  for (let i = 0; i < 12; i++) spans.push(sp(`(${21 + i})`, 74.2, 89, 161.1 + 16.4 * i, 6.5), sp("国際出願番号：", 96, 160, 161.1 + 16.4 * i, 8.5), sp("PCT/JP2099/012345", 240, 309.6, 161.1 + 16.4 * i, 6.5));
+  for (let i = 0; i < 18; i++) spans.push(...(i % 6 === 0 ? [sp(`(7${i % 10})`, 318.5, 334, 160.6 + 10.3 * i, 6.5)] : []), sp("東京都新宿区西新宿 7 丁目 5 番 25 号 西新宿木村屋ビル 9 階", 339.4, 552.7, 160.6 + 10.3 * i, 8.5));
+  // 右栏一行里 OCR 多认出的一个字，与 "区" 叠在一起（同一高度、不同的行）
+  spans.push(sp("巨", 405, 413, 160.6 + 10.3 * 3 + 0.4, 8.5));
+  for (let i = 0; i < 7; i++) spans.push(sp("東京都港区港南 1 丁目 7 番 1 号 ソニー株式会社内 Tokyo (JP).", 72, 300, 365 + 10.2 * i, 8.5));
+  const page = { index: 0, width: 595, height: 842, spans, segs: [], fills: [], images: [], vectorShapes: 0, paths: [], masks: [], rotatedText: 0 };
+  const model = buildDocModel([page as any], { mode: "exact" });
+  eq(model.stats.columnPages, 1, "著录项目应识别为两栏");
+  const paras = model.blocks.filter((b: any) => b.kind === "p") as any[];
+  const flow = paras.map(text);
+  const boxes = paras.flatMap((p) => (p.textBoxes ?? []).map((t: any) => text(t.para)));
+  assert(flow.includes("(43) 国際公開日") && flow.includes("W O 2099/012345 A 1"), `大号公开号与左边的小字各自成行：${flow.slice(0, 8).join(" | ")}`);
+  for (let i = 21; i <= 32; i++) assert(flow.some((t) => t.includes(`(${i})`) && t.includes("国際出願番号：") && t.includes("PCT/JP2099/012345")), `(${i}) 的标签与值在左栏同一段：${flow.filter((t) => t.includes(`(${i})`)).join(" | ")}`);
+  assert(!flow.some((t) => t.includes("PCT/JP") && t.includes("東京都新宿区")), "左栏的值不应混进右栏");
+  // 与左栏同高的碎字按原位置成文本框；排进文字流只能一前一后，后面的两栏整块下移，压到底图里的横线上
+  assert(boxes.includes("W 画") && boxes.includes("P O | P C T") && !flow.some((t) => /画|P C T/.test(t)), `徽标碎字应是文本框：框 ${boxes.join(" | ")}；正文 ${flow.filter((t) => /画|P C T/.test(t)).join(" | ")}`);
+  assert(boxes.includes("巨") && !flow.some((t) => t.includes("巨")), `栏内与正文行叠在一起的碎字应是文本框：框 ${boxes.join(" | ")}`);
+  // 编号 6.5 pt、标签 8.5 pt 混排的单行：行高按最大的字号，不能写成"最小值"行距（排版时按字体实际高度撑开、逐行下移）
+  for (const p of paras.filter((p) => !p.tiny && p.runs.length && !p.runs.some((r: any) => r.br))) {
+    const big = Math.max(...p.runs.filter((r: any) => !r.tab && r.text?.trim()).map((r: any) => r.size ?? 0));
+    assert(big <= 1.08 * p.lineHeight, `单行段落的行高放得下最大的字：${JSON.stringify(text(p))} 行高 ${p.lineHeight} 字号 ${big}`);
+  }
+  // 编号行（单行、编号后接制表符）：缩进改写成制表位后，编号后的制表位也要保留，否则 "国際出願番号：" 跳到行尾的右对齐制表位上
+  for (const p of paras.filter((p) => text(p).includes("国際出願番号：") && !text(p).includes("\n") && p.indLeft === 0 && p.firstLine === 0)) {
+    const tabRuns = p.runs.filter((r: any) => r.tab).length;
+    assert(tabRuns <= p.tabs.length, `每个制表符都有制表位：${JSON.stringify(text(p))} 制表位 ${JSON.stringify(p.tabs)}`);
+  }
+});
+
 // ---------------------------------------------------------------------------
 console.log("\n旧版 Word（.doc）");
 // ---------------------------------------------------------------------------
