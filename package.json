@@ -12,6 +12,7 @@
     "dev:web": "npm --prefix web run dev",
     "build:web": "node scripts/ensure-web.mjs --force",
     "typecheck": "tsc --noEmit -p tsconfig.json",
+    "build:pdf2word": "node scripts/build-pdf2word.mjs",
     "test": "tsx test/run.ts"
   },
   "engines": {
@@ -23,6 +24,7 @@
     "@types/multer": "^1.4.13",
     "@types/node": "^22.20.4",
     "@types/prompts": "^2.4.9",
+    "esbuild": "0.28.2",
     "tsx": "^4.23.15",
     "typescript": "^5.9.3"
   },

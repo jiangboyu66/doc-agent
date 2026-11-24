@@ -163,6 +163,59 @@ Markdown 和 HTML 采用同样的思路：直接在源文本上按位置拼接�
 
 输入 `/verify` 可以随时查看当前文档的保真报告。
 
+## pdf2word：PDF → Word 命令行发布包
+
+内置引擎也打包成独立的命令行工具 `pdf2word`，供不引入 doc-agent 整套依赖的系统使用（例如 AltaLex 在沙箱里调用）：只需要 Node 20.16 或更高版本；不访问网络，不需要环境变量，不调用 Python / LibreOffice。
+
+```
+node pdf2word/pdf2word.mjs --version
+node pdf2word/pdf2word.mjs convert in.pdf out.docx [--mode flow|exact] [--pages 1-20,25] [--max-pages N]
+```
+
+**契约 v1**（入口 `cli/pdf2word.ts`；契约有任何变化，次版本号加一，调用方的适配器测试同步修改）：
+
+- stdout 恰好一行 JSON（UTF-8，以 `\n` 结尾），此外没有任何输出；告警、诊断一律写 stderr。
+  - 成功：`{"ok":true,"tool":"pdf2word","version":"1.0.0","commit":"…","mode":"flow","bytes":N,"report":{…}}`，`report` 即上文的转换报告（`ConversionReport`）；
+  - 失败：`{"ok":false,"tool":"pdf2word","version":"…","commit":"…","code":"…","message":"…"}`。
+- `--version`：stdout 一行 `pdf2word <版本> (doc-agent <提交号>)`，退出码 0。
+- 退出码：0 成功；2 失败；64 参数错误。
+
+| code | 含义 |
+| --- | --- |
+| `usage` | 参数错误，包括页码范围无法识别或不在这份 PDF 的页码内（退出码 64） |
+| `input_unreadable` | 读不到输入文件 |
+| `not_pdf` | 前 1024 字节里没有 `%PDF-` |
+| `encrypted` | PDF 有打开密码 |
+| `conversion_failed` | 引擎转换失败（例如 PDF 已损坏） |
+| `output_unwritable` | 写不了输出文件；写到一半失败时删掉写了一半的文件 |
+| `engine_incomplete` | 包里缺 `cmaps/`、`standard_fonts/` 或 `fontMetrics.json`，或 Node 低于 20.16。读入 PDF 之前检查：缺这些数据时引擎本身不报错，未嵌入字体的中文 PDF 会转出 0 个字，完整性却仍显示 100% |
+
+其他约定：
+
+- 默认 `--mode flow`（可编辑排版）；单次最多 500 页，超出的页不转换，`report.notes` 里写明。
+- 只写 `out.docx` 这一个文件。
+- 不带 `@napi-rs/canvas`，相当于 `PDF_RASTER=0`：矢量图、公式区域按文字处理或不输出；PDF 里嵌入的位图（包括扫描件的整页图片）照常保留。
+- 判断有没有文字层看 `report.textTotal`（扫描件、文字转成曲线的 PDF 是 0 或很少），不能看 `textCoverage`：没有文字时它也是 1。
+
+**发布包** `pdf2word-<版本>.tgz`（约 2 MB，解压后约 3.9 MB、190 个文件），纯 JS，一个包同时适用于 x64 与 arm64：
+
+```
+pdf2word/
+  pdf2word.mjs              单文件：CLI + 引擎 + pdf.js + worker
+  pdf2word.mjs.LEGAL.txt    打进单文件的第三方包（pdf.js、jsdiff）的许可证原文
+  fontMetrics.json          Word 字体的字宽表
+  node_modules/pdfjs-dist/  package.json、LICENSE、cmaps/、standard_fonts/（pdf.js 的 CMap 与标准字体）
+```
+
+**构建**：`npm run build:pdf2word`，产物是 `dist/pdf2word-<版本>.tgz` 和 `.sha256`；需要 GNU tar 与 gzip（Linux、WSL 或 CI）。构建完自动在只含解压结果的空目录里跑冒烟测试：版本输出；中文合同、只用未嵌入中文 CID 字体的 PDF、未嵌入标准字体的 PDF 与开发环境转出的 `document.xml` 逐字节一致；扫描件；页码范围；各个错误码；删掉 `cmaps/` 或 `standard_fonts/` 时报 `engine_incomplete`。`-- --no-smoke` 只构建。压缩包可复现：文件 mtime 固定为 HEAD 的提交时间，属主 0:0，按名字排序，`gzip -n`；同一提交连续构建两次，摘要相同。工作区有未提交的修改时，提交号后面带 `-dirty`。
+
+**发版**：
+
+1. 修改 `scripts/build-pdf2word.mjs` 里的 `VERSION`（契约变化加次版本号；只更新引擎时加修订号），提交；
+2. 在要发布的提交上打标签 `pdf2word-v<VERSION>` 并推送；
+3. CI（`.github/workflows/pdf2word.yml`，ubuntu-latest、Node 20）依次跑类型检查、测试、构建与冒烟测试，核对标签与 `VERSION` 一致、再构建一次摘要不变，然后把 `.tgz` 和 `.sha256` 附到同名 Release；
+4. 发布包里写着构建时的提交号，所以摘要随提交变化：调用方固定的摘要要换成 Release 附带的 `.sha256`。
+
 ---
 
 ## 旧版 Word（.doc）
@@ -289,6 +342,8 @@ src/
   permissions/ hooks/ skills/ agents/ plugins/ config/ services/ session/
   entrypoints/server.ts   Web 服务（Express + SSE）
   entrypoints/cli.ts      命令行
+cli/pdf2word.ts           pdf2word 命令行（PDF → Word 发布包的入口，见"pdf2word"一节）
+scripts/build-pdf2word.mjs  pdf2word 发布包的构建与冒烟测试
 web/                      React 前端（Vite）
 skills/                   内置技能
 plugins/                  插件
