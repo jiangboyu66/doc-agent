@@ -4,13 +4,17 @@
  *   npm run build:pdf2word                 构建 dist/pdf2word-<版本>.tgz 与 .sha256，再在只含解压结果的空目录里跑冒烟测试
  *   npm run build:pdf2word -- --no-smoke   只构建
  *
- * 发布包（纯 JS，x64 / arm64 通用；运行只需要 Node ≥ 20.16）：
+ * 发布包（运行只需要 Node ≥ 20.16；渲染组件只带 linux-x64 glibc 的原生模块，其他平台照常转换，只是不渲染）：
  *   pdf2word/
- *     pdf2word.mjs               esbuild 单文件：CLI + 引擎 + pdf.js + worker（不含 @napi-rs/canvas，不渲染矢量图 / 公式）
+ *     pdf2word.mjs               esbuild 单文件：CLI + 引擎 + pdf.js + worker（@napi-rs/canvas 不打进单文件，在下面的 node_modules 里）
  *     pdf2word.mjs.LEGAL.txt     打进单文件的第三方代码的许可证注释
  *     fontMetrics.json           Word 字体的字宽表（引擎按 import.meta.url 在单文件旁边找它）
  *     node_modules/pdfjs-dist/{package.json, LICENSE, cmaps/, standard_fonts/}
  *                                pdf.js 的 CMap 与标准字体（引擎用 createRequire 从单文件所在目录定位）
+ *     node_modules/@napi-rs/canvas/{package.json, LICENSE, *.js}
+ *     node_modules/@napi-rs/canvas-linux-x64-gnu/{package.json, skia.linux-x64-gnu.node}
+ *                                把矢量图、文字被转成轮廓的表格、行间公式渲染成图片（没有它时这些内容整块丢失，
+ *                                文字完整性却仍是 100%）。CLI 发现带了本平台的原生模块却加载不了时报 engine_incomplete
  * 可复现：文件 mtime 固定为 HEAD 的提交时间，属主 0:0，按名字排序，gzip -n；同一提交连续构建两次，摘要相同。
  * 打包需要 GNU tar 与 gzip（Linux、WSL 或 CI）。
  */
@@ -29,7 +33,7 @@ import { fileURLToPath } from "node:url";
  * pdf2word 自己的版本号（与 doc-agent 的版本号无关）：主版本对应契约 v1；契约有任何变化，次版本号加一；
  * 只有引擎更新时修订号加一。发版标签为 pdf2word-v<版本>，CI 会核对标签与这里一致。
  */
-const VERSION = "1.0.1";
+const VERSION = "1.0.2";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const dist = path.join(root, "dist");
@@ -125,6 +129,29 @@ const pdfjsOut = path.join(pkg, "node_modules/pdfjs-dist");
 fs.mkdirSync(pdfjsOut, { recursive: true });
 for (const f of ["package.json", "LICENSE"]) fs.copyFileSync(path.join(pdfjsDir, f), path.join(pdfjsOut, f));
 for (const d of ["cmaps", "standard_fonts"]) copyTree(path.join(pdfjsDir, d), path.join(pdfjsOut, d));
+
+// 渲染组件：只带服务器沙箱的平台（linux-x64 glibc）。npm 只装构建机平台的原生模块，所以这里固定平台、缺了就失败，
+// 不按构建机上碰巧装了哪些来带：同一提交在哪里构建，发布包的内容都一样
+const CANVAS_PLATFORMS = ["linux-x64-gnu"];
+const canvasDir = path.dirname(createRequire(import.meta.url).resolve("@napi-rs/canvas/package.json"));
+const canvasVersion = JSON.parse(fs.readFileSync(path.join(canvasDir, "package.json"), "utf8")).version;
+const canvasOut = path.join(pkg, "node_modules/@napi-rs/canvas");
+fs.mkdirSync(canvasOut, { recursive: true });
+for (const f of fs.readdirSync(canvasDir).sort()) if (/\.(js|json)$|^LICENSE$/.test(f)) fs.copyFileSync(path.join(canvasDir, f), path.join(canvasOut, f));
+for (const platform of CANVAS_PLATFORMS) {
+  const native = `@napi-rs/canvas-${platform}`;
+  let dir;
+  try {
+    dir = path.dirname(createRequire(path.join(canvasDir, "package.json")).resolve(`${native}/package.json`));
+  } catch {
+    fail(`缺少 ${native}@${canvasVersion}：在 Linux x64 上 npm ci，或 npm i --no-save --os=linux --cpu=x64 --libc=glibc ${native}@${canvasVersion}`);
+  }
+  const { version } = JSON.parse(fs.readFileSync(path.join(dir, "package.json"), "utf8"));
+  if (version !== canvasVersion) fail(`${native} ${version} 与 @napi-rs/canvas ${canvasVersion} 版本不一致`);
+  const out = path.join(pkg, "node_modules", native);
+  fs.mkdirSync(out, { recursive: true });
+  for (const f of fs.readdirSync(dir).sort()) if (/\.(node|json)$/.test(f)) fs.copyFileSync(path.join(dir, f), path.join(out, f));
+}
 
 // ---------------------------------------------------------------------------
 // 3. 可复现的压缩包
@@ -331,6 +358,34 @@ for (const dir of ["cmaps", "standard_fonts"]) {
       fs.rmSync(copy, { recursive: true, force: true });
     }
   });
+}
+
+const canvasHere = process.platform === "linux" && process.arch === "x64" && !fs.readFileSync("/usr/bin/ldd", "utf8").includes("musl");
+if (canvasHere) {
+  check("outlined-table.pdf（文字被转成轮廓的表格）：渲染组件可用，表格整体渲染成图片贴回原位，与开发环境一致", () => {
+    const { r, j, out } = convert("outlined-table.pdf");
+    assert(r.status === 0 && j.ok, `失败：${r.stdout}`);
+    assert(j.report.figures >= 1 && j.report.notes.some((n) => n.includes("渲染为 288 dpi")), `应渲染出图片：${JSON.stringify(j.report).slice(0, 400)}`);
+    const buf = fs.readFileSync(out);
+    assert(buf.includes(Buffer.from("word/media/")), "Word 里没有图片");
+    sameAsDev("outlined-table.pdf", documentXml(out));
+    return `${j.report.figures} 幅图，${j.report.ms} ms`;
+  });
+
+  check("副本里的渲染原生模块损坏：engine_incomplete，不静默丢掉矢量内容", () => {
+    const copy = fs.mkdtempSync(path.join(os.tmpdir(), "pdf2word-canvas-"));
+    try {
+      copyTree(path.join(tmp, "pdf2word"), path.join(copy, "pdf2word"));
+      fs.writeFileSync(path.join(copy, "pdf2word/node_modules/@napi-rs/canvas-linux-x64-gnu/skia.linux-x64-gnu.node"), "not a module");
+      const r = run(["convert", path.join(work, "missing.pdf"), path.join(work, "x.docx")], path.join(copy, "pdf2word/pdf2word.mjs"));
+      const j = parse(r);
+      assert(r.status === 2 && j.code === "engine_incomplete", r.stdout);
+    } finally {
+      fs.rmSync(copy, { recursive: true, force: true });
+    }
+  });
+} else {
+  console.log(`  - 本机不是 linux-x64 glibc：跳过渲染的冒烟测试（发布包只带这个平台的渲染组件）`);
 }
 
 fs.rmSync(tmp, { recursive: true, force: true });

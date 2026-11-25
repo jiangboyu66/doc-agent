@@ -113,7 +113,8 @@ function renderBoxes(model: DocModel): ImageBox[] {
 
 async function runBuiltin(buf: Buffer, title: string, pages: PageModel[], mode: LayoutMode) {
   const notes: string[] = [];
-  let model = buildDocModel(pages, { mode, raster: await rasterAvailable() });
+  const raster = await rasterAvailable();
+  let model = buildDocModel(pages, { mode, raster });
   const regions = renderBoxes(model);
   if (regions.length) {
     const ok = await renderRegions(buf, regions).catch(() => 0);
@@ -131,7 +132,10 @@ async function runBuiltin(buf: Buffer, title: string, pages: PageModel[], mode: 
   }
   if (model.stats.inlineMath) notes.push(`${model.stats.inlineMath} 处没有文字编码的行内公式 / 符号（Type 3 位图字体）以图片形式插回原文行内。`);
   const data = writeDocx(model, title);
-  if (model.stats.vectorShapes) notes.push(`${model.stats.vectorShapes} 处零散的矢量图形（不构成完整的图）未能转换。`);
+  if (model.stats.vectorShapes) notes.push(raster
+    ? `${model.stats.vectorShapes} 处零散的矢量图形（不构成完整的图）未能转换。`
+    // 不能渲染时，完整的矢量图、文字被转成轮廓的表格也都算在这里：明确说出来，而不是混在"零散图形"里
+    : `${model.stats.vectorShapes} 处矢量图形未能转换：本环境不能渲染，矢量图、以轮廓绘制文字的表格和公式没有保留，请对照原 PDF。`);
   if (model.stats.rotatedText) notes.push(`${model.stats.rotatedText} 段旋转文字未转换。`);
   if (model.stats.columnPages) notes.push(`${model.stats.columnPages} 页检测到双栏排版，已用 Word 分栏还原。`);
   if (model.notes) notes.push(...model.notes);

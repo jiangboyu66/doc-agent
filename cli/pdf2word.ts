@@ -1,6 +1,7 @@
 /**
  * pdf2word：把 doc-agent 的内置 PDF → Word 引擎包装成独立的命令行工具，供外部系统（AltaLex）在沙箱里调用。
- * 打包：npm run build:pdf2word（scripts/build-pdf2word.mjs），产物是不依赖 node_modules 的单文件。
+ * 打包：npm run build:pdf2word（scripts/build-pdf2word.mjs），产物是单文件加上它旁边的数据：pdf.js 的 CMap / 标准字体，
+ * 以及把矢量图、轮廓文字绘制的表格、行间公式渲染成图片的 @napi-rs/canvas（只带 linux-x64 glibc 的原生模块）。
  *
  *   node pdf2word.mjs --version
  *   node pdf2word.mjs convert <in.pdf> <out.docx> [--mode flow|exact] [--pages 1-20,25] [--max-pages N]
@@ -13,6 +14,8 @@
  *   - --version：stdout 一行 "pdf2word <version> (doc-agent <commit>)"，退出码 0。
  *   - 退出码：0 成功；2 失败；64 参数错误。
  *   - 只写 <out.docx> 这一个文件；只用内置引擎；不访问网络，不需要环境变量，不调用 Python / LibreOffice。
+ *   - 发布包带了本平台的渲染组件时它必须能加载，否则 engine_incomplete（不静默丢掉矢量图和表格）；
+ *     没带的平台不渲染，矢量内容按文字重建，未能保留的在 report.notes 里写明。
  */
 
 import fs from "node:fs";
@@ -43,8 +46,7 @@ console.debug = console.error;
 process.stdout.write = process.stderr.write.bind(process.stderr) as typeof process.stdout.write;
 // 2. worker 与 CLI 在同一个文件里
 (globalThis as any).pdfjsWorker = pdfjsWorker;
-// 3. 不渲染矢量图 / 公式区域（发布包不带 @napi-rs/canvas）；这些区域按文字处理或不输出
-process.env.PDF_RASTER ??= "0";
+// 3. 矢量图 / 公式区域：能加载 @napi-rs/canvas 就渲染成图片（发布包里它与单文件并列）。PDF_RASTER=0 只供调试时关闭
 
 type Code = "usage" | "input_unreadable" | "not_pdf" | "encrypted" | "conversion_failed" | "output_unwritable" | "engine_incomplete";
 
@@ -152,7 +154,22 @@ async function checkEngine() {
     // 发布包里 fontMetrics.json 与 pdf2word.mjs 并列（引擎按 import.meta.url 找它；找不到时静默改用估算的字宽）
     const metrics = fileURLToPath(new URL("./fontMetrics.json", import.meta.url));
     if (!fs.existsSync(metrics)) throw new CliError("engine_incomplete", `缺少 ${path.basename(metrics)}`);
+    // 发布包带了本平台的渲染组件，它就必须能加载：加载不了时矢量图、轮廓文字的表格会整块丢失，而文字完整性仍是 100%
+    const platform = canvasPlatform();
+    const shipped = fileURLToPath(new URL(`./node_modules/@napi-rs/canvas-${platform}/package.json`, import.meta.url));
+    if (process.env.PDF_RASTER !== "0" && fs.existsSync(shipped)) {
+      const { rasterAvailable } = await import("../src/services/pdfConvert/render.js");
+      if (!(await rasterAvailable())) throw new CliError("engine_incomplete", `渲染组件 @napi-rs/canvas-${platform} 无法加载`);
+    }
   }
+}
+
+/** @napi-rs/canvas 原生模块的平台名（linux 区分 glibc / musl，判据与 @napi-rs/canvas 自己的一致） */
+function canvasPlatform(): string {
+  if (process.platform !== "linux") return `${process.platform}-${process.arch}`;
+  let musl = false;
+  try { musl = fs.readFileSync("/usr/bin/ldd", "utf8").includes("musl"); } catch { /* 没有 ldd：按 glibc */ }
+  return `linux-${process.arch}-${musl ? "musl" : "gnu"}`;
 }
 
 function isPasswordError(e: any): boolean {
