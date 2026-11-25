@@ -93,7 +93,10 @@ class Writer {
     // 逐行一致模式的排版换行：clear="none"（与普通换行等效）作为标记，编辑时可识别并去掉
     if (r.br) return `<w:r>${this.rPr(r)}<w:br w:clear="none"/></w:r>`;
     if (r.pageMark) return "<w:r><w:lastRenderedPageBreak/></w:r>";
-    if (r.field) return `<w:fldSimple w:instr=" ${r.field} "><w:r>${this.rPr(r)}<w:t>${esc(r.text)}</w:t></w:r></w:fldSimple>`;
+    if (r.field) {
+      const instr = r.fieldDigits ? `${r.field} \\# "${"0".repeat(r.fieldDigits)}"` : r.field;
+      return `<w:fldSimple w:instr=" ${esc(instr)} "><w:r>${this.rPr(r)}<w:t>${esc(r.text)}</w:t></w:r></w:fldSimple>`;
+    }
     return `<w:r>${this.rPr(r)}<w:t xml:space="preserve">${esc(clean(r.text))}</w:t></w:r>`;
   }
 

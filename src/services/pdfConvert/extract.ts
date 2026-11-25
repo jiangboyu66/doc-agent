@@ -94,6 +94,8 @@ export interface PageModel {
   index: number;
   width: number;
   height: number;
+  /** 按与页面 /Rotate 不同的方向读取时的视口旋转角（渲染图片区域时用同一方向） */
+  rotation?: number;
   spans: Span[];
   segs: Seg[];
   fills: FillRect[];
@@ -272,10 +274,27 @@ export async function extractPdf(buf: Buffer, opts: { maxPages?: number; pages?:
 }
 
 async function extractPage(page: any, index: number, OPS: any, Util: any): Promise<PageModel> {
-  const vp = page.getViewport({ scale: 1 });
+  let vp = page.getViewport({ scale: 1 });
+  let rotation: number | undefined;
+  // 页面带 /Rotate 90 / 270、内容却按未旋转的版面排（合并、扫描时转了页面方向）：显示出来整页文字都横躺着，
+  // 横躺的文字转换不了，整页会丢。这样的页面按文字自己的方向读，页面宽高随之互换
+  if ((((page.rotate ?? 0) % 360) + 360) % 180 === 90) {
+    const items = ((await page.getTextContent({ includeMarkedContent: false, disableNormalization: true })).items as any[]).filter((it) => it.str?.trim());
+    const upright = (T: M) => {
+      let up = 0, all = 0;
+      for (const it of items) {
+        const t = Util.transform(T, it.transform) as M, s = Math.hypot(t[2], t[3]), n = it.str.trim().length;
+        all += n;
+        if (Math.abs(t[1]) <= 0.01 * s && Math.abs(t[2]) <= 0.01 * s) up += n;
+      }
+      return all ? up / all : 1;
+    };
+    const flat = page.getViewport({ scale: 1, rotation: 0 });
+    if (upright(vp.transform) < 0.2 && upright(flat.transform) >= 0.8) { vp = flat; rotation = 0; }
+  }
   const VT = vp.transform as M;
   const ops = await page.getOperatorList();
-  const model: PageModel = { index, width: vp.width, height: vp.height, spans: [], segs: [], fills: [], images: [], vectorShapes: 0, rotatedText: 0, paths: [], masks: [] };
+  const model: PageModel = { index, width: vp.width, height: vp.height, ...(rotation !== undefined ? { rotation } : {}), spans: [], segs: [], fills: [], images: [], vectorShapes: 0, rotatedText: 0, paths: [], masks: [] };
 
   // ---------- 操作符遍历：图形、图片、文字颜色 ----------
   interface GState { ctm: M; fill: string; stroke: string; lw: number; trm: number; clip?: { x0: number; y0: number; x1: number; y1: number } }
@@ -672,7 +691,11 @@ async function extractPage(page: any, index: number, OPS: any, Util: any): Promi
           smallCaps = lower >= 3 && wide >= Math.max(2, 0.6 * lower);
           // 按颜色 / 伪粗体切段（只处理 BMP 字符：操作符流按 UTF-16 码元记录）
           const keyOf = (j: number) => `${textColors[at + j].color}|${textColors[at + j].fakeBold ? 1 : 0}`;
-          if (!spaced && !/[\ud800-\udfff]/.test(it.str) && joined.length > 1 && [...joined].some((_, j) => j > 0 && keyOf(j) !== keyOf(j - 1))) {
+          // 跨过表格竖线的文字项：相邻两格的文字间距不大时，pdf.js 当作词间空格把它们合成一项（"…testing 2027-02-14"），
+          // 整项按中心落进左边一格、右边一格变空。在竖线所在的词间空白处切开
+          const mid = baseline - 0.3 * size;
+          const vlines = model.segs.filter((g) => !g.horizontal && g.x0 > x0 && g.x1 < x0 + width && g.y1 - g.y0 >= 0.8 * size && g.y0 <= mid && g.y1 >= mid);
+          if (!spaced && !/[\ud800-\udfff]/.test(it.str) && joined.length > 1 && (vlines.length || [...joined].some((_, j) => j > 0 && keyOf(j) !== keyOf(j - 1)))) {
             // 每个非空白字符在 it.str 中的下标，以及它前面 it.str 里的空白段数（TJ 位移代替空格时据此补上空格宽度）
             const idx: number[] = [], gapsBefore: number[] = [];
             let gaps = 0, prevSpace = false;
@@ -683,8 +706,14 @@ async function extractPage(page: any, index: number, OPS: any, Util: any): Promi
               gapsBefore.push(gaps);
             }
             const startEm = (j: number) => starts[j] + (missing ? Math.max(0, gapsBefore[j] - spacesAt[j]) * spEm : 0);
-            const cuts = [0, ...[...joined].map((_, j) => j).filter((j) => j > 0 && keyOf(j) !== keyOf(j - 1))];
-            pieces = cuts.map((j, k) => {
+            const atRule = (j: number) => {
+              if (!vlines.length || gapsBefore[j] === gapsBefore[j - 1]) return false;
+              const a = x0 + (width * (startEm(j - 1) + textColors[at + j - 1].adv)) / em, b = x0 + (width * startEm(j)) / em;
+              // 两个操作合成的一项里，两段之间的真实间距按一个空格估算，位置会差几磅：两边各放宽半个字号
+              return vlines.some((g) => (g.x0 + g.x1) / 2 > a - 0.5 * size && (g.x0 + g.x1) / 2 < b + 0.5 * size);
+            };
+            const cuts = [0, ...[...joined].map((_, j) => j).filter((j) => j > 0 && (keyOf(j) !== keyOf(j - 1) || atRule(j)))];
+            if (cuts.length > 1) pieces = cuts.map((j, k) => {
               const next = cuts[k + 1];
               const f0 = k === 0 ? 0 : startEm(j) / em, f1 = next === undefined ? 1 : startEm(next) / em;
               return {

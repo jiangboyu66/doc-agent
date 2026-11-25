@@ -1674,6 +1674,48 @@ await test(".doc 形状组合：矩形、带箭头的连接线、自由曲线都
   for (const t of ["示意图如下。", "图后的正文。"]) assert(docText(data).includes(t), `正文：${t}`);
 });
 
+await test("PWB 回归（pwb-cases.py）：左对齐正文不在短行处断段、跨页段落合并；补零的 Bates 号写成页码域；表格竖线两侧的文字不并格；/Rotate 页按文字方向转换；首页带引用号的脚注留在正文", async () => {
+  const { pdfToDocx } = await import("../src/services/pdfConvert/index.js");
+  const plain = (xml: string) => (xml.match(/<w:p[ >][\s\S]*?<\/w:p>/g) ?? [])
+    .map((p) => p.replace(/<w:instrText[^>]*>[^<]*<\/w:instrText>/g, "").replace(/<w:tab\/>/g, "\t").replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim()).filter(Boolean);
+  const footers = (pkg: InstanceType<typeof ZipPackage>) => pkg.names().filter((n) => /^word\/footer\d*\.xml$/.test(n)).map((n) => pkg.readText(n));
+  // 左对齐正文排在留有内边距的文本框里，页眉横线、页脚伸到页边：区域右边界比折行处靠右；第 7 段跨页
+  {
+    const { data, report } = await pdfToDocx(await fixture("ragged.pdf"), { mode: "flow" });
+    eq(report.textCoverage, 1, `文字完整性，缺失：${report.missing}`);
+    const pkg = new ZipPackage(data);
+    const paras = plain(pkg.readText("word/document.xml"));
+    const body = paras.filter((p) => p.length > 200);
+    eq(body.length, 12, `12 段正文各成一段：${paras.map((p) => p.slice(-24)).join(" | ")}`);
+    assert(body.every((p) => /\.$/.test(p)), "每段都以句号结束（没有在句子中间断开）");
+    assert(footers(pkg).some((f) => /ALX<\/w:t>[\s\S]*?00000<\/w:t>[\s\S]*?instr=" PAGE "/.test(f)), "Bates 号写成 ALX00000 + PAGE 域");
+    assert(!paras.some((p) => p.includes("ALX00000")), "Bates 号不回正文");
+  }
+  // 说明列的文字离右边框线很近，pdf.js 把它和日期当作词间空格合成一项
+  {
+    const { data } = await pdfToDocx(await fixture("cells.pdf"), { mode: "flow" });
+    const rows = (docXml(data).match(/<w:tr[ >][\s\S]*?<\/w:tr>/g) ?? []).map((r) => (r.match(/<w:tc[ >][\s\S]*?<\/w:tc>/g) ?? []).map((c) => c.replace(/<[^>]+>/g, "").trim()));
+    for (let i = 1; i <= 5; i++) {
+      assert(rows.some((r) => r[1] === `Delivery of work package ${i} and acceptance testing` && r[2] === `2027-0${i}-14`), `第 ${i} 行：说明与日期应各在一格：${JSON.stringify(rows[i])}`);
+    }
+  }
+  // 第 2 页带 /Rotate 90：按文字自己的方向读，正文不当成旋转文字丢掉，也不按第一页（横向）的版心判断折行
+  {
+    const { data, report } = await pdfToDocx(await fixture("rotated.pdf"), { mode: "flow" });
+    eq(report.textCoverage, 1, `文字完整性，缺失：${report.missing}`);
+    assert(!report.notes.some((n) => n.includes("旋转文字")), `不应有旋转文字未转换：${report.notes.join(" | ")}`);
+    eq(plain(docXml(data)).filter((p) => p.length > 200).length, 4, "第 2 页 4 段正文各成一段");
+  }
+  // 各页页底的脚注都留在本页正文末尾，不只把第一页的移进首页页脚
+  {
+    const { data } = await pdfToDocx(await fixture("footnotes.pdf"), { mode: "flow" });
+    const pkg = new ZipPackage(data);
+    assert(footers(pkg).every((f) => !f.includes("See clause")), "脚注不进页脚");
+    const paras = plain(pkg.readText("word/document.xml"));
+    for (let k = 1; k <= 9; k++) eq(paras.filter((p) => p.startsWith(`${k} See clause`)).length, 1, `脚注 ${k} 在正文里单独成段`);
+  }
+});
+
 // ---------------------------------------------------------------------------
 
 await fs.rm(tmp, { recursive: true, force: true });

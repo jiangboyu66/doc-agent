@@ -117,7 +117,8 @@ async function runBuiltin(buf: Buffer, title: string, pages: PageModel[], mode: 
   let model = buildDocModel(pages, { mode, raster });
   const regions = renderBoxes(model);
   if (regions.length) {
-    const ok = await renderRegions(buf, regions).catch(() => 0);
+    const rotation = new Map(pages.filter((p) => p.rotation !== undefined).map((p) => [p.index, p.rotation!] as [number, number]));
+    const ok = await renderRegions(buf, regions, undefined, rotation).catch(() => 0);
     if (ok < regions.length) {
       // 渲染失败：退回纯文字重建，保证内容不丢
       model = buildDocModel(pages, { mode, raster: false });

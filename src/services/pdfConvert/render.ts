@@ -54,7 +54,7 @@ export async function rasterAvailable(): Promise<boolean> {
 }
 
 /** 渲染所有待渲染的区域，填入 png / pxW / pxH；返回成功渲染的数量 */
-export async function renderRegions(buf: Buffer, boxes: ImageBox[], dpi = 288): Promise<number> {
+export async function renderRegions(buf: Buffer, boxes: ImageBox[], dpi = 288, rotation: ReadonlyMap<number, number> = new Map()): Promise<number> {
   const todo = boxes.filter((b) => b.render && !b.png.length);
   if (!todo.length) return 0;
   const m = await loadCanvas();
@@ -84,7 +84,8 @@ export async function renderRegions(buf: Buffer, boxes: ImageBox[], dpi = 288): 
     for (const [pi, list] of byPage) {
       try {
         const page = await doc.getPage(pi + 1);
-        const vp = page.getViewport({ scale });
+        // 与读取文字时同一方向（extract.ts 按文字方向读的 /Rotate 页面）
+        const vp = page.getViewport({ scale, ...(rotation.has(pi) ? { rotation: rotation.get(pi) } : {}) });
         const f = new CanvasFactory();
         const cc = f.create(vp.width, vp.height);
         // 透明背景：贴回 Word 后不会遮住相邻的文字

@@ -9,6 +9,8 @@
  *   - 在多页出现、确是页眉页脚、但 Word 写不出来的行：另一节的页眉、逐页递增却不是本文页码的编号（Bates 号、
  *     另起的页码）。它们不回正文（放回去会截断跨页的段落），在 notes 里如实说明没有写进去；
  *   - 页码域只放在真正的页码位上：页眉里的版本号、合同编号即使恰好等于某一页的页码，也保持原文。
+ *   - 补零到固定位数、逐页等于印刷页码的编号（从第 1 页起编的 Bates 号 ALX000001）也是页码位：写成带
+ *     数字格式的 PAGE 域（PAGE \# "000000"），两页的文件也认得出来。
  */
 
 import type { Line } from "./layout.js";
@@ -31,6 +33,8 @@ export interface Furniture {
   hidden: Line[][];
   /** 含页码位的行：只有这些行里的页码写成 PAGE 域 */
   pageNumberLines: Set<Line>;
+  /** 页码补零到固定位数的行（Bates 号）：位数，写成 PAGE \# "0…0" */
+  paddedPageLines: Map<Line, number>;
   pick: FurniturePick;
   notes: string[];
 }
@@ -49,14 +53,17 @@ const lineText = (l: Line) => {
 /** 看起来像页码的行（数字归一后）：带"页 / Page / p."，或只有数字与装饰符号 */
 const PAGEISH = /页|page|p\.|^[#\s\-–—_·•|/／()（）\[\]]*$/i;
 
-type Item = { l: Line; i: number; s: string; runs: Array<{ v: string; at: number }>; kind: Array<"P" | "C" | undefined> };
+type Item = { l: Line; i: number; s: string; runs: Array<{ v: string; at: number }>; kind: Array<"P" | "Z" | "C" | undefined> };
 
 /** 页码：某一位数字减去页序号在多数页上相同（与 buildHeaders 原来的判据一致） */
 function pageOffset(lines: Line[][], n: number): number | undefined {
   const off = new Map<number, Set<number>>();
   lines.forEach((ls, i) => {
-    for (const l of ls) for (const m of lineText(l).matchAll(/(?<![\d.,])\d{1,4}(?![\d.,]?\d)/g)) {
+    // 页码最多 4 位；补零到固定位数的（Bates 号 000001）只在从 1 起编、逐页加一时才可能是页码
+    // （ABC0001234 这样从别的号起编的 Bates 号不是本文的页码，见下面的逐页递增编号）
+    for (const l of ls) for (const m of lineText(l).matchAll(/(?<![\d.,])(\d{1,4}|0\d{4,9})(?![\d.,]?\d)/g)) {
       const k = Number(m[0]) - i;
+      if (m[0].length > 4 && k !== 1) continue;
       if (!off.has(k)) off.set(k, new Set());
       off.get(k)!.add(i);
     }
@@ -110,6 +117,13 @@ export function settleFurniture(floating: Line[][], mids: number[], pageNos: num
           return v === String(it.i + start) && v.length <= 4 && !/[.,]$/.test(it.s.slice(0, at)) && !/^[.,]\d/.test(it.s.slice(at + v.length));
         });
         if (new Set(hits.map((h) => h.i)).size >= Math.max(2, Math.ceil(0.4 * n))) for (const h of hits) h.kind[j] = "P";
+        // 补零的页码：同一位数、数值逐页等于印刷页码
+        const width = g[0].runs[j].v.length;
+        const padded = g.filter((it) => {
+          const { v } = it.runs[j];
+          return !it.kind[j] && v.length === width && width > String(it.i + start).length && v.startsWith("0") && Number(v) === it.i + start;
+        });
+        if (new Set(padded.map((h) => h.i)).size >= Math.max(2, Math.ceil(0.4 * n))) for (const h of padded) h.kind[j] = "Z";
       }
       // 其余逐页递增的编号：连续三页以上、每页加一；只认页码样式的行（另起的页码）和 Bates 号这样的长编号，
       // 条款号、附件号碰巧逐页递增也不算
@@ -131,7 +145,7 @@ export function settleFurniture(floating: Line[][], mids: number[], pageNos: num
   const key = (it: Item) => {
     let k = "", at = 0;
     it.runs.forEach((r, j) => {
-      k += it.s.slice(at, r.at) + (it.kind[j] === "P" ? "#P" : it.kind[j] === "C" ? "#C" : r.v);
+      k += it.s.slice(at, r.at) + (it.kind[j] === "P" ? "#P" : it.kind[j] === "Z" ? `#Z${r.v.length}` : it.kind[j] === "C" ? "#C" : r.v);
       at = r.at + r.v.length;
     });
     return (k + it.s.slice(at)).replace(/\s+/g, "");
@@ -213,6 +227,7 @@ export function settleFurniture(floating: Line[][], mids: number[], pageNos: num
   return {
     keep, hidden,
     pageNumberLines: new Set(items.filter((it) => it.kind.includes("P")).map((it) => it.l)),
+    paddedPageLines: new Map(items.flatMap((it) => it.runs.flatMap((r, j) => (it.kind[j] === "Z" ? [[it.l, r.v.length] as [Line, number]] : [])))),
     pick: { pageNumStart: start, defPage, evenRep: evenOdd ? evenRep : undefined, evenOdd, titlePg },
     notes,
   };

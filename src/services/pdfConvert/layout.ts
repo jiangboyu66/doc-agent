@@ -39,6 +39,8 @@ export interface Run {
   tracking?: number;
   /** 域（页眉页脚中的页码、总页数） */
   field?: "PAGE" | "NUMPAGES";
+  /** 域的数字格式：页码补零到的位数（PAGE \# "000000"） */
+  fieldDigits?: number;
   /** 原 PDF 的分页位置（写成 lastRenderedPageBreak，浏览器预览据此分页） */
   pageMark?: boolean;
   /** 行内图片（没有文字编码的公式 / 符号）：text 为占位符 U+FFFC */
@@ -182,7 +184,7 @@ function labelLead(l: Line, minGap = 0): boolean {
 }
 /** 行首是编号、后面隔着制表间距（不是普通的词间空格）：新的条款 / 列表项 */
 const labelHead = (l: Line): boolean => labelLead(l, 0.3 * l.size);
-const BULLET = /^(\[\d{1,4}\]|[•·▪■□◆◇○●➢➤►▸☐☑☒\-–—*]|\(?\d{1,3}[.)、]|\(?[a-zA-Z][.)]|\([ivxIVX]+\)|[ivxIVX]+[.)]|[一二三四五六七八九十]+[、.．])$/;
+const BULLET = /^(\[\d{1,4}\]|[•·▪■□◆◇○●◦‣⁃∙➢➤►▸☐☑☒\-–—*]|\(?\d{1,3}[.)、]|\(?[a-zA-Z][.)]|\([ivxIVX]+\)|[ivxIVX]+[.)]|[一二三四五六七八九十]+[、.．])$/;
 const CJK = /[⺀-鿿豈-﫿＀-￯　-〿]/;
 
 /**
@@ -742,10 +744,62 @@ function localEdges(lines: Line[], r: Region): number[] {
   });
 }
 
+/** 行内的上标片段（比本行字号小、基线抬高）：脚注引用号 */
+function superscripts(l: Line): string[] {
+  return l.spans.filter((s) => s.size <= 0.85 * l.size && s.baseline < l.baseline - 0.12 * l.size).map((s) => s.text.trim()).filter((t) => /^(\d{1,3}|[*†‡§])$/.test(t));
+}
+
+/** 注释行开头的编号（"12 See clause…"、"¹²…"、"* …"）；没有则为 "" */
+function noteLabel(l: Line): string {
+  const m = /^\s*(\d{1,3}|[*†‡§])(?=[\s.)]|[A-Za-z\u4e00-\u9fff])/.exec(l.spans[0]?.text ?? "");
+  return m ? m[1] : "";
+}
+
+/** 行的文字（片段之间按间距补空格） */
+const lineString = (l: Line) => l.spans.map((s) => s.text).join(" ").replace(/\s+/g, " ").trim();
+
+/**
+ * 西文行停在句子中间：至少占到行宽（到 edge）的 60%，以字母、数字或逗号结尾，含小写字母（不是全大写的标题）。
+ * 中文按字折行，行尾留白就是段落结束或手动换行，不在此列
+ */
+function openEnded(a: Line, edge: number): boolean {
+  const ta = lineString(a);
+  if (!ta || CJK.test(ta.slice(-1)) || a.x1 - a.x0 < 0.6 * (edge - a.x0)) return false;
+  return /[A-Za-z0-9,]$/.test(ta) && /[a-z]/.test(ta);
+}
+
+/** 上一行 a 没写完一句话、下一行 b 接着写：b 以字母、数字、左括号或引号开头，a 的末尾与 b 的开头粗体一致 */
+function continuesSentence(a: Line, b: Line, edge: number): boolean {
+  const tb = lineString(b);
+  if (!tb || CJK.test(tb[0]) || !/^[A-Za-z0-9("'\u2018\u201c]/.test(tb) || !openEnded(a, edge)) return false;
+  return a.spans[a.spans.length - 1].bold === b.spans[0].bold;
+}
+
+/**
+ * 判断自动折行用的右边界：左对齐（右边参差）的正文没有 3 行以上落在同一右边界，localEdges 退回区域右边界；
+ * 区域常被页眉页脚、页码或更宽的表格撑得比实际折行处更靠右，句末恰好在行尾的那一行会被当成段落结束。
+ * 附近有 ≥3 行同起点、同字号，最长的一行离区域右边界不远（≤3 个字号或版心宽的 8%）时，以最长那一行为准
+ */
+function wrapEdges(lines: Line[], r: Region, edges: number[]): number[] {
+  return lines.map((l, i) => {
+    if (edges[i] < r.x1) return edges[i];
+    const near = lines.slice(Math.max(0, i - 4), i + 5).filter((o) => Math.abs(o.x0 - l.x0) <= 20 && Math.abs(o.size - l.size) <= 0.15 * l.size);
+    if (near.length < 3) return edges[i];
+    const longest = Math.max(...near.map((o) => o.x1));
+    const slack = r.x1 - longest;
+    return slack > 1.5 && slack <= Math.max(3 * l.size, 0.08 * (r.x1 - r.x0)) ? longest : edges[i];
+  });
+}
+
 function groupParagraphs(lines: Line[], r: Region, ctx?: Ctx): Array<{ lines: Line[]; edge: number }> {
   const paras: Line[][] = [];
   const paraEdge: number[] = [];
   const edges = localEdges(lines, r);
+  const wraps = wrapEdges(lines, r, edges);
+  // 这组行里占多数的字号（按字数）：只有正文字号的行才按"句子没写完"接到上一行（标题、题注另行判断）
+  const bySize = new Map<number, number>();
+  for (const l of lines) bySize.set(pitchKey(l.size), (bySize.get(pitchKey(l.size)) ?? 0) + lineChars(l));
+  const bodySize = [...bySize.entries()].sort((x, y) => y[1] - x[1])[0]?.[0] ?? 0;
   lines.forEach((l, idx) => {
     const P = paras[paras.length - 1];
     if (P) {
@@ -763,7 +817,7 @@ function groupParagraphs(lines: Line[], r: Region, ctx?: Ctx): Array<{ lines: Li
       // 新的条款 / 列表项（"1.2⇥…""(b)⇥…"）另起一段
       const startsBullet = (BULLET.test(firstText) && l.spans.length > 1) || labelHead(l);
       // 自动折行的判据：下一行的第一个词放不进上一行剩余的空间
-      const edge = Math.max(edges[idx - 1] ?? r.x1, a.x1);
+      const edge = Math.max(wraps[idx - 1] ?? r.x1, a.x1);
       const wrapped = a.x1 + firstWordWidth(l) + 0.25 * a.size > edge - 0.5;
       const bodyLeft = P.length >= 2 ? P[1].x0 : null;
       // 首行以编号开头（悬挂缩进）：续行与编号后的正文对齐
@@ -777,7 +831,13 @@ function groupParagraphs(lines: Line[], r: Region, ctx?: Ctx): Array<{ lines: Li
       // 折行后恰好以"[30]""(b)"开头的续行（高亮的占位符、行文中的列举自成一个文字片段）：后面只隔一个普通空格、
       // 行首与段落正文对齐，是上一行的延续，不是新的列表项（列表项的编号后是制表间距，或者编号伸出正文左边界）
       const inlineToken = startsBullet && l.spans.length > 1 && l.spans[1].x0 - l.spans[0].x1 <= 0.3 * l.size && (P.length >= 2 || aIsBullet) && wrapped && leftOk;
-      if (sizeOk && gapOk && (!startsBullet || inlineToken) && !hasBigGap(l) && ((wrapped && leftOk && !hasBigGap(a, true)) || centered)) {
+      // 左对齐（右边参差）的西文正文：区域右边界常比实际折行处更靠右（页眉页脚、页码伸到页边，文本框留有内边距），
+      // 下一行的短词（and、of、the）看起来放得进上一行，按上面的判据会在句子中间断段。上一行占了大半行宽、
+      // 停在词或逗号上（没有句末标点）、下一行接着是字母或数字、字体粗细不变，就是同一句话的折行
+      // （标题等非正文字号的行、两行都居中的行另按原来的判据，不在此列）
+      const runOn = !wrapped && leftOk && !hasBigGap(a, true) && pitchKey(a.size) === bodySize && !(isCentered(a, r) && isCentered(l, r)) &&
+        continuesSentence(a, l, edge);
+      if (sizeOk && gapOk && (!startsBullet || inlineToken) && !hasBigGap(l) && (((wrapped || runOn) && leftOk && !hasBigGap(a, true)) || centered)) {
         P.push(l);
         paraEdge[paraEdge.length - 1] = Math.max(paraEdge[paraEdge.length - 1], edges[idx]);
         return;
@@ -1146,7 +1206,9 @@ function buildPara(lines: Line[], r: Region, blockEdge: number, ctx: Ctx): Para 
   const lastLine = lines[lines.length - 1];
   return {
     // 末行排满到右边界：以文字块自己的右边缘为准（版心可能被页码等撑宽，比正文的右边缘更靠右）
-    lastFull: Math.min(r.x1, blockEdge > r.x0 ? blockEdge : r.x1) - lastLine.x1 <= Math.max(3, 0.04 * W),
+    // 左对齐的西文段落末行停在句子中间（没有句末标点、占了大半行宽）：下一页 / 下一栏接着写，也算排满
+    lastFull: Math.min(r.x1, blockEdge > r.x0 ? blockEdge : r.x1) - lastLine.x1 <= Math.max(3, 0.04 * W) ||
+      (align === "left" && openEnded(lastLine, Math.min(r.x1, blockEdge > r.x0 ? blockEdge : r.x1))),
     kind: "p", runs: runs.filter((_, k) => kept[k]), align, indLeft, indRight, firstLine, ...(labelTab && tabs.length === 1 ? { labelTab: true } : {}),
     spaceBefore: 0, lineHeight, tabs: tabs.sort((a, b) => a.pos - b.pos), size,
     lineFits: lineFits.map((f) => ({ ...f, start: remap(f.start), end: remap(f.end) })),
@@ -2025,8 +2087,11 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
       const ls = lines.filter((l) => l.x1 <= gutter.g0 + 1 && l.x1 - l.x0 > 0.5 * (gutter.g0 - left)).map((l) => l.x0);
       return { l: ls.length >= 4 ? Math.max(left, edgeOf(ls, "min")) : left, r: rs.length >= 4 ? Math.min(right, edgeOf(rs, "max")) : right };
     })();
+    // 比第一页窄的页（横向文件里夹着的纵向页、按文字方向读的 /Rotate 页）：右边界按同样的右边距从本页右边缘量起，
+    // 否则整页的行都比"版心"短得多，每行都被当成段落结束
+    const pageRight = pg.width < pageW - 1 ? Math.max(left + 0.3 * (pg.width - left), Math.min(right, pg.width - (pageW - right))) : right;
     const regionOf = (side: "full" | "L" | "R"): Region =>
-      side === "full" || !gutter ? { x0: left, x1: right } : side === "L" ? { x0: colEdge.l, x1: gutter.g0 } : { x0: gutter.g1, x1: colEdge.r };
+      side === "full" || !gutter ? { x0: left, x1: pageRight } : side === "L" ? { x0: colEdge.l, x1: gutter.g0 } : { x0: gutter.g1, x1: colEdge.r };
     for (const t of tables) items.push({ kind: "table", t, side: sideOf(t.x0, t.x1), top: t.y0 });
 
     // 旁边有文字的图片（流式模式）：挂在段落上、文字环绕；旁边那几行的缩进由环绕产生，行本身改为从栏边界起排
@@ -2173,6 +2238,12 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
         if (prev.kind === "rule") start = k - 1;
         else if (!(prev.kind === "line" && first.line.top - prev.line.bottom > 0.8 * first.line.size)) continue;
         const moved = own.slice(start);
+        // 正文里有上标引用号（"…仲裁。¹"）对应的脚注：与后面各页的脚注一样留在本页正文末尾（小字号段落），
+        // 不移进首页页脚——否则只有第一页的脚注进页脚、其余页的在正文里，同一份文件两种放法。
+        // 首页页脚只收论文首页那种没有引用号的注释（作者单位、收稿日期）
+        const refs = new Set(own.slice(0, k).flatMap((it) => (it.kind === "line" ? superscripts(it.line) : [])));
+        const labelled = moved.filter((it) => it.kind === "line" && refs.has(noteLabel(it.line)));
+        if (refs.size && labelled.length && labelled.length >= 0.5 * moved.filter((it) => it.kind === "line" && noteLabel(it.line)).length) continue;
         for (const it of moved) items.splice(items.indexOf(it), 1);
         const reg = regionOf(side);
         const out = layoutItems(moved, reg, moved[0].top - 0.01, [], ctx);
@@ -2226,7 +2297,7 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
     for (const band of bands) {
       if (!band.cols) {
         cursor += endSection({ cols: 1, colWidths: [right - left], colGap: 0 });
-        const out = layoutItems(band.items, body, cursor, pg.fills, ctx);
+        const out = layoutItems(band.items, pageRight === right ? body : { ...body, x1: pageRight }, cursor, pg.fills, ctx);
         if (flow) markRegion(out.blocks);
         blocks.push(...out.blocks);
         cursor = out.cursor;
@@ -2370,7 +2441,7 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
   // 判错的行若没有写进去，缺的字会如实计为未转换
   if (hfOut) {
     const shown = (ps: Para[] | undefined, i: number) => (ps ?? []).map((p) => p.runs.map((r) =>
-      r.field === "PAGE" ? String(i + hfOut.start) : r.field === "NUMPAGES" ? String(pre.length) : r.tab ? "" : r.text).join("")).join("\n");
+      r.field === "PAGE" ? String(i + hfOut.start).padStart(r.fieldDigits ?? 0, "0") : r.field === "NUMPAGES" ? String(pre.length) : r.tab ? "" : r.text).join("")).join("\n");
     pre.forEach((_, i) => {
       const part = i === 0 && hfOut.headers.first ? "first" : hfOut.headers.even && (i + hfOut.start) % 2 === 0 ? "even" : "default";
       rasterText.push(shown(hfOut.headers[part], i), shown(hfOut.footers[part], i));
@@ -2489,8 +2560,8 @@ function buildHeaders(hf: Array<{ head: Line[]; foot: Line[]; imgs: ImageBox[]; 
   const totalPages = pageNumStart === 1 && n >= 2 &&
     hf.filter((x) => [...x.head, ...x.foot].some((l) => TOTAL.test(lineText(l).replace(/\s+/g, " ")))).length >= Math.max(2, Math.ceil(n * 0.5));
 
-  const markPage = (p: Para, num: number, field: "PAGE" | "NUMPAGES" = "PAGE") => {
-    const s = String(num);
+  const markPage = (p: Para, num: number, field: "PAGE" | "NUMPAGES" = "PAGE", digits = 0) => {
+    const s = String(num).padStart(digits, "0");
     const re = new RegExp(`(?<!\\d)${s}(?!\\d)`, "g");
     let idx = field === "PAGE" ? p.runs.findIndex((r) => !r.tab && !r.field && r.text.trim() === s) : -1;
     let at = -1;
@@ -2506,7 +2577,12 @@ function buildHeaders(hf: Array<{ head: Line[]; foot: Line[]; imgs: ImageBox[]; 
     const r = p.runs[idx];
     const parts: Run[] = [];
     if (at > 0) parts.push({ ...r, text: r.text.slice(0, at) });
-    parts.push({ ...r, text: s, field });
+    // 补零的页码：各页页码位数相同时，前导零写成文字、后面接普通 PAGE 域（LibreOffice 等不支持数字格式开关的
+    // 程序也显示正确）；位数会变（第 9 页到第 10 页）时才用 PAGE \# "000000"
+    const lead = digits > String(num).length ? s.slice(0, digits - String(num).length) : "";
+    const sameWidth = String(printed(0)).length === String(printed(n - 1)).length;
+    if (lead && sameWidth) parts.push({ ...r, text: lead }, { ...r, text: String(num), field });
+    else parts.push({ ...r, text: s, field, ...(lead ? { fieldDigits: digits } : {}) });
     if (at + s.length < r.text.length) parts.push({ ...r, text: r.text.slice(at + s.length) });
     p.runs.splice(idx, 1, ...parts);
     return true;
@@ -2538,6 +2614,8 @@ function buildHeaders(hf: Array<{ head: Line[]; foot: Line[]; imgs: ImageBox[]; 
       if (totalPages && TOTAL.test(p.runs.map((r) => r.text).join("").replace(/\s+/g, " "))) markPage(p, n, "NUMPAGES");
       // 页码域只放在真正的页码位上（furniture.ts 逐位确认过的行）；页眉里恰好等于该页页码的版本号、条款号保持原文
       if (pageNumStart !== undefined && (!furniture || furniture.pageNumberLines.has(l))) markPage(p, printed(i));
+      const digits = furniture?.paddedPageLines.get(l);
+      if (pageNumStart !== undefined && digits) markPage(p, printed(i), "PAGE", digits);
       delete p.lineFits;
       out.push(p);
     }
