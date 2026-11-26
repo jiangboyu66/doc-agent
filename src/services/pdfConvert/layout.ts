@@ -192,7 +192,7 @@ function labelLead(l: Line, minGap = 0): boolean {
 }
 /** 行首是编号、后面隔着制表间距（不是普通的词间空格）：新的条款 / 列表项 */
 const labelHead = (l: Line): boolean => labelLead(l, 0.3 * l.size);
-const BULLET = /^(\[\d{1,4}\]|[•·▪■□◆◇○●◦‣⁃∙➢➤►▸☐☑☒\-–—*]|\(?\d{1,3}[.)、]|\(?[a-zA-Z][.)]|\([ivxIVX]+\)|[ivxIVX]+[.)]|[一二三四五六七八九十]+[、.．])$/;
+const BULLET = /^(\[ ?\d(?: ?\d){0,3} ?\]|[•·▪■□◆◇○●◦‣⁃∙➢➤►▸☐☑☒\-–—*]|\(?\d{1,3}[.)、]|\(?[a-zA-Z][.)]|\([ivxIVX]+\)|[ivxIVX]+[.)]|[一二三四五六七八九十]+[、.．])$/;
 const CJK = /[⺀-鿿豈-﫿＀-￯　-〿]/;
 
 /**
@@ -850,6 +850,12 @@ function firstWordWidth(l: Line): number {
  * 每一行所在文字块的右边界：附近若有 ≥3 行落在同一右边界（两端对齐的正文、缩进的摘要），用这条边界；
  * 否则用区域右边界。用于判断"上一行是自动折行还是手动换行/段落结束"。
  */
+/**
+ * 行的正文从哪里起：编号伸在左边距里的行（专利的"[0006]"、条款号），按编号后正文的起点算，
+ * 才能和它下面从正文左边界起排的续行比较
+ */
+const textStart = (l: Line) => (labelLead(l) ? Math.min(l.spans[1].x0, l.x0 + 0.5 * (l.x1 - l.x0)) : l.x0);
+
 function localEdges(lines: Line[], r: Region): number[] {
   return lines.map((l, i) => {
     const near = lines.slice(Math.max(0, i - 4), i + 5).filter((o) => Math.abs(o.x0 - l.x0) <= 20 && Math.abs(o.size - l.size) <= 0.15 * l.size);
@@ -897,7 +903,7 @@ function continuesSentence(a: Line, b: Line, edge: number): boolean {
 function wrapEdges(lines: Line[], r: Region, edges: number[]): number[] {
   return lines.map((l, i) => {
     if (edges[i] < r.x1) return edges[i];
-    const near = lines.slice(Math.max(0, i - 4), i + 5).filter((o) => Math.abs(o.x0 - l.x0) <= 20 && Math.abs(o.size - l.size) <= 0.15 * l.size);
+    const near = lines.slice(Math.max(0, i - 4), i + 5).filter((o) => Math.abs(textStart(o) - textStart(l)) <= 20 && Math.abs(o.size - l.size) <= 0.15 * l.size);
     if (near.length < 3) return edges[i];
     const longest = Math.max(...near.map((o) => o.x1));
     const slack = r.x1 - longest;
@@ -940,7 +946,10 @@ function groupParagraphs(lines: Line[], r: Region, ctx?: Ctx): Array<{ lines: Li
         ? Math.abs(l.x0 - bodyLeft) <= 3
         : l.x0 <= P[0].x0 + 3 || (aIsBullet && Math.abs(l.x0 - P[0].spans[1].x0) <= 3) ||
           // 编号比悬挂缩进还宽（"10.12""72.152"）：首行正文被推到下一个制表位，续行仍从悬挂缩进处起排、落在编号下方
-          (aIsBullet && l.x0 > P[0].x0 + 3 && l.x0 < P[0].spans[1].x0 - 3 && P[0].spans[0].x1 > l.x0 - 1);
+          (aIsBullet && l.x0 > P[0].x0 + 3 && l.x0 < P[0].spans[1].x0 - 3 && P[0].spans[0].x1 > l.x0 - 1) ||
+          // 编号伸在左边距里、首行正文空一两个字起排（日文专利"[0006]本技術…"，2026-11-26 WO2017038541A1）：续行从正文
+          // 左边界起排，落在编号和首行正文之间。原来每段的首行单独成段，余下的行另成一段
+          (aIsBullet && l.x0 > P[0].spans[0].x1 + 3 && l.x0 < P[0].spans[1].x0 - 3 && P[0].spans[1].x0 - l.x0 <= 2.2 * P[0].size);
       const centered = isCentered(a, r) && isCentered(l, r) && !hasBigGap(a) && !hasBigGap(l) && a.x1 + firstWordWidth(l) + 0.25 * a.size > r.x1 - (a.x0 - r.x0);
       // 折行后恰好以"[30]""(b)"开头的续行（高亮的占位符、行文中的列举自成一个文字片段）：后面只隔一个普通空格、
       // 行首与段落正文对齐，是上一行的延续，不是新的列表项（列表项的编号后是制表间距，或者编号伸出正文左边界）
@@ -1149,7 +1158,11 @@ function buildPara(lines: Line[], r: Region, blockEdge: number, ctx: Ctx): Para 
   const cMean = centers.reduce((a, b) => a + b, 0) / Math.max(1, centers.length);
   const centeredBlock = lines.length >= 2 && centers.every((c) => Math.abs(c - cMean) <= 2) &&
     Math.max(...lines.map((l) => l.x0)) - Math.min(...lines.map((l) => l.x0)) > 3;
-  if ((lines.every((l) => isCentered(l, r)) || centeredBlock) && !lines.some((l) => hasBigGap(l))) align = "center";
+  // 各行起点相同的多行文字是一栏正文，不是居中：版心常被首页著录项目、表格撑得比正文宽，正文满行恰好左右留白相近时
+  // 会被当成居中（2026-11-26 WO2017038541A1：全书 57 段正文居中，译文换行后整段居中排）。单独一行满到所在文字块
+  // 右边界（附近 3 行以上同起点、同右界）的，也是正文
+  const columnText = lines.length >= 2 ? leftSpread <= 3 : blockEdge < r.x1 - 1 && Math.abs(first.x1 - blockEdge) <= 1.5 && first.x1 - first.x0 > 0.6 * W;
+  if (((lines.every((l) => isCentered(l, r)) && !columnText) || centeredBlock) && !lines.some((l) => hasBigGap(l))) align = "center";
   else if (lines.length >= 2 && isJustified(lines, paraRight)) align = "both";
   else if (lines.every((l) => isRight(l, r)) && !lines.some((l) => hasBigGap(l)) && (lines.length === 1 || leftSpread > 3)) align = "right";
 

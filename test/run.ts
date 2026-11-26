@@ -1382,6 +1382,24 @@ await test("中文合同（律所草稿）：1.5 倍行距的条款合成一段�
     }
   }
 });
+await test("日文专利说明书：编号在左边距、首行空一字的段落合成一段；满行左右留白与版心相近时不当成居中", async () => {
+  // 2026-11-26 WO2017038541A1：每段首行单独成段（全书 169 段），余下的行居中（57 段），译文换行后整段居中
+  const { pdfToDocx } = await import("../src/services/pdfConvert/index.js");
+  const pdf = await fixture("patent-para.pdf");
+  for (const mode of ["exact", "flow"] as const) {
+    const { data, report } = await pdfToDocx(pdf, { mode });
+    eq(report.textCoverage, 1, `${mode}：文字完整性，缺失：${report.missing}`);
+    const xml = new ZipPackage(data).readText("word/document.xml").replace(/<w:txbxContent>[\s\S]*?<\/w:txbxContent>/g, "");
+    const paras = (xml.match(/<w:p [^>]*>[\s\S]*?<\/w:p>/g) ?? []).map((p) => ({ xml: p, text: p.replace(/<[^>]+>/g, "").replace(/\s/g, "") }));
+    for (const [label, end] of [["[0006]", "映像処理装置である。"], ["[0007]", "出力画像フレームを出力する。"], ["[0008]", "効果であってもよい。"]]) {
+      const p = paras.find((x) => x.text.startsWith(label));
+      assert(p && p.text.endsWith(end), `${mode}：${label} 应为一整段：${p?.text.slice(0, 30)}`);
+      assert(!/<w:jc w:val="center"\/>/.test(p!.xml), `${mode}：${label} 不应居中`);
+    }
+    assert(!paras.some((x) => x.text.length > 40 && /<w:jc w:val="center"\/>/.test(x.xml)), `${mode}：正文段落不应居中`);
+  }
+});
+
 
 await test("页眉页脚只收 Word 能逐页再现的行：页首的条款标题、附件标题留在正文；页眉里的版本号不写成页码域；Bates 号不写成固定号码", async () => {
   const { pdfToDocx } = await import("../src/services/pdfConvert/index.js");
