@@ -137,6 +137,10 @@ export interface SectionProps {
   cols: number; colWidths: number[]; colGap: number;
   /** 本节从第一页开始（流式模式）：首页使用"首页"页眉页脚 */
   titlePg?: boolean;
+  /** 本节的纸张大小与页边距（原 PDF 中页面尺寸 / 方向不同的那几页）；不写时用文档的 */
+  page?: { w: number; h: number; margins: DocModel["margins"] };
+  /** 本节从新的一页开始（纸张大小 / 方向变了的地方）；不写时是连续分节 */
+  newPage?: boolean;
 }
 
 /** 页眉 / 页脚（流式模式）：首页、奇数页（默认）、偶数页 */
@@ -1095,6 +1099,10 @@ interface Ctx {
   pitch?: Map<number, number>;
   /** 逐行一致模式：本页页首锚点段落上的文本框（排不进文字流原位置的行放在这里） */
   boxes?: NonNullable<Para["textBoxes"]>;
+  /** 逐行一致模式：本页页首锚点段落上按页面坐标放的图片（排不进文字流原位置的图放在这里） */
+  pins?: ImageBox[];
+  /** 逐行一致模式：文字流能排到的最低处（页高减下边距）；伸到这下面的图排进文字流会被挤到下一页 */
+  flowBottom?: number;
 }
 
 const pitchKey = (size: number) => Math.round(size * 2) / 2;
@@ -1918,8 +1926,69 @@ function checkBoxes(pg: PageModel): Seg[] {
   return frames;
 }
 
-/** unread：没有文字层、看得出是成行文字的页（页序号，从 0 起）；它们的整页图在 Word 里标上 pdf2word-page N */
-export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; raster?: boolean; unread?: ReadonlySet<number> } = {}): DocModel {
+type BuildOpts = { mode?: LayoutMode; raster?: boolean; unread?: ReadonlySet<number> };
+
+/** 两页的纸张大小 / 方向是否算作相同（扫描件、拼合的文件各页常差零点几磅到几磅，不必分节） */
+const samePaper = (a: PageModel, b: PageModel) => Math.abs(a.width - b.width) <= 18 && Math.abs(a.height - b.height) <= 18;
+
+/**
+ * unread：没有文字层、看得出是成行文字的页（页序号，从 0 起）；它们的整页图在 Word 里标上 pdf2word-page N。
+ *
+ * 原 PDF 里纸张大小 / 方向不一样的页（Word 文档的横向附录、Excel 导出的纵向说明页、拼合的不同尺寸页面）：
+ * 连续同尺寸的几页为一组，各组按自己的页面排版（版心、页边距按本组的页统计），组与组之间分节，
+ * 新的一节从新的一页开始、写自己的纸张大小和方向。以前整篇都用第一页的尺寸，横向页上的宽表格最右一列被裁掉
+ */
+export function buildDocModel(pages0: PageModel[], opts: BuildOpts = {}): DocModel {
+  const groups: PageModel[][] = [];
+  for (const p of pages0) {
+    const g = groups[groups.length - 1];
+    if (g && samePaper(g[0], p)) g.push(p);
+    else groups.push([p]);
+  }
+  if (groups.length <= 1) return buildDocModelGroup(pages0, opts);
+  const models = groups.map((g) => buildDocModelGroup(g, opts));
+  const blocks: Block[] = [];
+  models.forEach((m, gi) => {
+    const page = { w: m.pageW, h: m.pageH, margins: m.margins };
+    const sects = [...m.blocks.flatMap((b) => (b.kind === "p" && b.sectionEnd ? [b.sectionEnd] : [])), m.finalSection];
+    for (const s of sects) {
+      s.page = page;
+      // 首页不同的页眉页脚只用于整篇的第一页
+      if (gi > 0) s.titlePg = false;
+    }
+    if (gi > 0) sects[0].newPage = true;
+    blocks.push(...m.blocks);
+    if (gi < models.length - 1) blocks.push(tinyPara({ sectionEnd: m.finalSection }));
+  });
+  const first = models[0], last = models[models.length - 1];
+  // 正文字体 / 字号（样式表的默认值）：取页数最多的一组
+  const main = models.reduce((a, b) => (b.stats.pages > a.stats.pages ? b : a));
+  const sum = (k: "pages" | "paragraphs" | "tables" | "images" | "vectorShapes" | "rotatedText" | "columnPages" | "figures" | "equations" | "inlineMath" | "rotatedSlanted") =>
+    models.reduce((n, m) => n + (m.stats[k] ?? 0), 0);
+  const scans = models.map((m) => m.stats.scan).filter((x): x is NonNullable<typeof x> => !!x);
+  const scan = scans.length ? scans.reduce((a, b) => ({
+    textPages: [...a.textPages, ...b.textPages], formPages: [...a.formPages, ...b.formPages], blocks: a.blocks + b.blocks, inline: a.inline + b.inline,
+    furniture: a.furniture + b.furniture, stray: a.stray + b.stray, pageNumbers: a.pageNumbers + b.pageNumbers, header: a.header + b.header,
+  })) : undefined;
+  const notes = [...new Set(models.flatMap((m) => m.notes ?? []))];
+  return {
+    pageW: first.pageW, pageH: first.pageH, margins: first.margins,
+    blocks, finalSection: last.finalSection,
+    bodyFont: main.bodyFont, bodySize: main.bodySize,
+    stats: {
+      pages: sum("pages"), paragraphs: sum("paragraphs"), tables: sum("tables"), images: sum("images"), vectorShapes: sum("vectorShapes"),
+      rotatedText: sum("rotatedText"), rotatedSlanted: sum("rotatedSlanted"), columnPages: sum("columnPages"), figures: sum("figures"),
+      equations: sum("equations"), inlineMath: sum("inlineMath"), ...(scan ? { scan } : {}),
+    },
+    rasterText: models.map((m) => m.rasterText).filter(Boolean).join("\n"),
+    mode: first.mode,
+    // 可编辑排版的页眉页脚：各节共用第一组的
+    ...(first.headers ? { headers: first.headers, footers: first.footers, pageNumStart: first.pageNumStart, headerDist: first.headerDist, footerDist: first.footerDist } : {}),
+    ...(notes.length ? { notes } : {}),
+  };
+}
+
+function buildDocModelGroup(pages0: PageModel[], opts: BuildOpts = {}): DocModel {
   // 识别渲染区域时会从页面中移除元素：在副本上进行，原始提取结果保持不变（用于完整性校验、失败时回退）
   // 识别时会从页面中移除元素、插入行内公式：总在副本上进行，失败回退时原始结果不受影响
   // 浅拷贝：页面上的数组会被换掉（成图区域里的文字移走）；旋转文字会被标上 raster，逐个复制，渲染失败重建时不受上一次影响
@@ -2077,7 +2146,7 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
   // 版心：全部页面的内容边界
   const xs0: number[] = [], xs1: number[] = [], tops: number[] = [], bottoms: number[] = [];
   const tableX0: number[] = [], tableX1: number[] = [];
-  for (const { pg, tables, free } of pre) {
+  for (const { pg, tables, free, figures } of pre) {
     // 以"行"为单位统计左右边界（片段级统计会被行内的词间断开干扰）
     const pls = buildLines(free);
     for (const l of pls) { xs0.push(l.x0); xs1.push(l.x1); }
@@ -2093,15 +2162,23 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
         if (lx.length >= 4 && rx.length >= 4) { tableX0.push(edgeOf(lx, "min")); tableX1.push(edgeOf(rx, "max")); }
       }
     }
-    const ys = [...free.map((s) => s.top), ...tables.map((t) => t.y0), ...pg.images.map((i) => i.y0)];
-    const ye = [...free.map((s) => s.bottom), ...tables.map((t) => t.y1)];
+    // 渲染成图的区域（矢量图、带标注的图片）也排在文字流里：版心要把它们包进来
+    const ys = [...free.map((s) => s.top), ...tables.map((t) => t.y0), ...pg.images.map((i) => i.y0), ...figures.map((f) => f.y0)];
+    const ye = [...free.map((s) => s.bottom), ...tables.map((t) => t.y1), ...figures.map((f) => f.y1)];
     if (ys.length) tops.push(Math.min(...ys));
     if (ye.length) bottoms.push(Math.max(...ye));
   }
-  const left = Math.max(9, Math.min(pageW * 0.4, xs0.length ? Math.min(edgeOf(xs0, "min"), ...tableX0) : 72));
-  const maxX1 = xs1.length ? Math.max(edgeOf(xs1, "max"), ...tableX1) : pageW - 72;
+  // 没有正文行的（整页是表格、渲染成图的区域，如只有表单控件的页）：版心按表格、图的边界，
+  // 而不是一律留 72pt——图排在版心外放不下，并排的两张图被挤成上下两行，一页变两页
+  const figX0 = pre.flatMap((x) => x.figures.map((f) => f.x0)), figX1 = pre.flatMap((x) => x.figures.map((f) => f.x1));
+  const lefts = xs0.length ? [edgeOf(xs0, "min"), ...tableX0] : [...tableX0, ...figX0];
+  const rights = xs1.length ? [edgeOf(xs1, "max"), ...tableX1] : [...tableX1, ...figX1];
+  const left = Math.max(9, Math.min(pageW * 0.4, lefts.length ? Math.min(...lefts) : 72));
+  const maxX1 = rights.length ? Math.max(...rights) : pageW - 72;
   const right = Math.min(pageW - 9, Math.max(maxX1, pageW - left));
-  const marginTop = Math.max(9, Math.min(...(tops.length ? tops : [72])) - 4);
+  // 上边距不超过页高的三成：只有一两页、内容全在页面下半部的（封面、页面上只剩页角标记）也留出排版的地方，
+  // 内容的位置由段前距还原，上边距小一些不影响
+  const marginTop = Math.max(9, Math.min(0.3 * pageH, Math.min(...(tops.length ? tops : [72])) - 4));
   // 底边距留得尽量小：每页都以分页开始，多出的空间不会被使用，但能吸收排版误差，避免页脚被挤到下一页
   const marginBottom = Math.max(2, Math.min(14, pageH - Math.max(...(bottoms.length ? bottoms : [pageH - 72])) - 4));
   const body: Region = { x0: left, x1: right, overhang: Math.max(0, Math.min(36, pageW - right - 4)) };
@@ -2394,6 +2471,8 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
       for (const l of floating[pi]) anchor.textBoxes!.push(...lineBoxes(l, ctx));
     }
     ctx.boxes = flow ? undefined : anchor.textBoxes;
+    ctx.pins = flow ? undefined : anchor.images;
+    ctx.flowBottom = flow ? undefined : pageH - marginBottom;
     // 旋转文字（随图片保存的除外）：落在表格里的交给表格（竖排表头写成竖排单元格），
     // 其余（页边竖排说明、斜放的水印 / 印章、竖排的标签）按原角度放进挂在锚点段落上的文本框，两种模式都保留
     const flowRot: Array<{ l: RotLine; box: NonNullable<Para["textBoxes"]>[number] }> = [];
@@ -3100,6 +3179,14 @@ function layoutItems(items: Array<PageItem & { top: number }>, r: Region, cursor
     } else if (it.kind === "float") waiting.push(it.img);
     else if (it.kind === "image") {
       flush();
+      // 逐页保留：前面的内容已经排到这张图原位置下面一大截（同一高度错开半截的两张图、压在表格上的图），
+      // 排进文字流只能往下挤，后面的内容跟着下移、溢到下一页：改按页面坐标放在原位置。
+      // 只差几磅的（行间公式的外框带留白、和上一行的字底重叠一点）照常排进文字流，随文字移动
+      // 伸到版心下边以外的（页角的标记）同样按页面坐标放
+      // 横向超出版心（含右侧可伸出的部分）的图排进一行放不下、会折到下一行，同样按页面坐标放
+      const iy0 = Math.min(...it.imgs.map((i) => i.y0)), iy1 = Math.max(...it.imgs.map((i) => i.y1));
+      const ix0 = Math.min(...it.imgs.map((i) => i.x0)), ix1 = Math.max(...it.imgs.map((i) => i.x1)), oh = r.overhang ?? 0;
+      if (ctx.pins && (iy0 < cursor - Math.max(6, 0.3 * (iy1 - iy0)) || iy1 > (ctx.flowBottom ?? Infinity) || ix0 < r.x0 - oh - 1 || ix1 > r.x1 + oh + 1)) { ctx.pins.push(...it.imgs); continue; }
       const p = imagePara(it.imgs, r, cursor);
       blocks.push(p);
       cursor = Math.max(cursor, Math.min(...it.imgs.map((i) => i.y0))) + p.lineHeight;

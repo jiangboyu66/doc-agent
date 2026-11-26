@@ -214,6 +214,8 @@ class Writer {
 
   private sectPr(s: SectionProps, continuous: boolean): string {
     const m = this.m;
+    // 纸张大小 / 方向不同的节（原 PDF 的横向页等）写自己的尺寸和页边距
+    const pw = s.page?.w ?? m.pageW, ph = s.page?.h ?? m.pageH, mg = s.page?.margins ?? m.margins;
     // 每一节都显式引用页眉页脚（与继承等效；浏览器预览只认本节的引用）；起始页码只在第一节；
     // 从第一页开始的节标记"首页不同"
     const first = this.sectCount++ === 0;
@@ -226,8 +228,8 @@ class Writer {
       : '<w:cols w:space="425"/>';
     return (
       `<w:sectPr>${refs}${continuous ? '<w:type w:val="continuous"/>' : ""}` +
-      `<w:pgSz w:w="${tw(m.pageW)}" w:h="${tw(m.pageH)}"${m.pageW > m.pageH ? ' w:orient="landscape"' : ""}/>` +
-      `<w:pgMar w:top="${tw(m.margins.top)}" w:right="${tw(m.margins.right)}" w:bottom="${tw(m.margins.bottom)}" w:left="${tw(m.margins.left)}" w:header="${tw(m.headerDist ?? 0)}" w:footer="${tw(m.footerDist ?? 0)}" w:gutter="0"/>` +
+      `<w:pgSz w:w="${tw(pw)}" w:h="${tw(ph)}"${pw > ph ? ' w:orient="landscape"' : ""}/>` +
+      `<w:pgMar w:top="${tw(mg.top)}" w:right="${tw(mg.right)}" w:bottom="${tw(mg.bottom)}" w:left="${tw(mg.left)}" w:header="${tw(m.headerDist ?? 0)}" w:footer="${tw(m.footerDist ?? 0)}" w:gutter="0"/>` +
       `${pgNum}${cols}${titlePg}</w:sectPr>`
     );
   }
@@ -258,7 +260,7 @@ class Writer {
     if (ind.length) ppr.push(`<w:ind ${ind.join(" ")}/>`);
     if (p.align !== "left") ppr.push(`<w:jc w:val="${p.align}"/>`);
     if (p.tiny) ppr.push('<w:rPr><w:sz w:val="2"/><w:szCs w:val="2"/></w:rPr>');
-    if (p.sectionEnd) ppr.push(this.sectPr(p.sectionEnd, true));
+    if (p.sectionEnd) ppr.push(this.sectPr(p.sectionEnd, !p.sectionEnd.newPage));
 
     const body: string[] = [];
     if (p.columnBreakBefore) body.push('<w:r><w:br w:type="column"/></w:r>');
@@ -316,7 +318,7 @@ class Writer {
     });
     // 表格不能作为 body 的最后一个元素之前的节尾；Word 要求 body 以段落或 sectPr 结束
     if (this.m.blocks[this.m.blocks.length - 1]?.kind === "table") out.push(this.para({ kind: "p", runs: [], align: "left", indLeft: 0, indRight: 0, firstLine: 0, spaceBefore: 0, lineHeight: 1, tabs: [], tiny: true, size: 1 }));
-    return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<w:document ${NS}><w:body>${out.join("")}${this.sectPr(this.m.finalSection, this.m.blocks.some((b) => b.kind === "p" && !!b.sectionEnd))}</w:body></w:document>`;
+    return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<w:document ${NS}><w:body>${out.join("")}${this.sectPr(this.m.finalSection, !this.m.finalSection.newPage && this.m.blocks.some((b) => b.kind === "p" && !!b.sectionEnd))}</w:body></w:document>`;
   }
 
   styles(): string {

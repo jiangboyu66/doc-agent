@@ -651,6 +651,33 @@ await test("旋转文字（竖排表头、页边竖排说明、竖排标签、�
   }
 });
 
+await test("纸张大小 / 方向不一样的页（横向附录、A4 说明页、/Rotate 180、带偏移的裁剪框）各自分节、写自己的纸张大小，宽表格不被裁；裁剪框外的东西不转换（两种模式）", async () => {
+  const { pdfToDocx } = await import("../src/services/pdfConvert/index.js");
+  const pdf = await fixture("mixed-pages.pdf");
+  const textOf = (x: string) => (x.match(/<w:t[^>]*>([^<]*)<\/w:t>/g) ?? []).map((t) => t.replace(/<[^>]+>/g, "")).join(" ");
+  for (const mode of ["exact", "flow"] as const) {
+    const { data, report } = await pdfToDocx(pdf, { mode });
+    eq(report.textCoverage, 1, `${mode}：文字完整性`);
+    const xml = new ZipPackage(data).readText("word/document.xml");
+    const sects = xml.match(/<w:sectPr>[\s\S]*?<\/w:sectPr>/g) ?? [];
+    const sizes = sects.map((x) => x.match(/<w:pgSz w:w="(\d+)" w:h="(\d+)"/)!.slice(1).join("x"));
+    eq(sizes.join(" "), "12240x15840 15840x12240 11900x16840 12240x15840 8000x10000", `${mode}：每一节按原页面的纸张大小（twip）`);
+    assert(/<w:pgSz w:w="15840" w:h="12240" w:orient="landscape"\/>/.test(sects[1]), `${mode}：横向页标成横向`);
+    // 纸张大小变了的节从新的一页开始（不是连续分节）
+    for (let i = 1; i < sects.length; i++) assert(!sects[i].includes('<w:type w:val="continuous"/>'), `${mode}：第 ${i + 1} 节应从新的一页开始`);
+    // 横向页的 7 列宽表格完整保留（总宽 684pt，比纵向页宽）
+    const tbl = xml.match(/<w:tbl>[\s\S]*?<\/w:tbl>/)?.[0] ?? "";
+    const grid = [...tbl.matchAll(/<w:gridCol w:w="(\d+)"\/>/g)].map((m) => Number(m[1]));
+    eq(grid.length, 7, `${mode}：宽表格应有 7 列`);
+    assert(Math.abs(grid.reduce((a, b) => a + b, 0) - 684 * 20) < 40, `${mode}：宽表格总宽应是 684pt：${grid}`);
+    for (const t of ["Description", "Attempts before giving up", "scheduler"]) assert(textOf(tbl).includes(t), `${mode}：宽表格里应有"${t}"`);
+    // /Rotate 180 的页按文字自己的方向读：是正常的正文，不是倒过来的旋转文字
+    assert(xml.includes("Rotated page heading") && !report.notes.some((n) => n.includes("旋转文字")), `${mode}：/Rotate 180 的页应按正文读出`);
+    // 裁剪框外看不见的字不转换；框里的照常
+    assert(xml.includes("Visible text inside the crop box.") && !xml.includes("Hidden text below") && !xml.includes("Hidden right"), `${mode}：只转换裁剪框里的内容`);
+  }
+});
+
 // ---------------------------------------------------------------------------
 console.log("\n代理主循环（模拟模型）");
 // ---------------------------------------------------------------------------
@@ -1228,7 +1255,7 @@ await test("所有夹具 PDF：两种排版方式都不报错、文字完整；L
   const run = promisify(execFile);
   const soffice = process.env.SOFFICE_PATH || "soffice";
   const hasSoffice = await run(soffice, ["--version"]).then(() => true, () => false);
-  const names = ["columns", "journal", "figures", "math", "journal-front", "journal-eq", "journal-fig", "bios", "colstart", "signature", "citecolor", "texpaper", "contract-cn", "scan-letter", "furniture-cn", "bates", "rotated-text"];
+  const names = ["columns", "journal", "figures", "math", "journal-front", "journal-eq", "journal-fig", "bios", "colstart", "signature", "citecolor", "texpaper", "contract-cn", "scan-letter", "furniture-cn", "bates", "rotated-text", "mixed-pages"];
   const dir = await fs.mkdtemp(path.join(tmp, "pages-"));
   const bad: string[] = [];
   for (const name of names) {

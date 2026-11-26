@@ -400,16 +400,17 @@ export function resolveRectFill(subs: SubPath[], evenOdd: boolean): SubPath[] | 
 async function extractPage(page: any, index: number, OPS: any, Util: any): Promise<PageModel> {
   let vp = page.getViewport({ scale: 1 });
   let rotation: number | undefined;
-  // 页面带 /Rotate 90 / 270、内容却按未旋转的版面排（合并、扫描时转了页面方向）：显示出来整页文字都横躺着，
-  // 横躺的文字转换不了，整页会丢。这样的页面按文字自己的方向读，页面宽高随之互换
-  if ((((page.rotate ?? 0) % 360) + 360) % 180 === 90) {
+  // 页面带 /Rotate 90 / 180 / 270、内容却按未旋转的版面排（合并、扫描时转了页面方向）：显示出来整页文字都横躺着
+  // 或倒着，这样的文字转换不了，整页会丢。这样的页面按文字自己的方向读（90 / 270 时页面宽高随之互换）
+  if ((((page.rotate ?? 0) % 360) + 360) % 360 !== 0) {
     const items = ((await page.getTextContent({ includeMarkedContent: false, disableNormalization: true })).items as any[]).filter((it) => it.str?.trim());
+    // 正着的文字：基线水平、从左往右（倒着的文字基线也水平，但方向相反、字头朝下）
     const upright = (T: M) => {
       let up = 0, all = 0;
       for (const it of items) {
         const t = Util.transform(T, it.transform) as M, s = Math.hypot(t[2], t[3]), n = it.str.trim().length;
         all += n;
-        if (Math.abs(t[1]) <= 0.01 * s && Math.abs(t[2]) <= 0.01 * s) up += n;
+        if (Math.abs(t[1]) <= 0.01 * s && Math.abs(t[2]) <= 0.01 * s && t[0] > 0 && t[3] < 0) up += n;
       }
       return all ? up / all : 1;
     };
@@ -572,7 +573,7 @@ async function extractPage(page: any, index: number, OPS: any, Util: any): Promi
         const glyphs = args[0] ?? [];
         let pendingSpace = 0;
         const [bx, by] = (() => { const a = [tm[0], tm[1]], b = [gs.ctm[0] * a[0] + gs.ctm[2] * a[1], gs.ctm[1] * a[0] + gs.ctm[3] * a[1]]; return [VT[0] * b[0] + VT[2] * b[1], VT[1] * b[0] + VT[3] * b[1]]; })();
-        const rot = Math.abs(by) > 0.01 * Math.hypot(bx, by);
+        const rot = Math.abs(by) > 0.01 * Math.hypot(bx, by) || bx < 0;
         for (const g of glyphs) {
           if (!g || typeof g !== "object") continue;
           const w = typeof g.width === "number" ? g.width * curScale : 0;
@@ -784,7 +785,8 @@ async function extractPage(page: any, index: number, OPS: any, Util: any): Promi
     const t = Util.transform(VT, it.transform) as M;
     const size = Math.hypot(t[2], t[3]);
     if (size < 0.5) continue;
-    if (Math.abs(t[1]) > 0.01 * size || Math.abs(t[2]) > 0.01 * size) {
+    // 基线不水平的，或水平但倒着（从右往左、字头朝下）的：旋转文字
+    if (Math.abs(t[1]) > 0.01 * size || Math.abs(t[2]) > 0.01 * size || t[0] < 0) {
       model.rotatedText++;
       const em = Math.hypot(it.transform[0], it.transform[1]) || size;
       const wEm = (it.width || em * it.str.length * 0.5) / em;
@@ -991,6 +993,23 @@ async function extractPage(page: any, index: number, OPS: any, Util: any): Promi
     }
   }
   model.spans = mergeLetterSpaced(model.spans);
+  // 裁剪框（CropBox）之外的东西看不见：整个落在页面外的文字、图片、线条、色块不转换。
+  // 视口已按裁剪框换算，页面就是 [0, 宽] × [0, 高]；以前它们按负坐标排进版面，把页面上的内容整块往下挤，一页变三页
+  {
+    const W = model.width, H = model.height;
+    const on = (x0: number, y0: number, x1: number, y1: number, pad = 0) => x1 + pad > 0.5 && x0 - pad < W - 0.5 && y1 + pad > 0.5 && y0 - pad < H - 0.5;
+    model.spans = model.spans.filter((s) => on(s.x0, s.top, s.x1, s.bottom));
+    model.images = model.images.filter((b) => on(b.x0, b.y0, b.x1, b.y1));
+    model.fills = model.fills.filter((b) => on(b.x0, b.y0, b.x1, b.y1));
+    model.segs = model.segs.filter((g) => on(Math.min(g.x0, g.x1), Math.min(g.y0, g.y1), Math.max(g.x0, g.x1), Math.max(g.y0, g.y1), g.width / 2));
+    model.masks = model.masks.filter((b) => on(b.x0, b.y0, b.x1, b.y1));
+    const gone = model.paths.filter((b) => !on(b.x0, b.y0, b.x1, b.y1));
+    if (gone.length) {
+      model.paths = model.paths.filter((b) => on(b.x0, b.y0, b.x1, b.y1));
+      model.vectorShapes = Math.max(0, model.vectorShapes - gone.filter((p) => (p.curved || p.diagonal) && (p.x1 - p.x0) * (p.y1 - p.y0) > 4).length);
+    }
+    if (model.rotated) model.rotated = model.rotated.filter((b) => on(b.x0, b.y0, b.x1, b.y1));
+  }
   if (scanned) {
     const split = splitScan(scanned.gray, scanned.box, model.spans.map((sp) => ({ x0: sp.x0, y0: sp.top, x1: sp.x1, y1: sp.bottom, text: sp.text, baseline: sp.baseline, size: sp.size })));
     if (split) model.scan = { ...split, image: scanned.image };
