@@ -1716,6 +1716,136 @@ await test("PWB 回归（pwb-cases.py）：左对齐正文不在短行处断段�
   }
 });
 
+await test("按制表位对齐的清单（附图标记说明：每行几组“部件名，编号”）不是分栏：隔几行才有两行的空隙上下对齐，不切成左右两栏；通栏内容多于双栏内容、但双栏成片时仍是分栏", async () => {
+  const { buildLines, detectGutter } = await import("../src/services/pdfConvert/layout.js");
+  const sp = (text: string, x0: number, x1: number, bl: number, size = 10) => ({ text, x0, x1, top: bl - size, bottom: bl + 0.27 * size, baseline: bl, size, font: "MS-Mincho", bold: false, italic: false, color: "000000" });
+  // 12 行清单：每 4 行里有 2 行在 x≈324 处留空（两侧都有文字），另外 2 行有一组“部件名”横跨这里。
+  // 当成分栏后这两行被拆成左右两栏，读成“理装置，13 统合…｜ラ装置，30…｜20，20_1…カメ｜雲台，40…”，行序错乱
+  const list: any[] = [];
+  for (let r = 0; r < 12; r++) {
+    const bl = 101.3 + 24 * r;
+    if (r % 4 < 2) list.push(sp("理装置，", 113.8, 160.4, bl), sp("1 3", 177.4, 193.4, bl), sp("統合映像処理装置，", 210, 316.4, bl), sp("2 0 ， 2 0 _ 1乃至2 0 — N", 332.2, 483.1, bl), sp("カ メ", 498.7, 520, bl));
+    else list.push(sp("映像処理サーバ，", 126.2, 219.5, bl), sp("6 0", 236.2, 253.4, bl), sp("情報端末装置，", 269.8, 352.4, bl), sp("7 0", 368.4, 385.4, bl), sp("ネ ッ トワ ー ク ，", 402.7, 483.5, bl), sp("8 0", 499.9, 517.4, bl));
+  }
+  eq(detectGutter(buildLines(list as any), { x0: 113.8, x1: 520 }), null, "清单不是分栏");
+  // 通栏的摘要 14 行 + 下面双栏正文 8 行：横跨栏间的行比双栏的行多，但双栏的 8 行上下相连
+  const mixed: any[] = [];
+  for (let r = 0; r < 14; r++) mixed.push(sp("この技術は映像処理装置に関するものであり入力画像フレームを処理する方法を提供する", 72, 523, 100 + 14 * r));
+  for (let r = 0; r < 8; r++) mixed.push(sp("左の段の本文がここに続いて書かれている行", 72, 288, 320 + 14 * r), sp("右の段の本文がここに続いて書かれている行", 307, 523, 320 + 14 * r));
+  const g = detectGutter(buildLines(mixed as any), { x0: 72, x1: 523 });
+  assert(g && g.g0 <= 289 && g.g1 >= 306, `成片的双栏仍应识别：${JSON.stringify(g)}`);
+});
+
+await test("文字替换式扫描件（scan-text.pdf，WIPO 专利小册子的做法）：整页扫描图拆开，附图成图、只在图里的字留在原来的句子里、每页相同的页眉写进 Word 页眉；表单页格线垫底、文字放进原位文本框；没有文字层的页分清是附图还是没做识别的文字，并给调用方标出来", async () => {
+  const { pdfToDocx } = await import("../src/services/pdfConvert/index.js");
+  const pdf = await fixture("scan-text.pdf");
+  const paraText = (p: string) => p.replace(/<wp:inline[\s\S]*?<\/wp:inline>/g, "[IMG]").replace(/<[^>]+>/g, "");
+  const read = async (mode: "exact" | "flow") => {
+    const { data, report } = await pdfToDocx(pdf, { mode });
+    const pkg = new ZipPackage(data);
+    const xml = pkg.readText("word/document.xml");
+    const headers = pkg.names().filter((n) => /^word\/header\d*\.xml$/.test(n)).map((n) => pkg.readText(n)).join("");
+    return { report, xml, headers, paras: (xml.match(/<w:p[ >][\s\S]*?<\/w:p>/g) ?? []).map(paraText), media: pkg.names().filter((n) => n.startsWith("word/media/")).length };
+  };
+  const flow = await read("flow");
+  eq(flow.report.textCoverage, 1, "文字完整性");
+  // 表单页（第 6 页）的文字仍是文字：算文字页，不算整页成图
+  eq(JSON.stringify(flow.report.scanPages), JSON.stringify({ text: [1, 2, 3, 6], picture: [4], unread: [5] }), "各页的归类");
+  // 文字页不再把整页扫描图垫在文字下面；只有表单页的格线图垫在文字下面
+  eq((flow.xml.match(/behindDoc="1"/g) ?? []).length, 1, "只有表单页垫底");
+  // 只在图里的字：小图片插在原来那句话的中间，前后文字不断开，并标上 pdf2word-glyph
+  assert(flow.paras.some((t) => /document number\s*\[IMG\]\s*of the series/.test(t)), `第 1 页句中的字应留在原行：${flow.paras.join(" | ").slice(0, 600)}`);
+  assert(flow.paras.some((t) => /according to claim\s*\[IMG\]\s*, wherein the frames are stored/.test(t)), "第 2 页第一处权利要求编号应留在原行");
+  assert(flow.paras.some((t) => /according to claim\s*\[IMG\]\s*, wherein the angle is corrected/.test(t)), "第 2 页第二处权利要求编号应留在原行");
+  eq((flow.xml.match(/name="pdf2word-glyph \d+"/g) ?? []).length, 3, "句中的字标成 pdf2word-glyph");
+  // 没有文字层、看得出是文字的第 5 页：整页图标成 pdf2word-page 5，调用方识别后可以替换
+  eq((flow.xml.match(/name="pdf2word-page 5"/g) ?? []).length, 1, "没读出来的页标成 pdf2word-page 5");
+  assert(!/pdf2word-page 4/.test(flow.xml), "附图页不标");
+  // 表单页：每行文字一个原位文本框；垫底的格线图标成 pdf2word-form 6（格里的字已是文字，图不必再翻译）
+  eq((flow.xml.match(/name="pdf2word-form 6"/g) ?? []).length, 1, "表单页的格线图标成 pdf2word-form 6");
+  for (const line of ["Box No. 1", "Box No. 12", "The applicant confirms the statement made in this box of the form"]) {
+    assert(new RegExp(`<w:txbxContent>(?:(?!</w:txbxContent>)[\\s\\S])*${line.replace(/\./g, "\\.")}`).test(flow.xml), `表单文字应在文本框里：${line}`);
+  }
+  // 每页相同的页眉块（公开号条）写进 Word 页眉，不在正文里重复
+  assert(/<w:drawing>/.test(flow.headers), "页眉里应有公开号条的图片");
+  eq(flow.media, 10, "图片数：1 幅附图 + 3 个字 + 页眉 3 块（WO、2099/000001、PCT 号）+ 第 4、5、6 页各一张整页图");
+  const notes = flow.report.notes.join("\n");
+  assert(/第 1–3 页的文字画在整页扫描图上面/.test(notes) && /可能有识别错误/.test(notes), `应说明正文来自 PDF 已有的识别文字：${notes}`);
+  assert(/写进了 Word 页眉页脚/.test(notes), "应说明页眉块写进了页眉");
+  assert(/第 6 页是带表格线的表单：格线保留为垫底的图片，文字按原位置放在文本框里/.test(notes), "应说明表单页的做法");
+  assert(/第 4 页没有文字层/.test(notes), "应说明哪些页是整页附图");
+  assert(/第 5 页是没有做过文字识别的扫描页/.test(notes), "应说明哪些页的文字没有转成正文");
+  // 逐行一致模式不重排文字，整页图照旧垫在文字下面；没有文字层的页同样要归类、标出
+  const exact = await read("exact");
+  eq(exact.report.textCoverage, 1, "exact：文字完整性");
+  eq(JSON.stringify(exact.report.scanPages), JSON.stringify({ text: [], picture: [4], unread: [5] }), "exact：各页的归类");
+  eq((exact.xml.match(/behindDoc="1"/g) ?? []).length, 4, "exact：有文字的 4 页仍以整页图衬底");
+  eq((exact.xml.match(/name="pdf2word-page 5"/g) ?? []).length, 1, "exact：没读出来的页也标出");
+  // 没有画布时结果相同（表单页不再靠渲染）
+  const prev = process.env.PDF_RASTER;
+  process.env.PDF_RASTER = "0";
+  try {
+    const plain = await read("flow");
+    eq(plain.report.textCoverage, 1, "无画布：文字完整性");
+    eq(JSON.stringify(plain.report.scanPages), JSON.stringify({ text: [1, 2, 3, 6], picture: [4], unread: [5] }), "无画布：各页的归类");
+    assert(plain.paras.some((t) => /according to claim\s*\[IMG\]\s*, wherein the frames/.test(t)), "无画布：句中的字仍留在原行");
+  } finally {
+    if (prev === undefined) delete process.env.PDF_RASTER; else process.env.PDF_RASTER = prev;
+  }
+});
+
+await test("扫描页印成图的页码：按位数变化推出编号，写成页码域；两位数的数字粘成一块时按宽度算位数；推不出来时不写", async () => {
+  const { buildDocModel } = await import("../src/services/pdfConvert/layout.js");
+  const { encodePng } = await import("../src/services/pdfConvert/extract.js");
+  // 只构造版面需要的字段：每页一行正文，页顶中间一块"页码"（宽度按位数，第 13 页起两位数粘成一块）
+  const mk = (index: number, printed: number | null) => {
+    const png = encodePng(4, 4, new Uint8Array(16), 1);
+    const digits = printed === null ? 0 : String(printed).length;
+    const w = 6 * digits, merged = printed !== null && printed >= 13 && printed <= 15;
+    const pieces = printed === null ? [] : [{ x0: 300, y0: 40, x1: 300 + w, y1: 49, kind: "glyphs", glyphs: merged ? 1 : digits, png: Buffer.from(png.toString("base64") + index, "utf8"), pxW: 4, pxH: 4 }];
+    const scanImage = { x0: 0, y0: 0, x1: 595, y1: 842, png, pxW: 4, pxH: 4 };
+    const span = (text: string, y: number) => ({ text, x0: 72, x1: 500, top: y - 9, bottom: y + 2.5, baseline: y, size: 11, font: "Times New Roman", bold: false, italic: false, color: "000000", natural: 428, wordW: 428, spaceW: 3, wordSpaceW: 3 });
+    return {
+      index, width: 595, height: 842, spans: [span(`Paragraph text on page ${index + 1} that runs across the line.`, 120), span("Another line of the same paragraph continues here.", 136)],
+      images: [scanImage], segs: [], fills: [], paths: [], vectorShapes: 0, rotatedText: 0,
+      scan: { pieces, rules: [], inkUnderText: 0, textLines: 0, ink: 0.01, glyphCount: 1, graphicCount: 0, graphicArea: 0, image: scanImage },
+    };
+  };
+  // 原文第 3 页起印 1（前两页不印）：第 3–20 页印 1–18
+  const pages = [mk(0, null), mk(1, null), ...Array.from({ length: 18 }, (_, k) => mk(k + 2, k + 1))];
+  const model = buildDocModel(pages as any, { mode: "flow" });
+  eq(model.stats.scan?.pageNumbers, 18, "18 页的页码换成文字");
+  const head = (model.headers?.default ?? []).flatMap((p: any) => p.runs).map((r: any) => (r.field ? `{${r.field}}` : r.text)).join("");
+  assert(head.includes("{PAGE}"), `页眉应有页码域：${head}`);
+  // 全是一位数（看不出起点）：不写页码
+  const short = buildDocModel([mk(0, 4), mk(1, 5), mk(2, 6)] as any, { mode: "flow" });
+  eq(short.stats.scan?.pageNumbers ?? 0, 0, "推不出起点时不写页码");
+});
+
+await test("扫描图拆分（scanLayer）：墨迹太多、碎片太多或和文字大面积重叠一半的图不拆；整页都是成行的字时看得出是文字", async () => {
+  const { splitScan, looksLikeText } = await import("../src/services/pdfConvert/scanLayer.js");
+  const W = 600, H = 800, box = { x0: 0, y0: 0, x1: 300, y1: 400 };
+  const blank = () => new Uint8Array(W * H).fill(255);
+  const rect = (d: Uint8Array, x0: number, y0: number, x1: number, y1: number) => { for (let y = y0; y < y1; y++) d.fill(0, y * W + x0, y * W + x1); };
+  // 一张照片（大片深色）不是文字替换式的扫描页
+  const dark = blank();
+  rect(dark, 0, 0, W, H / 2);
+  eq(splitScan({ data: dark, w: W, h: H }, box, []), null, "墨迹超过三成的图不拆");
+  // 空白页：没有东西可拆，也不像文字
+  const empty = splitScan({ data: blank(), w: W, h: H }, box, []);
+  assert(empty && empty.pieces.length === 0 && !looksLikeText(empty), "空白页没有碎片");
+  // 30 行、每行 24 个小方块（字）
+  const page = blank();
+  for (let r = 0; r < 30; r++) for (let k = 0; k < 24; k++) rect(page, 40 + k * 18, 60 + r * 22, 40 + k * 18 + 14, 60 + r * 22 + 12);
+  const text = splitScan({ data: page, w: W, h: H }, box, []);
+  assert(text && looksLikeText(text), `成行的字应看得出是文字：${text && JSON.stringify({ lines: text.textLines, glyphs: text.glyphCount })}`);
+  const drawing = blank();
+  rect(drawing, 100, 100, 500, 104); rect(drawing, 100, 500, 500, 504); rect(drawing, 100, 100, 104, 504); rect(drawing, 496, 100, 500, 504);
+  for (let k = 0; k < 6; k++) rect(drawing, 150 + k * 20, 300, 162 + k * 20, 314);
+  const fig = splitScan({ data: drawing, w: W, h: H }, box, []);
+  assert(fig && !looksLikeText(fig) && fig.graphicCount >= 1, `一幅带几个标注的附图不是文字页：${fig && JSON.stringify({ lines: fig.textLines, glyphs: fig.glyphCount, graphics: fig.graphicCount })}`);
+});
+
 // ---------------------------------------------------------------------------
 
 await fs.rm(tmp, { recursive: true, force: true });

@@ -10,6 +10,7 @@ import zlib from "node:zlib";
 import { crc32 } from "../../documents/docx/zip.js";
 import { symbolChar } from "../../documents/docx/symbolFont.js";
 import { isSafeFamily, isSmallCapsFont, parseFontName, measureWord, type FontInfo } from "./fonts.js";
+import { splitScan, type ScanSplit } from "./scanLayer.js";
 
 export { parseFontName };
 
@@ -76,6 +77,20 @@ export interface ImageBox {
   alt?: string;
   /** 文字环绕时与旁边文字的间距（pt），按原 PDF 中图片与文字的实测距离；Word 默认只留 2pt，文字几乎贴着图片 */
   wrap?: { l: number; r: number; b: number };
+  /** 从扫描页的位图层上裁下来的一块（见 scanLayer.ts）：graphic 是图、条码、线框，glyphs 是没被识别成文字的字 */
+  scan?: "graphic" | "glyphs";
+  /** 落在一行文字里的漏认字：那一行的基线与字号（作为行内图片插回这一行） */
+  line?: { baseline: number; size: number };
+  /** 固定在页面坐标上、不进入文字流（版心之外的页边装饰） */
+  pinned?: boolean;
+  /**
+   * 写进 Word 时给调用方的标记（图片名 pdf2word-glyph / pdf2word-page N / pdf2word-form N）：glyph 是句子里没被识别成文字的字，
+   * page 是第 N 页没有文字层、看得出是成行文字的整页图（调用方可以把它们识别成文字后替换掉）；
+   * form 是第 N 页表单垫在文本框下面的格线图（格里的字已是文字，图不必再翻译）
+   */
+  role?: "glyph" | "page" | "form";
+  /** role 为 page、form 时的页码（从 1 起） */
+  pageNo?: number;
 }
 
 /** 一条已绘制的路径（用于识别矢量图） */
@@ -111,6 +126,8 @@ export interface PageModel {
   ocrChars?: number;
   /** 旋转文字（坐标轴的竖排标题等）的外接框：本身不转换，但图区域要把它们包进来，渲染时一并画出 */
   rotated?: Array<{ x0: number; y0: number; x1: number; y1: number; size: number }>;
+  /** 铺满页面的黑白扫描图拆开后的结果（见 scanLayer.ts）；image 是 images 里的那张整页图 */
+  scan?: ScanSplit & { image: ImageBox };
 }
 
 type M = [number, number, number, number, number, number];
@@ -295,6 +312,9 @@ async function extractPage(page: any, index: number, OPS: any, Util: any): Promi
   const VT = vp.transform as M;
   const ops = await page.getOperatorList();
   const model: PageModel = { index, width: vp.width, height: vp.height, ...(rotation !== undefined ? { rotation } : {}), spans: [], segs: [], fills: [], images: [], vectorShapes: 0, rotatedText: 0, paths: [], masks: [] };
+  // 铺满页面的黑白扫描图（只有一张时）：像素留到文字读完
+  let scanned: { gray: { data: Uint8Array | Uint8ClampedArray; w: number; h: number }; box: { x0: number; y0: number; x1: number; y1: number }; image: ImageBox } | null = null;
+  let scanPages = 0;
 
   // ---------- 操作符遍历：图形、图片、文字颜色 ----------
   interface GState { ctm: M; fill: string; stroke: string; lw: number; trm: number; clip?: { x0: number; y0: number; x1: number; y1: number } }
@@ -552,8 +572,16 @@ async function extractPage(page: any, index: number, OPS: any, Util: any): Promi
           }
         }
         const png = dec && { png: encodePng(dec.w, dec.h, dec.data, dec.ch), w: dec.w, h: dec.h };
-        if (png && box.x1 - box.x0 > 2 && box.y1 - box.y0 > 2) model.images.push({ ...box, png: png.png, pxW: png.w, pxH: png.h });
-        else if (!png) model.vectorShapes++;
+        if (png && box.x1 - box.x0 > 2 && box.y1 - box.y0 > 2) {
+          const im: ImageBox = { ...box, png: png.png, pxW: png.w, pxH: png.h };
+          model.images.push(im);
+          // 铺满页面的单通道位图（黑白扫描）：留着像素，等文字读完后把它拆开；一页有两张以上（上下拼条）的不拆
+          const straight = Math.abs(corners[1][1] - corners[0][1]) < 0.05 && Math.abs(corners[2][0] - corners[0][0]) < 0.05 && corners[1][0] > corners[0][0] && corners[2][1] < corners[0][1];
+          if (dec!.ch === 1 && straight && box.x1 - box.x0 >= 0.85 * model.width && box.y1 - box.y0 >= 0.85 * model.height) {
+            scanPages++;
+            scanned = scanPages === 1 ? { gray: { data: dec!.data, w: dec!.w, h: dec!.h }, box, image: im } : null;
+          }
+        } else if (!png) model.vectorShapes++;
         break;
       }
     }
@@ -775,6 +803,10 @@ async function extractPage(page: any, index: number, OPS: any, Util: any): Promi
     }
   }
   model.spans = mergeLetterSpaced(model.spans);
+  if (scanned) {
+    const split = splitScan(scanned.gray, scanned.box, model.spans.map((sp) => ({ x0: sp.x0, y0: sp.top, x1: sp.x1, y1: sp.bottom, text: sp.text, baseline: sp.baseline, size: sp.size })));
+    if (split) model.scan = { ...split, image: scanned.image };
+  }
   return model;
 }
 

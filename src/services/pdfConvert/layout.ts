@@ -14,6 +14,7 @@ import type { FillRect, ImageBox, PageModel, PathBox, Seg, Span } from "./extrac
 import { collectHyphenated, collectWords, isSoftHyphen, wordCounts } from "../../documents/hyphen.js";
 import { settleFurniture, type Furniture, type FurniturePick } from "./furniture.js";
 import { detectDropCaps, detectEquations, detectIconPaths, detectFigures, detectImageGrids, detectMaskInk, rawBase, rasterBox, removeInside, spansText, textHighlights, type Box, type MathCtx } from "./raster.js";
+import type { ScanPiece } from "./scanLayer.js";
 
 export interface Run {
   text: string;
@@ -140,7 +141,14 @@ export interface DocModel {
   finalSection: SectionProps;
   bodyFont: string;
   bodySize: number;
-  stats: { pages: number; paragraphs: number; tables: number; images: number; vectorShapes: number; rotatedText: number; columnPages: number; figures: number; equations: number; inlineMath?: number };
+  stats: {
+    pages: number; paragraphs: number; tables: number; images: number; vectorShapes: number; rotatedText: number; columnPages: number; figures: number; equations: number; inlineMath?: number;
+    /**
+     * 扫描页的位图层（可编辑排版）：拆开的文字页、格线垫底 + 文字放进文本框的表单页（页码从 1 起）；作为行内图片插回的漏认字、
+     * 没保留的页眉页脚块与零散墨迹的个数，换成页码文字的页数
+     */
+    scan?: { textPages: number[]; formPages: number[]; blocks: number; inline: number; furniture: number; stray: number; pageNumbers: number; header: number };
+  };
   /** 渲染为图片的区域中的文字（计入完整性校验） */
   rasterText: string;
   mode: LayoutMode;
@@ -558,6 +566,112 @@ function detectRuledTables(page: PageModel, used: Set<Seg>, taken: Set<Span>): T
     out.push({ x0, x1, y0, y1, xs, ys, hs: hsDraft, vs, spans });
     for (const h of g) h.src.forEach((sg) => used.add(sg));
     for (const sp of spans) taken.add(sp);
+  }
+  return out;
+}
+
+interface ScanPlan {
+  /** 线框铺满页面、文字大半在框里的表单页：格线留作垫底图片，文字按原位置放进文本框 */
+  form: boolean;
+  /** 从位图层裁下来、要保留的块（含每页都一样、写进页眉页脚的块） */
+  images: ImageBox[];
+  /** 没保留的页眉页脚块 */
+  furniture: number;
+  /** 每页都不同的窄条：印成图的页码，换成这一页的页码文字（由页眉页脚的处理写成页码域） */
+  pageNumber?: { box: Box; text: string };
+  /** images 里每页都一样、留给页眉页脚的块 */
+  header: Set<ImageBox>;
+}
+
+/**
+ * 可编辑排版下，哪些扫描页把位图层拆开处理（见 scanLayer.ts）：整页的黑白位图上面画着文字的页。
+ * 没有文字的页（附图）不在其中，仍按整页图片保留。
+ *   - 表单页（一个线框占了大半页、文字大半在框里：国际检索报告）：框线和字合起来才看得懂，重排文字会把字从格子里挪走。
+ *     能渲染时整页成图；不能渲染时不动（整页位图垫在文字下面）。
+ *   - 其余的页：整页位图不要，裁下来的块当图片。每页顶上、底下重复出现的块（印成图的公开号、页码）是页眉页脚，不进正文。
+ */
+function planScanPages(pages: PageModel[]): Map<PageModel, ScanPlan> {
+  const plans = new Map<PageModel, ScanPlan>();
+  const cand = pages.filter((pg) => pg.scan && pg.images.includes(pg.scan.image) && pg.spans.some((sp) => sp.text.trim() && !sp.img));
+  // 页眉页脚位置上的块：整块在第一行文字之上（且在页面顶部 10% 内），或在最后一行文字之下（且在底部 8% 内）
+  const strips = new Map<PageModel, Set<ScanPiece>>();
+  for (const pg of cand) {
+    const real = pg.spans.filter((sp) => sp.text.trim());
+    const top = Math.min(...real.map((sp) => sp.top)), bottom = Math.max(...real.map((sp) => sp.bottom));
+    const set = new Set(pg.scan!.pieces.filter((p) => p.y1 <= Math.min(0.1 * pg.height, top - 1) || p.y0 >= Math.max(0.92 * pg.height, bottom + 1)));
+    if (set.size) strips.set(pg, set);
+  }
+  // 三页以上都有：是每页重复的页眉页脚。只有一两页有的（首页顶上的徽标）留在正文里。
+  // 按位置分组：每页一模一样的（公开号、申请号）保留，写进 Word 页眉页脚；每页都不一样的窄条是页码
+  const keep = new Set<ScanPiece>();
+  const numbers = new Map<ScanPiece, string>();
+  if (strips.size >= 3) {
+    const groups = new Map<string, Array<{ pg: PageModel; p: ScanPiece }>>();
+    for (const [pg, set] of strips) for (const p of set) {
+      const key = `${(p.y0 + p.y1) / 2 < pg.height / 2 ? "t" : "b"}${Math.round((p.x0 + p.x1) / 2 / 20)}`;
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key)!.push({ pg, p });
+    }
+    for (const list of groups.values()) {
+      if (list.length < 3) continue;
+      const counts = new Map<string, number>();
+      const sig = (p: ScanPiece) => p.png.toString("base64");
+      for (const { p } of list) counts.set(sig(p), (counts.get(sig(p)) ?? 0) + 1);
+      const [topSig, topCount] = [...counts.entries()].sort((a, b) => b[1] - a[1])[0];
+      if (topCount >= Math.max(3, 0.6 * list.length)) {
+        for (const { p } of list) if (sig(p) === topSig) keep.add(p);
+        continue;
+      }
+      if (counts.size === list.length) for (const [p, text] of pageNumberTexts(list)) numbers.set(p, text);
+    }
+  }
+  for (const pg of cand) {
+    const sc = pg.scan!;
+    const real = pg.spans.filter((sp) => sp.text.trim());
+    const chars = (list: Span[]) => list.reduce((n, sp) => n + sp.text.replace(/\s/g, "").length, 0);
+    const within = (p: Box) => real.filter((sp) => { const cx = (sp.x0 + sp.x1) / 2, cy = (sp.top + sp.bottom) / 2; return cx >= p.x0 && cx <= p.x1 && cy >= p.y0 && cy <= p.y1; });
+    const form = sc.pieces.some((p) => p.kind === "graphic" && p.x1 - p.x0 >= 0.6 * pg.width && p.y1 - p.y0 >= 0.45 * pg.height && chars(within(p)) >= 0.5 * chars(real));
+    if (form) {
+      plans.set(pg, { form: true, images: [], furniture: 0, header: new Set() });
+      continue;
+    }
+    const drop = strips.size >= 3 ? strips.get(pg) : undefined;
+    const header = new Set<ImageBox>();
+    const images: ImageBox[] = sc.pieces.filter((p) => !drop?.has(p) || keep.has(p)).map((p) => {
+      const im: ImageBox = { x0: p.x0, y0: p.y0, x1: p.x1, y1: p.y1, png: p.png, pxW: p.pxW, pxH: p.pxH, scan: p.kind, ...(p.line ? { line: p.line } : {}) };
+      if (keep.has(p)) header.add(im);
+      return im;
+    });
+    const num = [...(drop ?? [])].find((p) => numbers.has(p));
+    plans.set(pg, {
+      form: false, images, header, furniture: [...(drop ?? [])].filter((p) => !keep.has(p) && !numbers.has(p)).length,
+      ...(num ? { pageNumber: { box: { x0: num.x0, y0: num.y0, x1: num.x1, y1: num.y1 }, text: numbers.get(num)! } } : {}),
+    });
+  }
+  return plans;
+}
+
+/**
+ * 每页都不同的一组窄条是不是页码、各是几：页码逐页加一，图里的数字个数（连通块数）只在 9→10、99→100 处变。
+ * 由位数变化的位置推出起始页码，所有页的位数都对得上才算；推不出来（不是页码、或页码不连续）返回空
+ */
+function pageNumberTexts(list: Array<{ pg: PageModel; p: ScanPiece }>): Map<ScanPiece, string> {
+  const out = new Map<ScanPiece, string>();
+  const sorted = [...list].sort((a, b) => a.pg.index - b.pg.index);
+  if (sorted.some(({ p, pg }) => p.x1 - p.x0 > 0.12 * pg.width || p.glyphs < 1 || p.glyphs > 4)) return out;
+  // 位数：连通块数；两个数字粘在一起时只算一块，再按宽度核对（一位数的宽度取单块中较窄的一半的中位数）
+  const widths = sorted.filter(({ p }) => p.glyphs === 1).map(({ p }) => p.x1 - p.x0).sort((a, b) => a - b);
+  const one = widths.length ? widths[Math.floor((widths.length - 1) / 4)] : 0;
+  const digits = sorted.map(({ p }) => Math.max(p.glyphs, one ? (p.x1 - p.x0 > 2.4 * one ? 3 : p.x1 - p.x0 > 1.45 * one ? 2 : 1) : 1));
+  // 候选起点：第一页的页码 n0，使得每一页 n0 + (页序差) 的位数与图里的数字个数一致
+  for (let n0 = 0; n0 <= 9999; n0++) {
+    const ok = sorted.every(({ pg }, k) => String(n0 + pg.index - sorted[0].pg.index).length === digits[k]);
+    if (!ok) continue;
+    // 起点不唯一（全是一位数、没有位数变化）时推不出来
+    const next = sorted.every(({ pg }, k) => String(n0 + 1 + pg.index - sorted[0].pg.index).length === digits[k]);
+    if (next) return out;
+    sorted.forEach(({ pg, p }) => out.set(p, String(n0 + pg.index - sorted[0].pg.index)));
+    return out;
   }
   return out;
 }
@@ -1488,6 +1602,18 @@ export function detectGutter(lines: Line[], r: Region): { g0: number; g1: number
   }
   if (!bestRun || bestRun.two < 4 || bestRun.two < 0.15 * lines.length) return null;
   const best = { x: (scores[bestRun.a].x + scores[bestRun.b].x) / 2, two: bestRun.two };
+  if (bestRun.eff <= 0) {
+    // 横跨这条线的行不比被它分开的行少：要有成片的双栏（上下相连的 4 行以上两侧都有文字，中间没有横跨的行）才算分栏。
+    // 按制表位对齐的清单（附图标记说明：每行几组"部件名，编号"）里，隔几行就有两三行的空隙上下对齐，
+    // 当成分栏后这几行被拆成左右两栏，读序错乱
+    let run = 0, longest = 0;
+    for (const l of [...lines].sort((a, b) => a.top - b.top)) {
+      const k = classify(l, best.x);
+      if (k === "cross") run = 0;
+      else if (k === "two") longest = Math.max(longest, ++run);
+    }
+    if (longest < 4) return null;
+  }
   // 不跨栏的行：分栏线左侧 / 右侧的文字片段
   const parts: Array<{ l: Line; L: Span[]; R: Span[] }> = [];
   for (const l of lines) {
@@ -1618,7 +1744,8 @@ function checkBoxes(pg: PageModel): Seg[] {
   return frames;
 }
 
-export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; raster?: boolean } = {}): DocModel {
+/** unread：没有文字层、看得出是成行文字的页（页序号，从 0 起）；它们的整页图在 Word 里标上 pdf2word-page N */
+export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; raster?: boolean; unread?: ReadonlySet<number> } = {}): DocModel {
   // 识别渲染区域时会从页面中移除元素：在副本上进行，原始提取结果保持不变（用于完整性校验、失败时回退）
   // 识别时会从页面中移除元素、插入行内公式：总在副本上进行，失败回退时原始结果不受影响
   const pages = pages0.map((p) => ({ ...p }));
@@ -1642,12 +1769,86 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
   const rasterText: string[] = [];
   let figureCount = 0, equationCount = 0, inlineMathCount = 0, iconCount = 0;
 
+  // 扫描页的位图层（见 scanLayer.ts）：可编辑排版下，文字画在位图上面的页不把整页位图垫在文字下面
+  const scanPlan = flow ? planScanPages(pages) : new Map<PageModel, ScanPlan>();
+  const scanStats = { textPages: [] as number[], formPages: [] as number[], blocks: 0, inline: 0, furniture: 0, stray: 0, pageNumbers: 0, header: 0 };
+
   // 预处理：矢量图（渲染为图片）、表格、装饰线
   const pre = pages.map((pg) => {
     let figures: ImageBox[] = [];
     // 整页的扫描图 / 底图：作为页面背景单独处理，不参与图片、组图、版心的识别
-    const bgs = pageBackgrounds(pg);
+    let bgs = pageBackgrounds(pg);
     if (bgs.length) { const b = new Set(bgs); pg.images = pg.images.filter((im) => !b.has(im)); }
+    // 没有文字层、看得出是成行文字的扫描页：整页图标上页码，调用方识别出文字后可以替换
+    if (opts.unread?.has(pg.index)) for (const im of bgs) { im.role = "page"; im.pageNo = pg.index + 1; }
+    const plan = scanPlan.get(pg);
+    if (plan) {
+      const whole = pg.scan!.image;
+      bgs = bgs.filter((im) => im !== whole);
+      pg.images = pg.images.filter((im) => im !== whole);
+      scanStats.furniture += plan.furniture;
+      scanStats.header += plan.header.size;
+      if (plan.form) {
+        // 表单页：线框和框里的字合起来才看得懂。扫描图（识别出的字已从图里抹掉，剩下格线）整页垫在下面，
+        // 每行文字按原位置放进文本框（独占一页）：翻译只换文字，格线和位置不动
+        scanStats.formPages.push(pg.index + 1);
+        whole.role = "form";
+        whole.pageNo = pg.index + 1;
+        return { pg, tables: [], free: [], rules: [], figures: [], frames: [], bgs: [whole], formLines: buildLines(pg.spans.filter((sp) => sp.text.trim())) };
+      } else {
+        scanStats.textPages.push(pg.index + 1);
+        const real = pg.spans.filter((sp) => sp.text.trim());
+        const tx0 = Math.min(...real.map((sp) => sp.x0)), tx1 = Math.max(...real.map((sp) => sp.x1));
+        if (plan.pageNumber) {
+          // 印成图的页码：换成这一页的页码文字，由页眉页脚的处理认成页码、写成页码域
+          const { box, text } = plan.pageNumber;
+          const size = Math.round((box.y1 - box.y0) / 0.72 * 2) / 2;
+          const ref = real[0];
+          pg.spans.push({
+            text, x0: box.x0, x1: box.x1, top: box.y1 - 0.75 * size, bottom: box.y1 + 0.22 * size, baseline: box.y1, size,
+            font: ref.font, bold: false, italic: false, color: "000000", natural: box.x1 - box.x0, wordW: box.x1 - box.x0, spaceW: ref.spaceW, wordSpaceW: ref.wordSpaceW,
+          });
+          scanStats.pageNumbers++;
+        }
+        for (const im of plan.images) {
+          if (plan.header.has(im)) {
+            // 每页都一样的页眉页脚块：在页眉页脚区域，由页眉页脚的处理写进 Word 页眉页脚
+            pg.images.push(im);
+          } else if (im.line) {
+            im.role = "glyph";
+            // 落在文字行里的漏认字：作为行内图片插回那一行
+            const ref = real.reduce((a, b) => (Math.abs(b.baseline - im.line!.baseline) + Math.max(0, b.x0 - im.x1, im.x0 - b.x1) / 100 < Math.abs(a.baseline - im.line!.baseline) + Math.max(0, a.x0 - im.x1, im.x0 - a.x1) / 100 ? b : a));
+            const size = im.line.size;
+            pg.spans.push({
+              text: "\uFFFC", x0: im.x0, x1: im.x1, top: im.line.baseline - 0.75 * size, bottom: im.line.baseline + 0.22 * size, baseline: im.line.baseline, size,
+              font: ref.font, bold: false, italic: false, color: "000000", natural: im.x1 - im.x0, wordW: im.x1 - im.x0, spaceW: ref.spaceW, wordSpaceW: ref.wordSpaceW, img: im,
+            });
+            scanStats.inline++;
+          } else if (im.scan === "glyphs" && im.x1 - im.x0 <= 16 && im.y1 - im.y0 <= 16) {
+            // 换到下一行行首、独占一行的标点（句末的"。"）：接在上一行末尾，作为行内图片。
+            // 其余不挨着任何一行文字的零散墨迹（污点、重影）不保留
+            const own = real.some((sp) => Math.min(sp.bottom, im.y1) - Math.max(sp.top, im.y0) > 0);
+            const above = own ? [] : real.filter((sp) => sp.baseline <= im.y0 + 1 && im.y0 - sp.baseline <= 2.2 * sp.size);
+            const last = above.length ? Math.max(...above.map((sp) => sp.baseline)) : NaN;
+            const row = above.filter((sp) => Math.abs(sp.baseline - last) < 1);
+            const end = row.reduce<Span | undefined>((a, b) => (!a || b.x1 > a.x1 ? b : a), undefined);
+            // 在行首：不比上一行的起点靠右两个字以上（段落编号栏右边、悬在正文左边的句号也算）
+            if (end && im.x0 <= Math.min(...row.map((sp) => sp.x0)) + 2 * end.size) {
+              im.role = "glyph";
+              const w = im.x1 - im.x0, x0 = end.x1 + 0.3;
+              pg.spans.push({
+                text: "\uFFFC", x0, x1: x0 + w, top: end.baseline - 0.75 * end.size, bottom: end.baseline + 0.22 * end.size, baseline: end.baseline, size: end.size,
+                font: end.font, bold: false, italic: false, color: "000000", natural: w, wordW: w, spaceW: end.spaceW, wordSpaceW: end.wordSpaceW, img: im,
+              });
+              scanStats.inline++;
+            } else scanStats.stray++;
+          } else if (im.x1 <= tx0 - 2 || im.x0 >= tx1 + 2) {
+            // 版心左右之外的（页边的竖排条码）：首页固定在原位置，其余页不要（与页边的装饰线条同样处理）
+            if (pg.index === pages[0].index) { im.pinned = true; pg.images.push(im); scanStats.blocks++; } else scanStats.furniture++;
+          } else { pg.images.push(im); scanStats.blocks++; }
+        }
+      }
+    }
     // 文字底色（高亮的占位符等）先认出来：它们是文字的属性，不能被当成图形截成图片
     textHighlights(pg);
     if (opts.raster) {
@@ -1666,7 +1867,7 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
         const chars = over.reduce((n, s) => n + s.text.replace(/\s/g, "").length, 0);
         if (!inside || chars > 300) continue;
         const gone = removeInside(pg, im);
-        figures.push(rasterBox({ x0: im.x0, y0: im.y0, x1: im.x1, y1: im.y1 }, pg.index, "figure", spansText(gone)));
+        figures.push({ ...rasterBox({ x0: im.x0, y0: im.y0, x1: im.x1, y1: im.y1 }, pg.index, "figure", spansText(gone)), ...(im.scan ? { scan: im.scan } : {}) });
       }
       for (const f of figures) if (f.alt) rasterText.push(f.alt);
       figureCount += figures.length;
@@ -1694,7 +1895,7 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
     tables.push(...detectSideBySide(pg, used, inTable));
     const free = pg.spans.filter((s) => !inTable.has(s));
     const rules = applyTextDecorations(free, pg.segs, used);
-    return { pg, tables, free, rules, figures, frames, bgs };
+    return { pg, tables, free, rules, figures, frames, bgs, formLines: undefined as Line[] | undefined };
   });
 
   // 版心：全部页面的内容边界
@@ -1964,7 +2165,7 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
     for (const im of bgs) im.behind = pg.spans.some((s) => s.text.trim() && s.x1 > im.x0 && s.x0 < im.x1 && s.bottom > im.y0 && s.top < im.y1);
     // 与文字重叠的图片（水印、底图）放在文字下方
     // 文字真正压在图片上（文字中心落在图片内部）才算底图；只是边缘相接的（作者照片旁边的简介）不算
-    for (const img of pg.images) img.behind = pg.spans.some((s) => {
+    for (const img of pg.images) img.behind = !!img.pinned || pg.spans.some((s) => {
       const cx = (s.x0 + s.x1) / 2, cy = (s.top + s.bottom) / 2;
       return s.text.trim() && cx > img.x0 + 2 && cx < img.x1 - 2 && cy > img.y0 + 2 && cy < img.y1 - 2;
     });
@@ -2018,6 +2219,8 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
       for (const l of floating[pi]) anchor.textBoxes!.push(...lineBoxes(l, ctx));
     }
     ctx.boxes = flow ? undefined : anchor.textBoxes;
+    // 表单页：每行文字一个按原位置定位的文本框，压在垫底的格线图上
+    for (const l of pre[pi].formLines ?? []) anchor.textBoxes!.push(...lineBoxes(l, ctx));
 
     // 条目：行 / 表格 / 分隔线 / 图片，按纵向位置排序后切成"通栏带"与"分栏带"
     type Item = PageItem;
@@ -2186,7 +2389,8 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
     const pics = [...pg.images.filter((im) => !im.behind), ...figures].sort((a, b) => a.y0 - b.y0);
     const rest: ImageBox[] = [];
     for (const img of pics) {
-      const side = sideOf(img.x0, img.x1);
+      // 从扫描图上裁下来的块：外接框含留白和线框，略微越过栏间距的中线不算通栏；没碰到另一栏的文字就属于这一栏
+      const side = img.scan && gutter ? (img.x1 <= gutter.g1 - 1 ? "L" : img.x0 >= gutter.g0 + 1 ? "R" : "full") : sideOf(img.x0, img.x1);
       // 流式模式：页眉页脚区域的图片（徽标）写进页眉页脚，每页都在原位置，不随正文移动
       if (inMarginZone(img.y0, img.y1)) { (flow ? hf[pi].imgs : anchor.images!).push(img); continue; }
       const beside = besideOf(img, side);
@@ -2456,7 +2660,10 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
     blocks,
     finalSection: curSection,
     bodyFont, bodySize,
-    stats: { ...stats, images: stats.images + iconCount, figures: figureCount, equations: equationCount, inlineMath: inlineMathCount },
+    stats: {
+      ...stats, images: stats.images + iconCount, figures: figureCount, equations: equationCount, inlineMath: inlineMathCount,
+      ...(scanStats.textPages.length || scanStats.formPages.length ? { scan: scanStats } : {}),
+    },
     rasterText: rasterText.join("\n"),
     mode: ctx.mode,
     ...(hfOut ? { headers: hfOut.headers, footers: hfOut.footers, pageNumStart: hfOut.pageNumStart, headerDist, footerDist } : {}),
@@ -2634,12 +2841,14 @@ function buildHeaders(hf: Array<{ head: Line[]; foot: Line[]; imgs: ImageBox[]; 
     for (const i of ids) { const k = sigAt(i); if (!n.has(k)) n.set(k, []); n.get(k)!.push(i); }
     return [...n.values()].sort((a, b) => b.length - a.length)[0]?.[0];
   };
-  // 代表页：furniture.ts 已按文字身份选定（其余页只留下了与代表页相同的行，每一行都能原样再现）
-  const oddRep = pick ? pick.defPage : major(odd), evenRep = pick ? pick.evenRep : major(even);
-  const evenOdd = pick ? pick.evenOdd : oddRep !== undefined && evenRep !== undefined && sigAt(oddRep) !== sigAt(evenRep);
-  const defPage = pick ? pick.defPage : evenOdd ? oddRep! : major(rest) ?? 0;
+  // 代表页：furniture.ts 已按文字身份选定（其余页只留下了与代表页相同的行，每一行都能原样再现）。
+  // 页眉页脚里只有图片（扫描页上每页相同的公开号条）时它没有依据，按多数页选
+  const byText = pick && hf.some((x) => x.head.length || x.foot.length) ? pick : undefined;
+  const oddRep = byText ? byText.defPage : major(odd), evenRep = byText ? byText.evenRep : major(even);
+  const evenOdd = byText ? byText.evenOdd : oddRep !== undefined && evenRep !== undefined && sigAt(oddRep) !== sigAt(evenRep);
+  const defPage = byText ? byText.defPage : evenOdd ? oddRep! : major(rest) ?? 0;
   const rep0 = evenOdd && printed(0) % 2 === 0 ? evenRep! : defPage;
-  const titlePg = notes.length > 0 || (pick ? pick.titlePg : n > 1 && sigAt(0) !== sigAt(rep0));
+  const titlePg = notes.length > 0 || (byText ? byText.titlePg : n > 1 && sigAt(0) !== sigAt(rep0));
   const headers: HeaderSet = { default: mk(hf[defPage].head, defPage) };
   const footers: HeaderSet = { default: mk(hf[defPage].foot, defPage, "foot") };
   if (evenOdd) { headers.even = mk(hf[evenRep!].head, evenRep!); footers.even = mk(hf[evenRep!].foot, evenRep!, "foot"); }

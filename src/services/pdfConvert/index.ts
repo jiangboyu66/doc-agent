@@ -15,6 +15,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
+import { looksLikeText } from "./scanLayer.js";
 import { extractPdf, formatPageRange, MAX_PDF_PAGES, type ImageBox, type PageModel } from "./extract.js";
 
 export { parsePageRange, formatPageRange, MAX_PDF_PAGES } from "./extract.js";
@@ -48,6 +49,13 @@ export interface ConversionReport {
   textCoverage: number;
   /** 缺失字符示例 */
   missing: string;
+  /**
+   * 扫描页（整页是一张图）怎么处理的，页码从 1 起；没有这样的页时省略。
+   *   text：文字画在扫描图上面的页，正文取自这些文字，图里剩下的东西裁成图片；
+   *   picture：整页保留为一张图片，且页面上没有成段的文字要读（附图），或文字已随图片保存（表单页）；
+   *   unread：整页保留为一张图片，但页面看起来是文字（或无法判断）——这些文字没有被读出来，需要先做文字识别。
+   */
+  scanPages?: { text: number[]; picture: number[]; unread: number[] };
   notes: string[];
   ms: number;
 }
@@ -111,17 +119,17 @@ function renderBoxes(model: DocModel): ImageBox[] {
   return out;
 }
 
-async function runBuiltin(buf: Buffer, title: string, pages: PageModel[], mode: LayoutMode) {
+async function runBuiltin(buf: Buffer, title: string, pages: PageModel[], mode: LayoutMode, unread: ReadonlySet<number> = new Set()) {
   const notes: string[] = [];
   const raster = await rasterAvailable();
-  let model = buildDocModel(pages, { mode, raster });
+  let model = buildDocModel(pages, { mode, raster, unread });
   const regions = renderBoxes(model);
   if (regions.length) {
     const rotation = new Map(pages.filter((p) => p.rotation !== undefined).map((p) => [p.index, p.rotation!] as [number, number]));
     const ok = await renderRegions(buf, regions, undefined, rotation).catch(() => 0);
     if (ok < regions.length) {
       // 渲染失败：退回纯文字重建，保证内容不丢
-      model = buildDocModel(pages, { mode, raster: false });
+      model = buildDocModel(pages, { mode, raster: false, unread });
       notes.push("矢量图 / 公式渲染失败，已按文字方式重建（公式与流程图的版式可能有偏差）。");
     } else {
       const parts = [model.stats.figures ? `${model.stats.figures} 幅矢量图（流程图、曲线图等）` : "", model.stats.equations ? `${model.stats.equations} 个行间公式` : ""].filter(Boolean);
@@ -229,11 +237,39 @@ export async function pdfToDocx(buf: Buffer, opts: { engine?: PdfEngine; title?:
   let data: Buffer;
   let rasterText = "";
   let stats = { pages: pages.length, paragraphs: 0, tables: 0, images: 0, columnPages: 0, figures: 0, equations: 0 };
+  let scanPages: ConversionReport["scanPages"];
   if (engine === "builtin") {
-    const r = await runBuiltin(buf, opts.title ?? "文档", pages, opts.mode ?? "exact");
+    // 没有文字层的整页图片：附图（整页保留成图），还是看得出是成行文字、没读出来的页。后者的整页图在 Word 里
+    // 标上 pdf2word-page N，调用方识别出文字后可以替换
+    const picture: number[] = [], unread: number[] = [];
+    for (const pg of pages) {
+      if (!pg.images.length || pg.spans.reduce((n, sp) => n + sp.text.replace(/\s/g, "").length, 0) >= 10) continue;
+      if (!pg.images.some((im) => im.x1 - im.x0 >= 0.5 * pg.width && im.y1 - im.y0 >= 0.3 * pg.height)) continue;
+      // 拆不开的（彩色、灰度、上下拼条的扫描图）无法判断：按"文字没被读出来"算
+      (pg.scan && !looksLikeText(pg.scan) ? picture : unread).push(pg.index + 1);
+    }
+    const r = await runBuiltin(buf, opts.title ?? "文档", pages, opts.mode ?? "exact", new Set(unread.map((n) => n - 1)));
     data = r.data;
     rasterText = r.rasterText;
-    stats = r.stats;
+    const { scan, ...rest } = r.stats;
+    stats = rest;
+    // 扫描页的说明排在前面：它说的是正文从哪来、哪些页没有转成文字，比版式上的说明要紧
+    // 文字页：拆开扫描图的页和表单页（文字都是 PDF 里已有的识别文字）
+    const text = [...(scan?.textPages ?? []), ...(scan?.formPages ?? [])].sort((a, b) => a - b);
+    if (text.length || picture.length || unread.length) scanPages = { text, picture, unread };
+    if (scan?.textPages.length) {
+      notes.push(`第 ${formatPageRange(scan.textPages)} 页的文字画在整页扫描图上面（识别出的字已从图里抹掉）：整页扫描图不再垫在文字下面，` +
+        [scan.blocks ? `图里剩下的附图、条码等 ${scan.blocks} 处裁成图片放回原位` : "", scan.inline ? `${scan.inline} 处没被识别成文字的字以小图片插回原来的行里（图片名 pdf2word-glyph）` : ""].filter(Boolean).join("，") +
+        (scan.header ? `；每页相同的页眉页脚块（公开号等 ${scan.header} 处）写进了 Word 页眉页脚` : "") +
+        (scan.pageNumbers ? `；印成图的页码换成了页码域` : "") +
+        (scan.furniture ? `；另有 ${scan.furniture} 处页眉页脚块没有保留` : "") +
+        (scan.stray ? `；${scan.stray} 处零散墨迹没有保留` : "") +
+        "。正文来自 PDF 里已有的识别文字，可能有识别错误，重要的数字、日期请对照原 PDF。");
+    }
+    if (scan?.formPages.length) notes.push(`第 ${formatPageRange(scan.formPages)} 页是带表格线的表单：格线保留为垫底的图片，文字按原位置放在文本框里。`);
+    // 整份都是整页图片时前面已有说明；这里只说混在文字页中间的
+    if (picture.length && textChars >= 20 * pages.length) notes.push(`第 ${formatPageRange(picture)} 页没有文字层（附图等），按整页图片保留。`);
+    if (unread.length && textChars >= 20 * pages.length) notes.push(`第 ${formatPageRange(unread)} 页是没有做过文字识别的扫描页，按整页图片保留（图片名 pdf2word-page 加页码），其中的文字没有转成正文。`);
     notes.push(...r.notes);
   } else if (engine === "pdf2docx") {
     data = await runPdf2docx(buf, subset ? info.pages : undefined);
@@ -258,6 +294,7 @@ export async function pdfToDocx(buf: Buffer, opts: { engine?: PdfEngine; title?:
       textTotal: v.total,
       textCoverage: v.coverage,
       missing: v.missing,
+      ...(scanPages ? { scanPages } : {}),
       notes,
       ms: Date.now() - t0,
     },

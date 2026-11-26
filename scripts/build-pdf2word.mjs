@@ -33,7 +33,7 @@ import { fileURLToPath } from "node:url";
  * pdf2word 自己的版本号（与 doc-agent 的版本号无关）：主版本对应契约 v1；契约有任何变化，次版本号加一；
  * 只有引擎更新时修订号加一。发版标签为 pdf2word-v<版本>，CI 会核对标签与这里一致。
  */
-const VERSION = "1.0.3";
+const VERSION = "1.1.0";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const dist = path.join(root, "dist");
@@ -370,6 +370,17 @@ if (canvasHere) {
     assert(buf.includes(Buffer.from("word/media/")), "Word 里没有图片");
     sameAsDev("outlined-table.pdf", documentXml(out));
     return `${j.report.figures} 幅图，${j.report.ms} ms`;
+  });
+
+  check("scan-text.pdf（文字画在整页扫描图上面）：report.scanPages 分清文字页、整页成图的页和没读出来的页，与开发环境一致", () => {
+    const { r, j, out } = convert("scan-text.pdf", ["--mode", "flow"]);
+    assert(r.status === 0 && j.ok, `失败：${r.stdout}`);
+    assert(JSON.stringify(j.report.scanPages) === JSON.stringify({ text: [1, 2, 3, 6], picture: [4], unread: [5] }), `scanPages：${JSON.stringify(j.report.scanPages)}`);
+    assert(j.report.textCoverage === 1, `textCoverage=${j.report.textCoverage}`);
+    const dev = path.join(work, "scan-text-dev.docx");
+    const d = spawnSync(process.execPath, ["--import", "tsx", path.join(root, "cli/pdf2word.ts"), "convert", path.join(fixtures, "scan-text.pdf"), dev, "--mode", "flow"], { cwd: root, encoding: "utf8", timeout: 180_000 });
+    assert(d.status === 0 && documentXml(dev) === documentXml(out), "与开发环境的结果不一致");
+    return `${j.report.images} 张图，${j.report.ms} ms`;
   });
 
   check("副本里的渲染原生模块损坏：engine_incomplete，不静默丢掉矢量内容", () => {

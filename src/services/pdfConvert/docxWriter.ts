@@ -114,7 +114,7 @@ class Writer {
     const id = this.drawingId++;
     const cx = emu(img.x1 - img.x0), cy = emu(img.y1 - img.y0);
     const xml =
-      `<wp:docPr id="${id}" name="图片 ${id}"${img.alt ? ` descr="${escAttr(img.alt)}"` : ""}/><wp:cNvGraphicFramePr><a:graphicFrameLocks noChangeAspect="1"/></wp:cNvGraphicFramePr>` +
+      `<wp:docPr id="${id}" name="${img.role === "glyph" ? `pdf2word-glyph ${id}` : img.role === "page" || img.role === "form" ? `pdf2word-${img.role} ${img.pageNo}` : `图片 ${id}`}"${img.alt ? ` descr="${escAttr(img.alt)}"` : ""}/><wp:cNvGraphicFramePr><a:graphicFrameLocks noChangeAspect="1"/></wp:cNvGraphicFramePr>` +
       `<a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic>` +
       `<pic:nvPicPr><pic:cNvPr id="${id}" name="${name}"/><pic:cNvPicPr/></pic:nvPicPr>` +
       `<pic:blipFill><a:blip r:embed="${rid}"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill>` +
@@ -214,7 +214,8 @@ class Writer {
     // 从第一页开始的节标记"首页不同"
     const first = this.sectCount++ === 0;
     const refs = this.hfParts.length ? this.hfParts.map((h) => `<w:${h.kind}Reference w:type="${h.type}" r:id="${h.rid}"/>`).sort((a, b) => (a.startsWith("<w:header") ? 0 : 1) - (b.startsWith("<w:header") ? 0 : 1)).join("") : "";
-    const pgNum = first && m.pageNumStart !== undefined ? `<w:pgNumType w:start="${m.pageNumStart}"/>` : "";
+    // 页码不能从负数起（原文第 3 页印 1、前两页不印时，起始页码算出来是 -1）：从 0 起，正文页码比原文大 1
+    const pgNum = first && m.pageNumStart !== undefined ? `<w:pgNumType w:start="${Math.max(0, m.pageNumStart)}"/>` : "";
     const titlePg = s.titlePg && this.hfParts.some((h) => h.type === "first") ? "<w:titlePg/>" : "";
     const cols = s.cols > 1
       ? `<w:cols w:num="${s.cols}" w:space="${tw(s.colGap)}" w:equalWidth="0">${s.colWidths.map((w, i) => `<w:col w:w="${tw(w)}"${i < s.colWidths.length - 1 ? ` w:space="${tw(s.colGap)}"` : ""}/>`).join("")}</w:cols>`
