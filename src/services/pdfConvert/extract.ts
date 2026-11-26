@@ -290,6 +290,94 @@ export async function extractPdf(buf: Buffer, opts: { maxPages?: number; pages?:
   return pages;
 }
 
+type SubPath = { kind: "rect"; pts: Array<[number, number]> } | { kind: "poly"; pts: Array<[number, number]>; ctrl: Array<[number, number]>; curved: boolean; closed: boolean };
+
+/**
+ * 一条填充路径里互相重叠的水平矩形按填充规则算出真正涂色的区域。
+ * 网页导出的 PDF（WeasyPrint、浏览器打印）把边框画成"外框 + 内框"的一条路径：奇偶规则（或非零规则下
+ * 内框方向相反）只涂两框之间的一圈。逐个子路径当实心块，外框就成了盖住文字的整块黑底、整行红条。
+ * 不重叠的矩形原样返回（表格各格的底色、柱状图的柱子）；返回 null 表示没有需要处理的重叠
+ */
+export function resolveRectFill(subs: SubPath[], evenOdd: boolean): SubPath[] | null {
+  type R = { x0: number; y0: number; x1: number; y1: number; sign: number; sp: SubPath };
+  const rects: R[] = [];
+  const others: SubPath[] = [];
+  for (const sp of subs) {
+    const p = sp.pts;
+    const pts = sp.kind === "poly" && p.length === 5 && Math.abs(p[0][0] - p[4][0]) < 0.05 && Math.abs(p[0][1] - p[4][1]) < 0.05 ? p.slice(0, 4) : p;
+    const rectLike = pts.length === 4 && !(sp.kind === "poly" && sp.curved) && pts.every((pt, i) => {
+      const q = pts[(i + 1) % 4];
+      return Math.abs(pt[0] - q[0]) < 0.05 || Math.abs(pt[1] - q[1]) < 0.05;
+    });
+    if (!rectLike) { others.push(sp); continue; }
+    const xs = pts.map((q) => q[0]), ys = pts.map((q) => q[1]);
+    const x0 = Math.min(...xs), x1 = Math.max(...xs), y0 = Math.min(...ys), y1 = Math.max(...ys);
+    if (x1 - x0 < 0.01 || y1 - y0 < 0.01) { others.push(sp); continue; }
+    let a = 0;
+    for (let i = 0; i < 4; i++) a += pts[i][0] * pts[(i + 1) % 4][1] - pts[(i + 1) % 4][0] * pts[i][1];
+    rects.push({ x0, y0, x1, y1, sign: a >= 0 ? 1 : -1, sp });
+  }
+  if (rects.length < 2 || rects.length > 400) return null;
+  // 互相重叠（面积 > 0）的矩形归成一组；只有一个矩形的组原样保留
+  const parent = rects.map((_, i) => i);
+  const find = (i: number): number => (parent[i] === i ? i : (parent[i] = find(parent[i])));
+  let any = false;
+  for (let i = 0; i < rects.length; i++) for (let j = i + 1; j < rects.length; j++) {
+    const a = rects[i], b = rects[j];
+    if (Math.min(a.x1, b.x1) - Math.max(a.x0, b.x0) > 0.01 && Math.min(a.y1, b.y1) - Math.max(a.y0, b.y0) > 0.01) { parent[find(i)] = find(j); any = true; }
+  }
+  if (!any) return null;
+  const groups = new Map<number, R[]>();
+  rects.forEach((r, i) => { const g = find(i); if (!groups.has(g)) groups.set(g, []); groups.get(g)!.push(r); });
+  const out: SubPath[] = [...others];
+  for (const g of groups.values()) {
+    if (g.length === 1 || g.length > 200) { out.push(...g.map((r) => r.sp)); continue; }
+    // 按所有边的坐标切成小格，逐格按填充规则判断涂不涂，再把涂色的格合并成矩形
+    const uniq = (v: number[]) => v.sort((a, b) => a - b).filter((x, i, arr) => i === 0 || x - arr[i - 1] > 0.01);
+    const xs = uniq(g.flatMap((r) => [r.x0, r.x1])), ys = uniq(g.flatMap((r) => [r.y0, r.y1]));
+    const on: boolean[][] = [];
+    for (let j = 0; j + 1 < ys.length; j++) {
+      const row: boolean[] = [];
+      const cy = (ys[j] + ys[j + 1]) / 2;
+      for (let i = 0; i + 1 < xs.length; i++) {
+        const cx = (xs[i] + xs[i + 1]) / 2;
+        let n = 0, w = 0;
+        for (const r of g) if (cx > r.x0 && cx < r.x1 && cy > r.y0 && cy < r.y1) { n++; w += r.sign; }
+        row.push(evenOdd ? n % 2 === 1 : w !== 0);
+      }
+      on.push(row);
+    }
+    // 每一行连续涂色的格合成横条，上下几行完全相同的横条再合成一个矩形
+    let open = new Map<string, { x0: number; x1: number; y0: number; y1: number }>();
+    const flush = (keep: Set<string>) => {
+      for (const [k, r] of open) if (!keep.has(k)) {
+        out.push({ kind: "rect", pts: [[r.x0, r.y0], [r.x1, r.y0], [r.x1, r.y1], [r.x0, r.y1]] });
+        open.delete(k);
+      }
+    };
+    for (let j = 0; j < on.length; j++) {
+      const runs: Array<[number, number]> = [];
+      for (let i = 0; i < on[j].length; i++) {
+        if (!on[j][i]) continue;
+        let e = i;
+        while (e + 1 < on[j].length && on[j][e + 1]) e++;
+        runs.push([i, e]);
+        i = e;
+      }
+      const keys = new Set(runs.map(([a, b]) => `${a}:${b}`));
+      flush(keys);
+      for (const [a, b] of runs) {
+        const k = `${a}:${b}`;
+        if (open.has(k)) open.get(k)!.y1 = ys[j + 1];
+        else open.set(k, { x0: xs[a], x1: xs[b + 1], y0: ys[j], y1: ys[j + 1] });
+      }
+    }
+    flush(new Set());
+    open = new Map();
+  }
+  return out;
+}
+
 async function extractPage(page: any, index: number, OPS: any, Util: any): Promise<PageModel> {
   let vp = page.getViewport({ scale: 1 });
   let rotation: number | undefined;
@@ -320,7 +408,7 @@ async function extractPage(page: any, index: number, OPS: any, Util: any): Promi
   interface GState { ctm: M; fill: string; stroke: string; lw: number; trm: number; clip?: { x0: number; y0: number; x1: number; y1: number } }
   let gs: GState = { ctm: [1, 0, 0, 1, 0, 0], fill: "000000", stroke: "000000", lw: 1, trm: 0 };
   const stack: GState[] = [];
-  const textColors: Array<{ ch: string; color: string; fakeBold: boolean; adv: number; spaceBefore: number; font: string; hidden: boolean }> = [];
+  const textColors: Array<{ ch: string; color: string; fakeBold: boolean; adv: number; spaceBefore: number; font: string; hidden: boolean; clip?: { x0: number; y0: number; x1: number; y1: number } }> = [];
   const spaceEm = new Map<string, number>(); // 各字体空格的字宽（em）
   let curFont = "";
   // 字形宽度的单位由字体矩阵决定：多数字体是 1/1000 em，但也有 1/2048（Elsevier 排版的 Charis SIL 等）、
@@ -338,13 +426,27 @@ async function extractPage(page: any, index: number, OPS: any, Util: any): Promi
     return scaleOf.get(name)!;
   };
   let curScale = 0.001;
-  let pendingPath: Array<{ kind: "rect"; pts: Array<[number, number]> } | { kind: "poly"; pts: Array<[number, number]>; ctrl: Array<[number, number]>; curved: boolean; closed: boolean }> = [];
+  let pendingPath: SubPath[] = [];
 
   const toPage = (x: number, y: number) => apply(VT, ...apply(gs.ctm, x, y));
   const scale = () => Math.sqrt(Math.abs(gs.ctm[0] * gs.ctm[3] - gs.ctm[1] * gs.ctm[2])) || 1;
 
-  const paint = (stroke: boolean, fill: boolean) => {
-    for (const sp of pendingPath) {
+  const paint = (stroke: boolean, fill: boolean, evenOdd = false) => {
+    // 填充路径里互相重叠的矩形先按填充规则算出涂色区域（边框的"外框 + 内框"只涂一圈）；
+    // 描边仍沿原来的子路径
+    const resolved = fill ? resolveRectFill(pendingPath, evenOdd) : null;
+    if (resolved) {
+      const all = pendingPath;
+      if (stroke) { pendingPath = all; paintSubs(pendingPath, true, false); }
+      paintSubs(resolved, false, true);
+      pendingPath = [];
+      return;
+    }
+    paintSubs(pendingPath, stroke, fill);
+    pendingPath = [];
+  };
+  const paintSubs = (subs: SubPath[], stroke: boolean, fill: boolean) => {
+    for (const sp of subs) {
       const xs = sp.pts.map((p) => p[0]), ys = sp.pts.map((p) => p[1]);
       const x0 = Math.min(...xs), x1 = Math.max(...xs), y0 = Math.min(...ys), y1 = Math.max(...ys);
       const w = x1 - x0, h = y1 - y0;
@@ -398,7 +500,6 @@ async function extractPage(page: any, index: number, OPS: any, Util: any): Promi
         }
       }
     }
-    pendingPath = [];
   };
 
   // 图像蒙版：单位方块经 ctm、视口变换映射到页面；记下外接框与反向映射，供合成图片
@@ -449,7 +550,7 @@ async function extractPage(page: any, index: number, OPS: any, Util: any): Promi
           const u = uni;
           for (let k = 0; k < u.length; k++) {
             if (!u[k].trim()) continue;
-            textColors.push({ ch: u[k], color: gs.trm === 1 ? gs.stroke : gs.fill, fakeBold: gs.trm === 2, adv: k === 0 ? w : 0, spaceBefore: k === 0 ? pendingSpace : 0, font: curFont, hidden: gs.trm === 3 || gs.trm === 7 });
+            textColors.push({ ch: u[k], color: gs.trm === 1 ? gs.stroke : gs.fill, fakeBold: gs.trm === 2, adv: k === 0 ? w : 0, spaceBefore: k === 0 ? pendingSpace : 0, font: curFont, hidden: gs.trm === 3 || gs.trm === 7, clip: gs.clip });
           }
           pendingSpace = 0;
         }
@@ -485,8 +586,10 @@ async function extractPage(page: any, index: number, OPS: any, Util: any): Promi
         break;
       }
       case OPS.stroke: case OPS.closeStroke: paint(true, false); break;
-      case OPS.fill: case OPS.eoFill: paint(false, true); break;
-      case OPS.fillStroke: case OPS.eoFillStroke: case OPS.closeFillStroke: case OPS.closeEOFillStroke: paint(true, true); break;
+      case OPS.fill: paint(false, true); break;
+      case OPS.eoFill: paint(false, true, true); break;
+      case OPS.fillStroke: case OPS.closeFillStroke: paint(true, true); break;
+      case OPS.eoFillStroke: case OPS.closeEOFillStroke: paint(true, true, true); break;
       case OPS.endPath: pendingPath = []; break;
       case OPS.clip: case OPS.eoClip: {
         // 裁剪区域只取水平 / 竖直的矩形（照片的取景框）；其他形状的裁剪不处理
@@ -662,7 +765,8 @@ async function extractPage(page: any, index: number, OPS: any, Util: any): Promi
     let natural: number | undefined;
     // 一个文字项里颜色 / 伪粗体有变化（行首蓝色的引用编号 "[23]" 接着黑色正文）：pdf.js 按字体合并文字项、不看颜色，
     // 整项取第一个字的颜色会把整行正文染成引用的蓝色。按变化处切成几段，各自的颜色、位置、自然字宽
-    let pieces: Array<{ str: string; x0: number; x1: number; color: string; fakeBold: boolean; natural?: number }> = [];
+    let pieces: Array<{ str: string; x0: number; x1: number; color: string; fakeBold: boolean; natural?: number; clipped?: boolean }> = [];
+    let clippedOut = false;
     // 字距加宽的文字（"a r t i c l e"）：pdf.js 按间距在每个字母之间插入了空格，还原成一个词，加宽由字符间距体现
     const spaced = /^(?:\S ){3,}\S$/u.test(it.str);
     const chars = [...it.str].filter((c) => c.trim());
@@ -717,13 +821,23 @@ async function extractPage(page: any, index: number, OPS: any, Util: any): Promi
           natural = em * size;
           // 同一字形的字宽总是相同，普通文字不会出现偏差；有一半以上的小写字母变宽即为小型大写
           smallCaps = lower >= 3 && wide >= Math.max(2, 0.6 * lower);
-          // 按颜色 / 伪粗体切段（只处理 BMP 字符：操作符流按 UTF-16 码元记录）
-          const keyOf = (j: number) => `${textColors[at + j].color}|${textColors[at + j].fakeBold ? 1 : 0}`;
+          // 落在裁剪框外的字看不见（网页导出的"…………"引导点被 overflow: hidden 截在金额前面）：不转换。
+          // 整段转出来会穿过金额、把一行撑长，逐页保留时挤出页面
+          const clipped = (j: number) => {
+            const c = textColors[at + j].clip;
+            if (!c) return false;
+            const cx = x0 + (width * (starts[j] + textColors[at + j].adv / 2)) / em, cy = baseline - 0.3 * size;
+            return cx < c.x0 - 0.5 || cx > c.x1 + 0.5 || cy < c.y0 - 0.5 * size || cy > c.y1 + 0.5 * size;
+          };
+          const hiddenAt = [...joined].map((_, j) => clipped(j));
+          if (hiddenAt.every(Boolean)) { clippedOut = true; }
+          // 按颜色 / 伪粗体 / 是否在裁剪框外切段（只处理 BMP 字符：操作符流按 UTF-16 码元记录）
+          const keyOf = (j: number) => `${textColors[at + j].color}|${textColors[at + j].fakeBold ? 1 : 0}|${hiddenAt[j] ? 1 : 0}`;
           // 跨过表格竖线的文字项：相邻两格的文字间距不大时，pdf.js 当作词间空格把它们合成一项（"…testing 2027-02-14"），
           // 整项按中心落进左边一格、右边一格变空。在竖线所在的词间空白处切开
           const mid = baseline - 0.3 * size;
           const vlines = model.segs.filter((g) => !g.horizontal && g.x0 > x0 && g.x1 < x0 + width && g.y1 - g.y0 >= 0.8 * size && g.y0 <= mid && g.y1 >= mid);
-          if (!spaced && !/[\ud800-\udfff]/.test(it.str) && joined.length > 1 && (vlines.length || [...joined].some((_, j) => j > 0 && keyOf(j) !== keyOf(j - 1)))) {
+          if (!spaced && !/[\ud800-\udfff]/.test(it.str) && joined.length > 1 && !clippedOut && (vlines.length || [...joined].some((_, j) => j > 0 && keyOf(j) !== keyOf(j - 1)))) {
             // 每个非空白字符在 it.str 中的下标，以及它前面 it.str 里的空白段数（TJ 位移代替空格时据此补上空格宽度）
             const idx: number[] = [], gapsBefore: number[] = [];
             let gaps = 0, prevSpace = false;
@@ -748,8 +862,9 @@ async function extractPage(page: any, index: number, OPS: any, Util: any): Promi
                 str: it.str.slice(k === 0 ? 0 : idx[j], next === undefined ? it.str.length : idx[next]),
                 x0: x0 + width * f0, x1: x0 + width * f1,
                 color: textColors[at + j].color, fakeBold: textColors[at + j].fakeBold, natural: natural! * (f1 - f0),
+                clipped: hiddenAt[j],
               };
-            });
+            }).filter((pc) => !pc.clipped);
           }
         }
       } else if (textColors[ci]) {
@@ -757,6 +872,7 @@ async function extractPage(page: any, index: number, OPS: any, Util: any): Promi
       }
     }
 
+    if (clippedOut) continue;
     if (!pieces.length) pieces = [{ str: it.str, x0, x1: x0 + width, color, fakeBold, natural }];
     // 扫描图上的 OCR 识别层：看不见的文字压在整页扫描图上，转成正文会与图里的字重叠成两层；不转换，只计数
     if (hidden) {

@@ -1474,7 +1474,9 @@ function buildTable(t: TableDraft, fills: FillRect[], originX: number, ctx: Ctx)
         blocks: [],
       };
       const fill = fills.find((f) => f.x0 <= box.x0 + 2 && f.x1 >= box.x1 - 2 && f.y0 <= box.y0 + 2 && f.y1 >= box.y1 - 2)
-        ?? fills.find((f) => (Math.min(f.x1, box.x1) - Math.max(f.x0, box.x0)) * (Math.min(f.y1, box.y1) - Math.max(f.y0, box.y0)) > 0.8 * (box.x1 - box.x0) * (box.y1 - box.y0));
+        // 重叠面积的两条边先各自截到 0：横竖都不重叠时两个负数相乘是正数，远处的色块会被当成这一格的底色
+        // （表单标题旁的红色竖条把一整张表染红、下一张表的绿色表头染到上一张表上）
+        ?? fills.find((f) => Math.max(0, Math.min(f.x1, box.x1) - Math.max(f.x0, box.x0)) * Math.max(0, Math.min(f.y1, box.y1) - Math.max(f.y0, box.y0)) > 0.8 * (box.x1 - box.x0) * (box.y1 - box.y0));
       if (fill) cell.shade = fill.color;
 
       if (vm !== "continue") {
@@ -1638,6 +1640,19 @@ export function detectGutter(lines: Line[], r: Region): { g0: number; g1: number
   const fullR = Rs.filter((p) => startR(p) >= g1 - tol(p.l) && Math.max(...p.R.map((s) => s.x1)) - startR(p) >= 0.6 * colR).length;
   const need = (n: number) => Math.min(3, Math.ceil(0.5 * n));
   if (fullL < need(Ls.length) || fullR < need(Rs.length)) return null;
+  // 一栏正文的行都从同一个左边界起头：栏的左边界（首行缩进、列表缩进差一两个字），或绕排在图旁边的那条边界。
+  // 无框表格的右半边（发票明细的数量、单价、金额，右上角的发票号、日期）各行起点参差不齐：这是表格的列，不是分栏
+  const lead = (p: { l: Line }, col: number) => Math.max(2 * p.l.size, 0.15 * col);
+  const modeOf = (xs: number[]) => {
+    let best = xs[0] ?? 0, n = 0;
+    for (const x of xs) { const c = xs.filter((y) => Math.abs(y - x) <= 3).length; if (c > n) { n = c; best = x; } }
+    return best;
+  };
+  const startL = (p: { L: Span[] }) => Math.min(...p.L.map((s) => s.x0));
+  const x0L = edgeOf(Ls.map(startL), "min"), modeL = modeOf(Ls.map(startL)), modeR = modeOf(Rs.map(startR));
+  const alignedL = Ls.filter((p) => startL(p) <= x0L + lead(p, colL) || Math.abs(startL(p) - modeL) <= 3).length;
+  const alignedR = Rs.filter((p) => (startR(p) >= g1 - 20 && startR(p) <= g1 + lead(p, colR)) || Math.abs(startR(p) - modeR) <= 3).length;
+  if (alignedL < 0.6 * Ls.length || alignedR < 0.6 * Rs.length) return null;
   return { g0, g1, x: best.x };
 }
 
