@@ -45,6 +45,8 @@ type PermissionResponse = import("../src/bridge/protocol.js").PermissionResponse
 
 const results: Array<{ name: string; ok: boolean; err?: string }> = [];
 async function test(name: string, fn: () => unknown | Promise<unknown>) {
+  // TEST_FILTER=关键词：只跑名字里含这个词的测试（调试单个功能时用）
+  if (process.env.TEST_FILTER && !name.includes(process.env.TEST_FILTER)) return;
   try {
     await fn();
     results.push({ name, ok: true });
@@ -608,6 +610,44 @@ await test("期刊里蓝色的引用编号：只有编号是蓝色，同一文�
     for (const t of ["[18]", "[23]", "[29]", "[27], [28]"]) assert(blue.includes(t), `${mode}：${t} 应是蓝色：${JSON.stringify(blue)}`);
     assert(runs.filter((r) => /While the transformer method|In particular, TransUNet and TransFuse/.test(r.text)).every((r) => !r.blue), `${mode}：引用后面的正文不应是蓝色`);
     assert(/<w:t[^>]*>\[23\]<\/w:t><\/w:r><w:r>(?:(?!<\/w:r>)[\s\S])*<w:t[^>]*>\. While/.test(xml), `${mode}：[23] 与后面的正文紧挨着，中间不多出空格`);
+  }
+});
+
+await test("旋转文字（竖排表头、页边竖排说明、竖排标签、斜放的半透明水印）都转换并计入文字完整性：表头写成竖排单元格，其余按原方向放进文本框（两种模式）", async () => {
+  const { pdfToDocx } = await import("../src/services/pdfConvert/index.js");
+  const pdf = await fixture("rotated-text.pdf");
+  const textOf = (x: string) => (x.match(/<w:t[^>]*>([^<]*)<\/w:t>/g) ?? []).map((t) => t.replace(/<[^>]+>/g, "")).join("");
+  for (const mode of ["exact", "flow"] as const) {
+    const { data, report } = await pdfToDocx(pdf, { mode });
+    eq(report.textCoverage, 1, `${mode}：文字完整性（旋转文字计入原文）`);
+    assert(report.notes.some((n) => n.includes("7 行旋转文字") && n.includes("1 行是斜放的")), `${mode}：报告应说明旋转文字的转换：${report.notes.join(" | ")}`);
+    assert(!report.notes.some((n) => n.includes("未转换")), `${mode}：不应再说旋转文字未转换`);
+    const xml = new ZipPackage(data).readText("word/document.xml");
+    // 表头：竖排单元格（从下往上读），不是压在表格上的文本框
+    const cells = xml.match(/<w:tc>[\s\S]*?<\/w:tc>/g) ?? [];
+    for (const q of ["Quarter one", "Quarter two", "Quarter three", "Quarter four"]) {
+      assert(cells.some((c) => textOf(c) === q && c.includes('<w:textDirection w:val="btLr"/>')), `${mode}：表头"${q}"应写成竖排单元格`);
+    }
+    const boxes = (xml.match(/<wp:anchor [\s\S]*?<\/wp:anchor>/g) ?? []).filter((b) => b.includes("<w:txbxContent>"));
+    const box = (t: string) => boxes.find((b) => textOf(b) === t);
+    // 竖排的：竖排文本框（Word、LibreOffice 都能正确显示），从下往上读的是 vert270
+    const note = box("Internal draft prepared by the finance office"), label = box("Figures unaudited");
+    assert(!!note && note.includes('vert="vert270"') && !/a:xfrm rot=/.test(note), `${mode}：页边说明应是从下往上读的竖排文本框`);
+    assert(!!label && label.includes('vert="vert"') && !/a:xfrm rot=/.test(label), `${mode}：竖排标签应是从上往下读的竖排文本框`);
+    // 可编辑排版：正文旁边的标签挂在段落上随文字移动；页边的说明按页面坐标
+    if (mode === "flow") {
+      assert(label!.includes('<wp:positionV relativeFrom="paragraph">'), "flow：正文旁的竖排标签应相对段落定位");
+      assert(note!.includes('<wp:positionV relativeFrom="page">'), "flow：页边说明按页面坐标定位");
+    }
+    // 斜放的水印：整个文本框按原角度旋转（−35° → 顺时针 325°），字母之间没有 pdf.js 插的空格，放在文字下方，半透明色折算成浅色
+    const wm = box("CONFIDENTIAL");
+    assert(!!wm, `${mode}：水印应转换成"CONFIDENTIAL"（没有插入的空格）：${boxes.map(textOf).join(" | ")}`);
+    const rot = Number(wm!.match(/a:xfrm rot="(\d+)"/)?.[1]);
+    assert(Math.abs(rot - 325 * 60000) < 60000, `${mode}：水印应旋转 325°：${rot}`);
+    assert(wm!.includes('behindDoc="1"'), `${mode}：水印应放在文字下方`);
+    const color = wm!.match(/<w:color w:val="([0-9A-F]{6})"\/>/)?.[1] ?? "";
+    assert([0, 2, 4].every((i) => parseInt(color.slice(i, i + 2), 16) >= 0xc0), `${mode}：15% 透明度的红色水印应折算成浅色：${color}`);
+    assert(/<w:spacing w:val="\d+"\/>/.test(wm!), `${mode}：水印的字距加宽应保留为字符间距`);
   }
 });
 
@@ -1188,7 +1228,7 @@ await test("所有夹具 PDF：两种排版方式都不报错、文字完整；L
   const run = promisify(execFile);
   const soffice = process.env.SOFFICE_PATH || "soffice";
   const hasSoffice = await run(soffice, ["--version"]).then(() => true, () => false);
-  const names = ["columns", "journal", "figures", "math", "journal-front", "journal-eq", "journal-fig", "bios", "colstart", "signature", "citecolor", "texpaper", "contract-cn", "scan-letter", "furniture-cn", "bates"];
+  const names = ["columns", "journal", "figures", "math", "journal-front", "journal-eq", "journal-fig", "bios", "colstart", "signature", "citecolor", "texpaper", "contract-cn", "scan-letter", "furniture-cn", "bates", "rotated-text"];
   const dir = await fs.mkdtemp(path.join(tmp, "pages-"));
   const bad: string[] = [];
   for (const name of names) {

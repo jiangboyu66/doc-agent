@@ -235,10 +235,14 @@ export interface PageAnchor {
   kind: "pic" | "text" | "shape";
   /** 相对页面 / 页边距的位置与尺寸（pt） */
   x: number; y: number; w: number; h: number;
-  relH: "page" | "margin"; relV: "page" | "margin";
+  /** relV = paragraph：y 相对所在段落的顶部（流式排版里随段落移动的旋转文字） */
+  relH: "page" | "margin"; relV: "page" | "margin" | "paragraph";
   behind: boolean;
   /** 文本框的段落数 */
   paras?: number;
+  /** 旋转文字：竖排文本框（vert 从上往下读、vert270 从下往上读），或整个框绕中心顺时针旋转的度数 */
+  vert?: "vert" | "vert270";
+  rot?: number;
   /** 图形：直线 / 矩形的线色、填充色、线宽 */
   shape?: { prst: string; fill?: string; line?: string; lw: number; flipV: boolean };
 }
@@ -270,7 +274,8 @@ function liftPageAnchors(xml: string): { xml: string; anchors: PageAnchor[] } {
     const ph = kid(a, "positionH"), pv = kid(a, "positionV");
     const relH = ph?.getAttribute("relativeFrom"), relV = pv?.getAttribute("relativeFrom");
     const offH = kid(ph, "posOffset"), offV = kid(pv, "posOffset");
-    if (!offH || !offV || !(relH === "page" || relH === "margin") || !(relV === "page" || relV === "margin")) continue;
+    const txbx0 = desc(a, "txbxContent")[0];
+    if (!offH || !offV || !(relH === "page" || relH === "margin") || !(relV === "page" || relV === "margin" || (relV === "paragraph" && txbx0))) continue;
     const run = up(a, "r"), para = up(a, "p");
     if (!run || !para || !run.parentNode) continue;
     const ext = kid(a, "extent");
@@ -302,6 +307,13 @@ function liftPageAnchors(xml: string): { xml: string; anchors: PageAnchor[] } {
         para.parentNode!.insertBefore(p, at.nextSibling); at = p;
       });
       item.kind = "text"; item.paras = ps.length;
+      // 相对段落定位：在所在段落里放一个标记，渲染后按这一段的位置定位
+      if (relV === "paragraph") { const [s0, e0] = bookmark(`_pvh_${item.k}`); run.parentNode.insertBefore(s0, run); run.parentNode.insertBefore(e0, run); }
+      const bodyPr = desc(a, "bodyPr")[0], xfrm = desc(a, "xfrm")[0];
+      const vert = bodyPr?.getAttribute("vert");
+      if (vert === "vert" || vert === "vert270") item.vert = vert;
+      const rot = Number(xfrm?.getAttribute("rot")) / 60000;
+      if (rot) item.rot = rot;
       drawing?.remove();
     } else if (gd && desc(gd, "wsp").length) {
       // 直线、矩形等图形
@@ -331,7 +343,15 @@ export function placePageAnchors(root: HTMLElement, anchors: PageAnchor[]): void
     const cs = getComputedStyle(sec);
     const px2pt = 0.75;
     const dx = it.relH === "margin" ? parseFloat(cs.paddingLeft) * px2pt : 0;
-    const dy = it.relV === "margin" ? parseFloat(cs.paddingTop) * px2pt : 0;
+    let dy = it.relV === "margin" ? parseFloat(cs.paddingTop) * px2pt : 0;
+    if (it.relV === "paragraph") {
+      // 所在段落相对页面的位置（offsetTop 不受预览缩放的影响）
+      const host = root.querySelector<HTMLElement>(`[id="_pvh_${it.k}"]`)?.closest<HTMLElement>("p");
+      let y = 0, e: HTMLElement | null = host ?? null;
+      while (e && e !== sec) { y += e.offsetTop; e = e.offsetParent as HTMLElement | null; }
+      if (!host || e !== sec) continue;
+      dy = y * px2pt;
+    }
     const box = document.createElement("div");
     box.className = "pv-abs";
     box.style.cssText = `position:absolute;left:${it.x + dx}pt;top:${it.y + dy}pt;width:${it.w}pt;min-height:${it.h}pt;z-index:${it.behind ? 0 : 2};pointer-events:none;`;
@@ -345,6 +365,17 @@ export function placePageAnchors(root: HTMLElement, anchors: PageAnchor[]): void
         if (!p) continue;
         p.style.margin = "0";
         box.appendChild(p);
+      }
+      // 旋转文字：竖排文本框按竖排排版（从下往上读的再转半圈），其余角度整个框绕中心旋转
+      if (it.vert) {
+        box.style.height = `${it.h}pt`;
+        box.style.writingMode = "vertical-rl";
+        box.style.textOrientation = "sideways";
+        if (it.vert === "vert270") box.style.transform = "rotate(180deg)";
+      } else if (it.rot) {
+        box.style.height = `${it.h}pt`;
+        box.style.transform = `rotate(${it.rot}deg)`;
+        box.style.transformOrigin = "50% 50%";
       }
     } else if (it.shape) {
       const sh = it.shape;

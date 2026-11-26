@@ -190,20 +190,24 @@ class Writer {
     );
   }
 
-  /** 绝对定位的文本框（页眉页脚等）：无边框、无填充、零内边距、不参与文字环绕 */
-  private textBox(tb: { x: number; y: number; w: number; h: number; para: Para }): string {
+  /**
+   * 绝对定位的文本框（页眉页脚等）：无边框、无填充、零内边距、不参与文字环绕。
+   * 旋转文字：vert / vert270 是竖排文本框（框不转）；rot 是整个框绕中心顺时针旋转，位置和大小是旋转前的框
+   */
+  private textBox(tb: { x: number; y: number; w: number; h: number; para: Para; rot?: number; vert?: "vert" | "vert270"; behind?: boolean; inPara?: boolean }): string {
     const id = this.drawingId++;
     const cx = emu(tb.w), cy = emu(tb.h);
+    const rot = tb.rot ? Math.round(tb.rot * 60000) % 21600000 : 0;
     return (
-      `<w:r><w:drawing><wp:anchor distT="0" distB="0" distL="0" distR="0" simplePos="0" relativeHeight="${251658240 + id}" behindDoc="0" locked="0" layoutInCell="1" allowOverlap="1">` +
+      `<w:r><w:drawing><wp:anchor distT="0" distB="0" distL="0" distR="0" simplePos="0" relativeHeight="${251658240 + id}" behindDoc="${tb.behind ? 1 : 0}" locked="0" layoutInCell="1" allowOverlap="1">` +
       `<wp:simplePos x="0" y="0"/><wp:positionH relativeFrom="page"><wp:posOffset>${emu(tb.x)}</wp:posOffset></wp:positionH>` +
-      `<wp:positionV relativeFrom="page"><wp:posOffset>${emu(tb.y)}</wp:posOffset></wp:positionV>` +
+      `<wp:positionV relativeFrom="${tb.inPara ? "paragraph" : "page"}"><wp:posOffset>${emu(tb.y)}</wp:posOffset></wp:positionV>` +
       `<wp:extent cx="${cx}" cy="${cy}"/><wp:effectExtent l="0" t="0" r="0" b="0"/><wp:wrapNone/>` +
       `<wp:docPr id="${id}" name="文本框 ${id}"/><wp:cNvGraphicFramePr/>` +
       `<a:graphic><a:graphicData uri="http://schemas.microsoft.com/office/word/2010/wordprocessingShape"><wps:wsp><wps:cNvSpPr txBox="1"/>` +
-      `<wps:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="${cx}" cy="${cy}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom><a:noFill/><a:ln><a:noFill/></a:ln></wps:spPr>` +
+      `<wps:spPr><a:xfrm${rot ? ` rot="${rot}"` : ""}><a:off x="0" y="0"/><a:ext cx="${cx}" cy="${cy}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom><a:noFill/><a:ln><a:noFill/></a:ln></wps:spPr>` +
       `<wps:txbx><w:txbxContent>${this.para(tb.para)}</w:txbxContent></wps:txbx>` +
-      `<wps:bodyPr rot="0" vert="horz" wrap="none" lIns="0" tIns="0" rIns="0" bIns="0" anchor="t" anchorCtr="0"><a:noAutofit/></wps:bodyPr>` +
+      `<wps:bodyPr rot="0" vert="${tb.vert ?? "horz"}" wrap="none" lIns="0" tIns="0" rIns="0" bIns="0" anchor="t" anchorCtr="0"><a:noAutofit/></wps:bodyPr>` +
       `</wps:wsp></a:graphicData></a:graphic></wp:anchor></w:drawing></w:r>`
     );
   }
@@ -282,6 +286,7 @@ class Writer {
     else if (c.vMerge === "continue") pr.push("<w:vMerge/>");
     pr.push(`<w:tcBorders>${this.border("top", c.borders.top)}${this.border("left", c.borders.left)}${this.border("bottom", c.borders.bottom)}${this.border("right", c.borders.right)}</w:tcBorders>`);
     if (c.shade) pr.push(`<w:shd w:val="clear" w:color="auto" w:fill="${c.shade}"/>`);
+    if (c.textDirection) pr.push(`<w:textDirection w:val="${c.textDirection}"/>`);
     if (c.vAlign !== "top") pr.push(`<w:vAlign w:val="${c.vAlign}"/>`);
     const content = c.blocks.length ? c.blocks.map((p) => this.para(p)).join("") : this.para({ kind: "p", runs: [], align: "left", indLeft: 0, indRight: 0, firstLine: 0, spaceBefore: 0, lineHeight: 12, tabs: [], size: 10 });
     return `<w:tc><w:tcPr>${pr.join("")}</w:tcPr>${content}</w:tc>`;

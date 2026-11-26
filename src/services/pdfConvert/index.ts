@@ -76,7 +76,8 @@ function docxText(buf: Buffer): string {
 }
 
 function verify(pages: PageModel[], docx: Buffer, rasterText = "") {
-  const src = charCounts(pages.flatMap((p) => p.spans.filter((s) => !s.img).map((s) => s.text)).join(""));
+  // 旋转文字（竖排表头、页边竖排说明、水印 / 印章、坐标轴标题）也是原文的一部分：转成文本框、竖排单元格，或随图片保存在替代文字里
+  const src = charCounts(pages.flatMap((p) => [...p.spans.filter((s) => !s.img).map((s) => s.text), ...(p.rotated ?? []).map((t) => t.text)]).join(""));
   // 渲染为图片的区域：文字保存在替代文字中，计为已保留
   const out = charCounts(docxText(docx) + rasterText);
   // 并入正文字母的重音符号变成了组合字符（F + ˆ → F̂）：按原来的重音符号计数
@@ -145,7 +146,11 @@ async function runBuiltin(buf: Buffer, title: string, pages: PageModel[], mode: 
     ? `${model.stats.vectorShapes} 处零散的矢量图形（不构成完整的图）未能转换。`
     // 不能渲染时，完整的矢量图、文字被转成轮廓的表格也都算在这里：明确说出来，而不是混在"零散图形"里
     : `${model.stats.vectorShapes} 处矢量图形未能转换：本环境不能渲染，矢量图、以轮廓绘制文字的表格和公式没有保留，请对照原 PDF。`);
-  if (model.stats.rotatedText) notes.push(`${model.stats.rotatedText} 段旋转文字未转换。`);
+  if (model.stats.rotatedText) {
+    const slanted = model.stats.rotatedSlanted ?? 0;
+    notes.push(`${model.stats.rotatedText} 行旋转文字（竖排表头、页边竖排说明、斜放的水印 / 印章等）已转换：表格里的竖排表头写成竖排单元格，其余放在按原方向摆放的文本框里` +
+      (slanted ? `；其中 ${slanted} 行是斜放的，Word / WPS 里按原角度显示，LibreOffice 里显示为横排` : "") + "。");
+  }
   if (model.stats.columnPages) notes.push(`${model.stats.columnPages} 页检测到双栏排版，已用 Word 分栏还原。`);
   if (model.notes) notes.push(...model.notes);
   return { data, stats: model.stats, notes, rasterText: model.rasterText };

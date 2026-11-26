@@ -10,10 +10,10 @@
  *   - 每一页以分页开始，页与页之间不会互相推挤。
  */
 
-import type { FillRect, ImageBox, PageModel, PathBox, Seg, Span } from "./extract.js";
+import type { FillRect, ImageBox, PageModel, PathBox, RotatedText, Seg, Span } from "./extract.js";
 import { collectHyphenated, collectWords, isSoftHyphen, wordCounts } from "../../documents/hyphen.js";
 import { settleFurniture, type Furniture, type FurniturePick } from "./furniture.js";
-import { detectDropCaps, detectEquations, detectIconPaths, detectFigures, detectImageGrids, detectMaskInk, rawBase, rasterBox, removeInside, spansText, textHighlights, type Box, type MathCtx } from "./raster.js";
+import { detectDropCaps, detectEquations, detectIconPaths, detectFigures, detectImageGrids, detectMaskInk, rawBase, rasterBox, removeInside, rotatedTextIn, spansText, textHighlights, type Box, type MathCtx } from "./raster.js";
 import type { ScanPiece } from "./scanLayer.js";
 
 export interface Run {
@@ -80,8 +80,15 @@ export interface Para {
   size: number;
   /** 分隔线、竖线、色块等图形：页面绝对坐标，不参与文字流 */
   shapes?: Array<{ kind: "line" | "rect"; x0: number; y0: number; x1: number; y1: number; width: number; color: string; behind: boolean }>;
-  /** 页眉页脚等：以页面绝对坐标定位的文本框（挂在页首锚点段落上，不参与文字流，不会被挤动） */
-  textBoxes?: Array<{ x: number; y: number; w: number; h: number; para: Para }>;
+  /**
+   * 页眉页脚等：以页面绝对坐标定位的文本框（挂在页首锚点段落上，不参与文字流，不会被挤动）。
+   * 旋转文字（页边竖排说明、斜放的水印 / 印章）按原角度摆放：
+   *   vert：竖排的文本框（框本身不转），vert 从上往下读、vert270 从下往上读——Word、LibreOffice 都能正确显示；
+   *   rot：其余角度，文本框绕中心顺时针旋转的度数，x / y / w / h 是旋转前的框（LibreOffice 不转框里的字，只有 Word / WPS 显示正确）
+   */
+  textBoxes?: Array<{ x: number; y: number; w: number; h: number; para: Para; rot?: number; vert?: "vert" | "vert270"; behind?: boolean; inPara?: boolean }>;
+  /** 本段第一行的顶边在原页面上的纵坐标（流式模式下把旋转文字的文本框挂到段落上时定位用；inPara 的文本框 y 相对段落顶部） */
+  srcTop?: number;
   /** 逐行一致模式：每一行的 run 范围、自然宽度与可用宽度，用于最终的"不折行"校验 */
   lineFits?: Array<{ start: number; end: number; natural: number; chars: number; avail: number }>;
   /** 独占一段的行内图片（行间公式、图）：随文字流移动，前后文字增减时不会与文字重叠 */
@@ -108,6 +115,8 @@ export interface Cell {
   borders: { top: Border | null; left: Border | null; bottom: Border | null; right: Border | null };
   shade?: string;
   vAlign: "top" | "center" | "bottom";
+  /** 竖排单元格（表头的竖排文字）：btLr 从下往上读，tbRl 从上往下读 */
+  textDirection?: "btLr" | "tbRl";
   blocks: Para[];
 }
 
@@ -143,6 +152,8 @@ export interface DocModel {
   bodySize: number;
   stats: {
     pages: number; paragraphs: number; tables: number; images: number; vectorShapes: number; rotatedText: number; columnPages: number; figures: number; equations: number; inlineMath?: number;
+    /** 转换了的旋转文字中斜放的（不是竖排）行数：Word / WPS 按原角度显示，LibreOffice 不转文本框里的字 */
+    rotatedSlanted?: number;
     /**
      * 扫描页的位图层（可编辑排版）：拆开的文字页、格线垫底 + 文字放进文本框的表单页（页码从 1 起）；作为行内图片插回的漏认字、
      * 没保留的页眉页脚块与零散墨迹的个数，换成页码文字的页数
@@ -389,6 +400,8 @@ interface TableDraft {
   xs: number[]; ys: number[];
   hs: HSeg[]; vs: VSeg[];
   spans: Span[];
+  /** 落在表格里的旋转文字（竖排表头等） */
+  rotated?: RotLine[];
 }
 
 function cluster(values: number[], tol: number): number[] {
@@ -1358,6 +1371,7 @@ function layoutLines(lines: Line[], r: Region, cursor: number, ctx: Ctx, floats?
     const p = buildPara(group, r, edge, ctx);
     const top = group[0].baseline - baselineOffset(p.lineHeight, p.size);
     p.spaceBefore = Math.max(0, top - cursor);
+    p.srcTop = top;
     // 旁边的浮动图片挂在这一段上：相对栏左边界、段落顶部定位
     for (const l of group) for (const img of floats?.get(l) ?? []) (p.floats ??= []).push({ img, dx: img.x0 - r.x0, dy: img.y0 - top });
     paras.push(p);
@@ -1390,6 +1404,136 @@ function lineBoxes(l: Line, ctx: Ctx): NonNullable<Para["textBoxes"]> {
     p.lineHeight = lh;
     return { x: gl.x0, y: gl.baseline - baselineOffset(lh, big), w, h: lh, para: p };
   });
+}
+
+// ---------------------------------------------------------------------------
+// 旋转文字：表头竖排、页边竖排说明、斜放的水印 / 印章
+// ---------------------------------------------------------------------------
+
+/** 一行旋转文字：同一角度、同一条基线上首尾相接的片段 */
+export interface RotLine {
+  /** 基线方向：页面坐标（y 向下）里顺时针的度数，−90 是从下往上读 */
+  angle: number;
+  /** 基线起点、沿基线的长度、字号 */
+  ox: number; oy: number; len: number; size: number;
+  /** 起点沿基线方向的坐标 s、基线到原点沿文字"下方"法向的距离 d：成行、排序用 */
+  s: number; d: number;
+  parts: Array<{ t: RotatedText; sep: string }>;
+  text: string;
+  x0: number; y0: number; x1: number; y1: number;
+}
+
+const rad = (deg: number) => (deg * Math.PI) / 180;
+/** 基线方向 u、文字"下方"的法向 n（页面坐标） */
+const rotAxes = (angle: number) => {
+  const ux = Math.cos(rad(angle)), uy = Math.sin(rad(angle));
+  return { ux, uy, nx: -uy, ny: ux };
+};
+
+/** 旋转文字片段成行：角度相同（±1.5°）、基线重合、沿基线首尾相接；重复描画的同一段字（假粗体）只留一份 */
+export function rotatedLines(items: RotatedText[]): RotLine[] {
+  const geo = items.filter((t) => t.text.trim()).map((t) => {
+    const { ux, uy, nx, ny } = rotAxes(t.angle);
+    return { t, s: t.ox * ux + t.oy * uy, d: t.ox * nx + t.oy * ny };
+  }).sort((a, b) => Math.round(a.t.angle * 2) - Math.round(b.t.angle * 2) || a.s - b.s);
+  const out: RotLine[] = [];
+  for (const g of geo) {
+    const t = g.t;
+    const same = (l: RotLine) => Math.abs(l.angle - t.angle) <= 1.5 && Math.abs(l.d - g.d) < 0.35 * Math.max(l.size, t.size);
+    if (out.some((l) => same(l) && l.parts.some((p) => p.t.text === t.text && Math.abs(p.t.ox - t.ox) + Math.abs(p.t.oy - t.oy) < 0.3 * t.size))) continue;
+    const l = out.find((l) => {
+      const gap = g.s - (l.s + l.len), sz = Math.max(l.size, t.size);
+      return same(l) && gap > -0.5 * sz && gap < 1.2 * sz;
+    });
+    if (!l) {
+      out.push({ angle: t.angle, ox: t.ox, oy: t.oy, len: t.len, size: t.size, s: g.s, d: g.d, parts: [{ t, sep: "" }], text: t.text, x0: t.x0, y0: t.y0, x1: t.x1, y1: t.y1 });
+      continue;
+    }
+    const gap = g.s - (l.s + l.len);
+    const sep = gap > 0.15 * Math.max(l.size, t.size) && !/\s$/.test(l.text) && !/^\s/.test(t.text) ? " " : "";
+    l.parts.push({ t, sep });
+    l.text += sep + t.text;
+    l.len = Math.max(l.len, g.s + t.len - l.s);
+    l.size = Math.max(l.size, t.size);
+    l.x0 = Math.min(l.x0, t.x0); l.y0 = Math.min(l.y0, t.y0); l.x1 = Math.max(l.x1, t.x1); l.y1 = Math.max(l.y1, t.y1);
+  }
+  for (const l of out) l.text = l.text.trim();
+  return out;
+}
+
+function rotatedRuns(l: RotLine): Run[] {
+  const runs: Run[] = [];
+  l.parts.forEach(({ t, sep }, i) => {
+    let text = sep + t.text;
+    if (i === 0) text = text.replace(/^\s+/, "");
+    if (i === l.parts.length - 1) text = text.replace(/\s+$/, "");
+    const last = runs[runs.length - 1];
+    // 字距加宽写成 tracking（实测的字符间距）：最后统一换算字符间距时优先采用
+    if (last && last.font === t.family && last.size === t.size && last.bold === t.bold && last.italic === t.italic && last.color === t.color && last.tracking === t.tracking) last.text += text;
+    else if (text) runs.push({ text, font: t.family, size: t.size, bold: t.bold, italic: t.italic, color: t.color, ...(t.tracking !== undefined ? { tracking: t.tracking } : {}) });
+  });
+  return runs;
+}
+
+/**
+ * 一行旋转文字的文本框：按原角度摆放，基线、起点与原文重合。
+ * 框内一行、固定行高 h，基线在行顶下方 h − 0.22 字号（与页眉页脚文本框相同）；文字居中，换了字体宽度不同时两头各差一半。
+ * 竖排（±90°）用竖排文本框：框不转，宽高对调，中心不变；其余角度整个框绕中心旋转
+ */
+function rotatedBox(l: RotLine): NonNullable<Para["textBoxes"]>[number] {
+  const { ux, uy, nx, ny } = rotAxes(l.angle);
+  const h = 1.25 * l.size, w = l.len + 0.8 * l.size;
+  const off = h / 2 - 0.22 * l.size; // 基线在框中心"下方"的距离
+  const cx = l.ox + (ux * l.len) / 2 - nx * off, cy = l.oy + (uy * l.len) / 2 - ny * off;
+  const para: Para = { kind: "p", runs: rotatedRuns(l), align: "center", indLeft: 0, indRight: 0, firstLine: 0, spaceBefore: 0, lineHeight: h, tabs: [], size: l.size };
+  const deg = ((l.angle % 360) + 360) % 360;
+  if (Math.abs(deg - 90) <= 1 || Math.abs(deg - 270) <= 1) return { x: cx - h / 2, y: cy - w / 2, w: h, h: w, para, vert: deg < 180 ? "vert" : "vert270" };
+  return { x: cx - w / 2, y: cy - h / 2, w, h, para, rot: deg };
+}
+
+/**
+ * 单元格里的旋转文字。只有竖排文字（±90°）、没有横排文字的格（竖排表头）写成竖排单元格：
+ * 文字随表格移动、可以直接编辑。每行一段：沿阅读方向的位置用段落对齐 / 缩进还原，各行之间的距离用固定行高 + 段前距还原
+ * （竖排格里段落从字顶一侧往字底一侧排：btLr 从左往右、tbRl 从右往左）。
+ * 其余（与横排文字混排、斜放的、比格子还长的——原文溢出格子，竖排格会把它折成几行）：逐页保留时按原角度放进页面上的文本框，
+ * 可编辑排版时竖排的照样写成竖排格（折行也能读），斜放的作为横排段落接在格内文字后面
+ */
+function placeRotated(cell: Cell, rots: RotLine[], box: { x0: number; y0: number; x1: number; y1: number }, hasText: boolean, ctx: Ctx): number {
+  const sign = Math.sign(rots[0].angle);
+  const { ux, uy, nx, ny } = rotAxes(sign * 90);
+  const corners = [[box.x0, box.y0], [box.x1, box.y0], [box.x0, box.y1], [box.x1, box.y1]];
+  const sOf = (x: number, y: number) => x * ux + y * uy, dOf = (x: number, y: number) => x * nx + y * ny;
+  const s0 = Math.min(...corners.map(([x, y]) => sOf(x, y))), s1 = Math.max(...corners.map(([x, y]) => sOf(x, y)));
+  const d0 = Math.min(...corners.map(([x, y]) => dOf(x, y)));
+  const fits = rots.every((l) => l.len <= 0.97 * (s1 - s0));
+  const vertical = !hasText && rots.every((l) => Math.abs(Math.abs(l.angle) - 90) <= 2 && Math.sign(l.angle) === sign) && (fits || !ctx.boxes);
+  if (vertical) {
+    const lines = [...rots].sort((a, b) => a.d - b.d);
+    const gaps = lines.slice(1).map((l, i) => l.d - lines[i].d);
+    const big = Math.max(...lines.map((l) => l.size));
+    const lh = gaps.length ? Math.max(Math.min(...gaps), 1.05 * big) : 1.2 * big;
+    cell.textDirection = sign < 0 ? "btLr" : "tbRl";
+    cell.vAlign = "top";
+    cell.blocks = lines.map((l, i) => {
+      const lead = l.s - s0, trail = s1 - (l.s + l.len);
+      const centered = Math.abs(lead - trail) <= Math.max(3, 0.15 * (s1 - s0));
+      const p: Para = {
+        kind: "p", runs: rotatedRuns(l), align: centered ? "center" : lead < trail ? "left" : "right", indLeft: 0, indRight: 0, firstLine: 0,
+        // 第一行：字顶到格子边（加单元格边距）的距离；其余：与上一行的基线间距多出行高的部分
+        spaceBefore: i === 0 ? Math.max(0, l.d - (lh - 0.22 * l.size) - (d0 + CELL_MARGIN)) : Math.max(0, gaps[i - 1] - lh),
+        lineHeight: lh, tabs: [], size: l.size,
+      };
+      if (!centered && fits) { if (lead < trail) p.indLeft = Math.max(0, lead - 0.5); else p.indRight = Math.max(0, trail - 0.5); }
+      return p;
+    });
+    // 竖排格里段落的宽度就是行高：放不下时返回需要的行高（可编辑排版的行高是"最小值"，把这一行加高，字就不会折断）
+    return fits ? 0 : Math.max(...lines.map((l) => l.len)) + 0.6 * big;
+  }
+  for (const l of [...rots].sort((a, b) => a.y0 - b.y0 || a.x0 - b.x0)) {
+    if (ctx.boxes) { ctx.boxes.push(rotatedBox(l)); continue; }
+    cell.blocks.push({ kind: "p", runs: rotatedRuns(l), align: "left", indLeft: 0, indRight: 0, firstLine: 0, spaceBefore: 0, lineHeight: 1.2 * l.size, tabs: [], size: l.size });
+  }
+  return 0;
 }
 
 /** 独占一段的行内图片：段前距 = 与上一块的实测间距，左缩进 = 图片的横坐标（并排的多张图用制表位定位） */
@@ -1455,8 +1599,10 @@ function buildTable(t: TableDraft, fills: FillRect[], originX: number, ctx: Ctx)
   };
 
   const rows: Table["rows"] = [];
+  const placed = new Set<RotLine>();
   for (let r = 0; r < nR; r++) {
     const cells: Cell[] = [];
+    let rowNeed = 0;
     for (const g of rowGroups[r]) {
       const vm = vmerge[r].get(g.c0);
       const box = cellBox(r, g);
@@ -1497,10 +1643,23 @@ function buildTable(t: TableDraft, fills: FillRect[], originX: number, ctx: Ctx)
           if (cell.vAlign !== "top" && paras.length) paras[0].spaceBefore = 0;
           cell.blocks = paras;
         }
+        const rots = (t.rotated ?? []).filter((l) => {
+          const cx = (l.x0 + l.x1) / 2, cy = (l.y0 + l.y1) / 2;
+          return !placed.has(l) && cx >= box.x0 && cx < box.x1 && cy >= box.y0 && cy < box.y1;
+        });
+        for (const l of rots) placed.add(l);
+        const need = rots.length ? placeRotated(cell, rots, box, spans.length > 0, ctx) : 0;
+        if (need && !vm) rowNeed = Math.max(rowNeed, need);
       }
       cells.push(cell);
     }
-    rows.push({ height: ys[r + 1] - ys[r], cells });
+    rows.push({ height: Math.max(ys[r + 1] - ys[r], rowNeed), cells });
+  }
+  // 落在网格边上、没归进任何一格的旋转文字：逐页保留时放进页面上的文本框，可编辑排版时接在最后一格里
+  for (const l of t.rotated ?? []) {
+    if (placed.has(l)) continue;
+    if (ctx.boxes) ctx.boxes.push(rotatedBox(l));
+    else rows[rows.length - 1]?.cells[rows[rows.length - 1].cells.length - 1]?.blocks.push({ kind: "p", runs: rotatedRuns(l), align: "left", indLeft: 0, indRight: 0, firstLine: 0, spaceBefore: 0, lineHeight: 1.2 * l.size, tabs: [], size: l.size });
   }
   return { kind: "table", indent: t.x0 - originX, colWidths: xs.slice(1).map((x, i) => x - xs[i]), rows, exactRows: ctx.mode === "exact" };
 }
@@ -1763,7 +1922,8 @@ function checkBoxes(pg: PageModel): Seg[] {
 export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; raster?: boolean; unread?: ReadonlySet<number> } = {}): DocModel {
   // 识别渲染区域时会从页面中移除元素：在副本上进行，原始提取结果保持不变（用于完整性校验、失败时回退）
   // 识别时会从页面中移除元素、插入行内公式：总在副本上进行，失败回退时原始结果不受影响
-  const pages = pages0.map((p) => ({ ...p }));
+  // 浅拷贝：页面上的数组会被换掉（成图区域里的文字移走）；旋转文字会被标上 raster，逐个复制，渲染失败重建时不受上一次影响
+  const pages = pages0.map((p) => ({ ...p, ...(p.rotated ? { rotated: p.rotated.map((t) => ({ ...t })) } : {}) }));
   const allText = pages0.map((p) => p.spans.map((s) => s.text).join(" ")).join("\n");
   const ctx: Ctx = { mode: opts.mode ?? "exact", spacing: new Map(), words: collectWords(allText), hyphenated: new Set(), counts: wordCounts(allText), softHyphens: 0 };
   // 行尾断开的写法不算"本身带连字符"：只收集行中间出现的
@@ -1881,8 +2041,9 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
         const inside = over.every((s) => s.x0 >= im.x0 - 2 && s.x1 <= im.x1 + 2 && s.top >= im.y0 - 2 && s.bottom <= im.y1 + 2);
         const chars = over.reduce((n, s) => n + s.text.replace(/\s/g, "").length, 0);
         if (!inside || chars > 300) continue;
+        const rot = rotatedTextIn(pg, im);
         const gone = removeInside(pg, im);
-        figures.push({ ...rasterBox({ x0: im.x0, y0: im.y0, x1: im.x1, y1: im.y1 }, pg.index, "figure", spansText(gone)), ...(im.scan ? { scan: im.scan } : {}) });
+        figures.push({ ...rasterBox({ x0: im.x0, y0: im.y0, x1: im.x1, y1: im.y1 }, pg.index, "figure", [spansText(gone), rot].filter(Boolean).join(" ")), ...(im.scan ? { scan: im.scan } : {}) });
       }
       for (const f of figures) if (f.alt) rasterText.push(f.alt);
       figureCount += figures.length;
@@ -1946,7 +2107,7 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
   const body: Region = { x0: left, x1: right, overhang: Math.max(0, Math.min(36, pageW - right - 4)) };
 
   const blocks: Block[] = [];
-  const stats = { pages: pages.length, paragraphs: 0, tables: 0, images: 0, vectorShapes: 0, rotatedText: 0, columnPages: 0, figures: 0, equations: 0 };
+  const stats = { pages: pages.length, paragraphs: 0, tables: 0, images: 0, vectorShapes: 0, rotatedText: 0, rotatedSlanted: 0, columnPages: 0, figures: 0, equations: 0 };
   let curSection: SectionProps = { cols: 1, colWidths: [right - left], colGap: 0, titlePg: flow };
   let curPage = 0;
   const sectKey = (x: SectionProps) => JSON.stringify([x.cols, x.colWidths, x.colGap]);
@@ -2185,7 +2346,6 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
       return s.text.trim() && cx > img.x0 + 2 && cx < img.x1 - 2 && cy > img.y0 + 2 && cy < img.y1 - 2;
     });
     stats.vectorShapes += pg.vectorShapes;
-    stats.rotatedText += pg.rotatedText;
     stats.tables += tables.length;
 
     const lines = pageLines[pi];
@@ -2234,6 +2394,26 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
       for (const l of floating[pi]) anchor.textBoxes!.push(...lineBoxes(l, ctx));
     }
     ctx.boxes = flow ? undefined : anchor.textBoxes;
+    // 旋转文字（随图片保存的除外）：落在表格里的交给表格（竖排表头写成竖排单元格），
+    // 其余（页边竖排说明、斜放的水印 / 印章、竖排的标签）按原角度放进挂在锚点段落上的文本框，两种模式都保留
+    const flowRot: Array<{ l: RotLine; box: NonNullable<Para["textBoxes"]>[number] }> = [];
+    for (const l of rotatedLines((pg.rotated ?? []).filter((r) => !r.raster))) {
+      const cx = (l.x0 + l.x1) / 2, cy = (l.y0 + l.y1) / 2;
+      // 只有竖排的才是表格内容（竖排表头）；斜放的压在表格上的是印章、水印，不属于哪一格
+      const t = Math.abs(Math.abs(l.angle) - 90) <= 2 ? tables.find((t) => cx > t.x0 && cx < t.x1 && cy > t.y0 && cy < t.y1) : undefined;
+      if (t) (t.rotated ??= []).push(l);
+      else {
+        // 压在正文上的（斜放的水印、印章）放在文字下方：正文照常可读、可选中
+        const box = rotatedBox(l);
+        if (box.rot) stats.rotatedSlanted++;
+        if (pg.spans.some((s) => s.text.trim() && (s.x0 + s.x1) / 2 > l.x0 && (s.x0 + s.x1) / 2 < l.x1 && (s.top + s.bottom) / 2 > l.y0 && (s.top + s.bottom) / 2 < l.y1)) box.behind = true;
+        // 可编辑排版：正文会跨页流动，版心里的旋转文字（无框表格的竖排表头、正文旁的竖排标签）挂到段落上随文字移动；
+        // 页边的（竖排的页边说明）仍按页面坐标放在页首锚点上，放在文字下方以防落到别的内容上
+        if (flow && l.x1 > left + 2 && l.x0 < right - 2) flowRot.push({ l, box });
+        else { if (flow) box.behind = true; anchor.textBoxes!.push(box); }
+      }
+      stats.rotatedText++;
+    }
     // 表单页：每行文字一个按原位置定位的文本框，压在垫底的格线图上
     for (const l of pre[pi].formLines ?? []) anchor.textBoxes!.push(...lineBoxes(l, ctx));
 
@@ -2563,6 +2743,16 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
         cursor = Math.max(L.cursor, R.cursor);
       }
     }
+    // 流式模式：版心里的旋转文字挂到原位置上方最近的一段上，没有可挂的段落时按页面坐标放。
+    // 文本框的纵坐标相对这一段的顶部——段前距也算在段落里（LibreOffice 实测如此，与 Word 一致），从段前距的上沿量起
+    if (flowRot.length) {
+      const hosts = blocks.slice(anchorAt + 1).filter((b): b is Para => b.kind === "p" && !b.tiny && b.srcTop !== undefined);
+      for (const { l, box } of flowRot) {
+        const h = [...hosts].reverse().find((p) => p.srcTop! <= l.y0 + 0.5) ?? hosts[0];
+        if (h) (h.textBoxes ??= []).push({ ...box, y: box.y - (h.srcTop! - h.spaceBefore), inPara: true });
+        else anchor.textBoxes!.push({ ...box, behind: true });
+      }
+    }
     // 流式模式：记下原 PDF 的分页位置
     if (flow && pi > 0) {
       const f = blocks.slice(pageFirst).find((b): b is Para => b.kind === "p" && (!b.tiny || !!b.inlineImages));
@@ -2705,7 +2895,7 @@ function mergeSplitParagraphs(blocks: Block[], ctx: Ctx) {
   const indentStyle = indented >= 3 && indented >= 0.25 * body.length;
 
   const canMerge = (a: Para, b: Para) => {
-    if (!a.lastFull || (a.tabs.length && !a.labelTab) || b.tabs.length || b.floats?.length) return false;
+    if (!a.lastFull || (a.tabs.length && !a.labelTab) || b.tabs.length || b.floats?.length || b.textBoxes?.length) return false;
     const at = textOfPara(a).trimEnd(), bt = textOfPara(b).trimStart();
     // 下一页页首只剩一行续行时，左右的空白可能恰好接近对称，被误判成居中：
     // 上一段在句子中间断开、这一行以句末标点收尾，仍是续行（居中的标题不以句号结尾）

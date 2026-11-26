@@ -124,8 +124,12 @@ export interface PageModel {
   rotatedText: number;
   /** 压在扫描图上的不可见文字（OCR 识别层，文字渲染模式 3 / 7）的字符数：不转成正文 */
   ocrChars?: number;
-  /** 旋转文字（坐标轴的竖排标题等）的外接框：本身不转换，但图区域要把它们包进来，渲染时一并画出 */
-  rotated?: Array<{ x0: number; y0: number; x1: number; y1: number; size: number }>;
+  /**
+   * 旋转文字（坐标轴的竖排标题、表头竖排、页边竖排说明、斜放的水印 / 印章）：外接框之外记下文字、角度和几何。
+   * angle：基线方向，页面坐标（y 向下）里顺时针的度数，−90 是从下往上读；ox / oy：基线起点；len：沿基线的长度。
+   * 落在渲染成图片的区域里的标 raster（随图片保存，文字进替代文字），其余的转成按原角度摆放的文本框或竖排单元格
+   */
+  rotated?: RotatedText[];
   /** 铺满页面的黑白扫描图拆开后的结果（见 scanLayer.ts）；image 是 images 里的那张整页图 */
   scan?: ScanSplit & { image: ImageBox };
 }
@@ -141,6 +145,12 @@ const hex = (c: any): string => {
   if (typeof c === "string") return c.replace("#", "").toUpperCase().padStart(6, "0");
   const r = Number(c?.[0] ?? 0), g = Number(c?.[1] ?? 0), b = Number(c?.[2] ?? 0);
   return [r, g, b].map((v) => Math.max(0, Math.min(255, Math.round(v))).toString(16).padStart(2, "0")).join("").toUpperCase();
+};
+/** 半透明的颜色（ExtGState 的 ca / CA）：按压在白纸上的效果折算成不透明色（Word 的文字、底纹没有透明度） */
+const overWhite = (c: string, a: number): string => {
+  if (!(a < 0.999)) return c;
+  const n = parseInt(c, 16), k = Math.max(0, a);
+  return hex([(n >> 16) & 255, (n >> 8) & 255, n & 255].map((v) => v * k + 255 * (1 - k)));
 };
 const isWhite = (c: string) => {
   const n = parseInt(c, 16);
@@ -290,6 +300,15 @@ export async function extractPdf(buf: Buffer, opts: { maxPages?: number; pages?:
   return pages;
 }
 
+export interface RotatedText {
+  x0: number; y0: number; x1: number; y1: number; size: number;
+  text: string; angle: number; ox: number; oy: number; len: number;
+  color: string; family: string; bold: boolean; italic: boolean;
+  /** 字距加宽 / 紧缩（pt，每个字之后） */
+  tracking?: number;
+  raster?: boolean;
+}
+
 type SubPath = { kind: "rect"; pts: Array<[number, number]> } | { kind: "poly"; pts: Array<[number, number]>; ctrl: Array<[number, number]>; curved: boolean; closed: boolean };
 
 /**
@@ -405,10 +424,15 @@ async function extractPage(page: any, index: number, OPS: any, Util: any): Promi
   let scanPages = 0;
 
   // ---------- 操作符遍历：图形、图片、文字颜色 ----------
-  interface GState { ctm: M; fill: string; stroke: string; lw: number; trm: number; clip?: { x0: number; y0: number; x1: number; y1: number } }
-  let gs: GState = { ctm: [1, 0, 0, 1, 0, 0], fill: "000000", stroke: "000000", lw: 1, trm: 0 };
+  // fill / stroke：折算了透明度的颜色（各处直接使用）；fill0 / stroke0、fa / sa：原色与透明度
+  interface GState { ctm: M; fill: string; stroke: string; fill0: string; stroke0: string; fa: number; sa: number; lw: number; trm: number; clip?: { x0: number; y0: number; x1: number; y1: number } }
+  let gs: GState = { ctm: [1, 0, 0, 1, 0, 0], fill: "000000", stroke: "000000", fill0: "000000", stroke0: "000000", fa: 1, sa: 1, lw: 1, trm: 0 };
+  const setFill = (c: string) => { gs.fill0 = c; gs.fill = overWhite(c, gs.fa); };
+  const setStroke = (c: string) => { gs.stroke0 = c; gs.stroke = overWhite(c, gs.sa); };
   const stack: GState[] = [];
-  const textColors: Array<{ ch: string; color: string; fakeBold: boolean; adv: number; spaceBefore: number; font: string; hidden: boolean; clip?: { x0: number; y0: number; x1: number; y1: number } }> = [];
+  // rot：字形的基线不是水平的（旋转文字）。旋转文字单独按顺序对齐颜色，横排文字的对齐不受影响
+  const textColors: Array<{ ch: string; color: string; fakeBold: boolean; adv: number; spaceBefore: number; font: string; hidden: boolean; clip?: { x0: number; y0: number; x1: number; y1: number }; rot?: boolean }> = [];
+  let tm: M = [1, 0, 0, 1, 0, 0]; // 文字矩阵（只用来判断字形的方向）
   const spaceEm = new Map<string, number>(); // 各字体空格的字宽（em）
   let curFont = "";
   // 字形宽度的单位由字体矩阵决定：多数字体是 1/1000 em，但也有 1/2048（Elsevier 排版的 Charis SIL 等）、
@@ -526,17 +550,29 @@ async function extractPage(page: any, index: number, OPS: any, Util: any): Promi
       case OPS.save: stack.push({ ...gs, ctm: [...gs.ctm] as M }); break;
       case OPS.restore: gs = stack.pop() ?? gs; break;
       case OPS.transform: gs.ctm = mul(gs.ctm, args as M); break;
-      case OPS.setFillRGBColor: gs.fill = hex(args); break;
-      case OPS.setStrokeRGBColor: gs.stroke = hex(args); break;
-      case OPS.setFillGray: gs.fill = hex([args[0] * 255, args[0] * 255, args[0] * 255]); break;
-      case OPS.setStrokeGray: gs.stroke = hex([args[0] * 255, args[0] * 255, args[0] * 255]); break;
+      case OPS.setFillRGBColor: setFill(hex(args)); break;
+      case OPS.setStrokeRGBColor: setStroke(hex(args)); break;
+      case OPS.setFillGray: setFill(hex([args[0] * 255, args[0] * 255, args[0] * 255])); break;
+      case OPS.setStrokeGray: setStroke(hex([args[0] * 255, args[0] * 255, args[0] * 255])); break;
+      case OPS.setGState: {
+        // 透明度：半透明的水印、印章、底色块按压在白纸上的颜色输出
+        for (const [k, v] of Array.isArray(args?.[0]) ? args[0] : []) {
+          if (k === "ca" && typeof v === "number") { gs.fa = v; setFill(gs.fill0); }
+          else if (k === "CA" && typeof v === "number") { gs.sa = v; setStroke(gs.stroke0); }
+        }
+        break;
+      }
       case OPS.setLineWidth: gs.lw = args[0]; break;
       case OPS.setTextRenderingMode: gs.trm = args[0]; break;
       case OPS.setFont: curFont = String(args[0]); curScale = advScale(curFont); break;
+      case OPS.beginText: tm = [1, 0, 0, 1, 0, 0]; break;
+      case OPS.setTextMatrix: if (Array.isArray(args) && args.length >= 6) tm = args.slice(0, 6) as M; break;
       case OPS.showText:
       case OPS.showSpacedText: {
         const glyphs = args[0] ?? [];
         let pendingSpace = 0;
+        const [bx, by] = (() => { const a = [tm[0], tm[1]], b = [gs.ctm[0] * a[0] + gs.ctm[2] * a[1], gs.ctm[1] * a[0] + gs.ctm[3] * a[1]]; return [VT[0] * b[0] + VT[2] * b[1], VT[1] * b[0] + VT[3] * b[1]]; })();
+        const rot = Math.abs(by) > 0.01 * Math.hypot(bx, by);
         for (const g of glyphs) {
           if (!g || typeof g !== "object") continue;
           const w = typeof g.width === "number" ? g.width * curScale : 0;
@@ -550,7 +586,7 @@ async function extractPage(page: any, index: number, OPS: any, Util: any): Promi
           const u = uni;
           for (let k = 0; k < u.length; k++) {
             if (!u[k].trim()) continue;
-            textColors.push({ ch: u[k], color: gs.trm === 1 ? gs.stroke : gs.fill, fakeBold: gs.trm === 2, adv: k === 0 ? w : 0, spaceBefore: k === 0 ? pendingSpace : 0, font: curFont, hidden: gs.trm === 3 || gs.trm === 7, clip: gs.clip });
+            textColors.push({ ch: u[k], color: gs.trm === 1 ? gs.stroke : gs.fill, fakeBold: gs.trm === 2, adv: k === 0 ? w : 0, spaceBefore: k === 0 ? pendingSpace : 0, font: curFont, hidden: gs.trm === 3 || gs.trm === 7, clip: gs.clip, ...(rot ? { rot } : {}) });
           }
           pendingSpace = 0;
         }
@@ -739,6 +775,10 @@ async function extractPage(page: any, index: number, OPS: any, Util: any): Promi
 
   let ci = 0; // textColors 游标
   const opText = textColors.map((t) => t.ch).join("");
+  // 旋转的字形单独成一条字符流，旋转文字按顺序在里面找自己的颜色（单个字母在全文里随便一找会找到别处的字）
+  const rotIdx = textColors.flatMap((t, i) => (t.rot ? [i] : []));
+  const rotText = rotIdx.map((i) => textColors[i].ch).join("");
+  let rci = 0;
   for (const it of tc.items as any[]) {
     if (!it.str || !it.str.trim()) continue;
     const t = Util.transform(VT, it.transform) as M;
@@ -749,7 +789,39 @@ async function extractPage(page: any, index: number, OPS: any, Util: any): Promi
       const em = Math.hypot(it.transform[0], it.transform[1]) || size;
       const wEm = (it.width || em * it.str.length * 0.5) / em;
       const cs = [apply(t, 0, -0.22), apply(t, wEm, -0.22), apply(t, 0, 0.85), apply(t, wEm, 0.85)];
-      (model.rotated ??= []).push({ x0: Math.min(...cs.map((c) => c[0])), y0: Math.min(...cs.map((c) => c[1])), x1: Math.max(...cs.map((c) => c[0])), y1: Math.max(...cs.map((c) => c[1])), size });
+      // 颜色：在旋转字形的字符流里按顺序找到这段文字（横排文字的游标不动）
+      const joined = [...it.str].filter((c) => c.trim()).join("");
+      let k = joined ? rotText.indexOf(joined, rci) : -1;
+      // 字符流里是连字等合写的字形时整段对不上：用开头几个字定位
+      if (k === -1 && joined.length > 3) k = rotText.indexOf(joined.slice(0, 3), rci);
+      const at = k !== -1 ? rotIdx[k] : -1;
+      if (k !== -1) rci = k + Math.max(1, rotText.startsWith(joined, k) ? joined.length : joined.length - 2);
+      // 不可见的文字（文字渲染模式 3 / 7，扫描件的识别层）：不转换
+      if (at !== -1 && rotIdx.slice(k, k + joined.length).every((i) => textColors[i].hidden)) continue;
+      const fr = infoOf(it.fontName);
+      const [ox, oy] = apply(t, 0, 0);
+      const emX = Math.hypot(t[0], t[1]), len = wEm * emX;
+      let text = expandLigatures(it.str.replace(/\u00ad/g, ""));
+      let tracking: number | undefined;
+      // 字距加宽的旋转文字（印章 "PAID"、水印 "CONFIDENTIAL"）：pdf.js 按间距在字母之间插了空格（"PA I D"）。
+      // 按字形流还原：只在真正有空格字形的地方留空格，加宽量（实际长度减去字形自然宽度）折成字符间距
+      if (k !== -1 && rotText.startsWith(joined, k)) {
+        const gl = rotIdx.slice(k, k + joined.length).map((i) => textColors[i]);
+        const real = gl.map((g, j) => (j > 0 && g.spaceBefore > 0 ? " " : "") + g.ch).join("");
+        const nat = gl.reduce((a, g, j) => a + g.adv + (j > 0 && g.spaceBefore > 0 ? g.spaceBefore : 0), 0) * emX;
+        const inserted = (it.str.trim().match(/\s+/g) ?? []).length > (real.match(/ /g) ?? []).length;
+        if (nat > 0 && (inserted || (!/\s/.test(it.str.trim()) && gl.length >= 3))) {
+          const tr = (len - nat) / gl.length;
+          if (Math.abs(tr) > 0.03 * size) tracking = tr;
+          if (inserted) text = expandLigatures(real);
+        }
+      }
+      (model.rotated ??= []).push({
+        x0: Math.min(...cs.map((c) => c[0])), y0: Math.min(...cs.map((c) => c[1])), x1: Math.max(...cs.map((c) => c[0])), y1: Math.max(...cs.map((c) => c[1])), size,
+        text, angle: (Math.atan2(t[1], t[0]) * 180) / Math.PI, ox, oy, len,
+        color: at !== -1 ? textColors[at].color : "000000", family: fr.family, bold: fr.bold || (at !== -1 && textColors[at].fakeBold), italic: fr.italic,
+        ...(tracking !== undefined ? { tracking } : {}),
+      });
       continue;
     }
     const style = tc.styles[it.fontName] ?? {};

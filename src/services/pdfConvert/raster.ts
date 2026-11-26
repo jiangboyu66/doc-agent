@@ -61,7 +61,13 @@ export function removeInside(pg: PageModel, r: Box): Span[] {
   const lostCurvy = pg.paths.filter((p) => inside(p, r) && (p.curved || p.diagonal) && (p.x1 - p.x0) * (p.y1 - p.y0) > 4).length;
   pg.vectorShapes = Math.max(0, pg.vectorShapes - lostCurvy);
   pg.paths = keep;
+  for (const t of pg.rotated ?? []) if (!t.raster && inside(t, r, 0.5)) t.raster = true;
   return gone;
+}
+
+/** 区域里还没随图片保存的旋转文字（坐标轴竖排标题等）：渲染成图片后，文字放进替代文字 */
+export function rotatedTextIn(pg: PageModel, r: Box): string {
+  return (pg.rotated ?? []).filter((t) => !t.raster && inside(t, r, 0.5)).map((t) => t.text.trim()).filter(Boolean).join(" ");
 }
 
 // ---------------------------------------------------------------------------
@@ -329,7 +335,7 @@ export function detectFigures(pg: PageModel, bodySize: number, tableBoxes: Box[]
     // 成行的文字横跨在合并框的边缘（作者简介：照片在左、正文紧挨在右，上下两位作者的照片相距很近）：
     // 这是各带文字的独立照片，不是组图；合并会把半行文字画进图里、另外半行留在正文里
     if (pg.spans.some((s) => s.text.trim().length >= 4 && !inside(spanBox(s), box, 0.5) && overlapArea(spanBox(s), box) > 0.2 * area(spanBox(s)))) continue;
-    const alt = spansText(inner);
+    const alt = [spansText(inner), rotatedTextIn(pg, box)].filter(Boolean).join(" ");
     removeInside(pg, box);
     out.push(rasterBox(box, pg.index, "figure", alt));
   }
@@ -541,7 +547,7 @@ export function detectImageGrids(pg: PageModel, bodySize: number): ImageBox[] {
     // 成行的文字横跨在合并框的边缘（作者简介：照片在左、正文紧挨在右，上下两位作者的照片相距很近）：
     // 这是各带文字的独立照片，不是组图；合并会把半行文字画进图里、另外半行留在正文里
     if (pg.spans.some((s) => s.text.trim().length >= 4 && !inside(spanBox(s), box, 0.5) && overlapArea(spanBox(s), box) > 0.2 * area(spanBox(s)))) continue;
-    const alt = spansText(inner);
+    const alt = [spansText(inner), rotatedTextIn(pg, box)].filter(Boolean).join(" ");
     removeInside(pg, box);
     out.push(rasterBox(box, pg.index, "figure", alt));
   }
