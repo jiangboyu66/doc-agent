@@ -33,7 +33,7 @@ import { fileURLToPath } from "node:url";
  * pdf2word 自己的版本号（与 doc-agent 的版本号无关）：主版本对应契约 v1；契约有任何变化，次版本号加一；
  * 只有引擎更新时修订号加一。发版标签为 pdf2word-v<版本>，CI 会核对标签与这里一致。
  */
-const VERSION = "1.1.0";
+const VERSION = "1.1.1";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const dist = path.join(root, "dist");

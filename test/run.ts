@@ -1251,6 +1251,28 @@ await test("Type 3 字形（位图蒙版 / 乱码编码）的公式与符号：�
   }
 });
 
+await test("中英左右对照 PDF（中文用浏览器嵌入的 Type 3 字体）：中文栏保留为文字，不当公式成图；表格单元格里的整行删除线保留", async () => {
+  // 2026-11-26 LTB-v1 LTB-03（合成测试文件的第 1、4 页）：一页上中文的字数远少于英文的字母数，Type 3 文字占比低于 0.3，
+  // 整栏中文被当成公式成图；附件一表内带删除线的一行丢了删除线（删除线检测原来只看表格以外的文字）
+  const { pdfToDocx } = await import("../src/services/pdfConvert/index.js");
+  const pdf = await fixture("bilingual-type3.pdf");
+  for (const mode of ["exact", "flow"] as const) {
+    const { data, report } = await pdfToDocx(pdf, { mode });
+    const xml = new ZipPackage(data).readText("word/document.xml");
+    eq(report.textCoverage, 1, `${mode}：文字完整性`);
+    eq(report.equations, 0, `${mode}：中文正文不应成公式图：${JSON.stringify(report)}`);
+    eq(report.inlineMath ?? 0, 0, `${mode}：中文正文不应成行内图片：${JSON.stringify(report)}`);
+    const text = xml.replace(/<[^>]+>/g, "");
+    assert(text.includes("供应商委任经销商为产品在区域内的独家经销商"), `${mode}：中文栏应是文字`);
+    assert(text.includes("The Supplier appoints the Distributor"), `${mode}：英文栏应是文字`);
+    const row = (xml.match(/<w:tr[ >](?:(?!<\/w:tr>)[\s\S])*LY-SP60A[\s\S]*?<\/w:tr>/) ?? [""])[0];
+    const runs = row.match(/<w:r[ >][\s\S]*?<\/w:r>/g) ?? [];
+    const struck = runs.filter((r) => /<w:strike\/>/.test(r)).map((r) => r.replace(/<[^>]+>/g, "")).join("");
+    for (const cell of ["LY-SP60A", "7.35", "6.90"]) assert(struck.includes(cell), `${mode}：删除线那一行的 ${cell} 应带删除线：${struck}`);
+    assert(!runs.some((r) => /同意删除/.test(r.replace(/<[^>]+>/g, "")) && /<w:strike\/>/.test(r)), `${mode}：行末的手写备注没有删除线`);
+  }
+});
+
 await test("首字下沉与正文同基线时仍识别为首字下沉；多行居中的标题不被误判为两端对齐；画成短横线的破折号还原为文字", async () => {
   const { detectDropCaps } = await import("../src/services/pdfConvert/raster.js");
   const sp = (text: string, x0: number, x1: number, baseline: number, size: number) => ({ text, x0, x1, top: baseline - 0.75 * size, bottom: baseline + 0.22 * size, baseline, size, font: "Times New Roman", bold: false, italic: false, color: "000000" });

@@ -1894,7 +1894,9 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
     tables.push(...detectRuledTables(pg, used, inTable));
     tables.push(...detectSideBySide(pg, used, inTable));
     const free = pg.spans.filter((s) => !inTable.has(s));
-    const rules = applyTextDecorations(free, pg.segs, used);
+    // 删除线 / 下划线也标在表格单元格里的文字上（2026-11-26 LTB-03 附件一：表内整行删除线丢失，原来只看表格外的文字）；
+    // 没对上任何文字的线照旧
+    const rules = applyTextDecorations(pg.spans, pg.segs, used);
     return { pg, tables, free, rules, figures, frames, bgs, formLines: undefined as Line[] | undefined };
   });
 

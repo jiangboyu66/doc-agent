@@ -617,15 +617,21 @@ export function detectMaskInk(pg: PageModel, bodySize: number, raster: boolean):
   const B = bodySize || 10;
   // Type 3 字体的文字：字形由 PDF 自己描述（多为公式符号），字符编码常是乱码（\u0000、\u0012），Word 里也没有这个字体。
   // 这页只有少量 Type 3 文字（公式）时，全部当作墨迹按原样渲染；正文本身也用 Type 3 时，编码正常的保留为文字，只把乱码的当作墨迹。
+  // 排过中日韩文字的 Type 3 字体是正文字体，不是公式（浏览器打印的中文 PDF 常这样嵌入思源字体）：中英左右对照的一页上，
+  // 中文的字数远少于英文的字母数，按占比会低于 0.3，整栏中文被当成公式成图（2026-11-26 LTB-03）。这类字体（含它的数字、
+  // 标点）只把乱码的当作墨迹。
   // 没有画布时无法渲染：保留为文字，换成正文字体并去掉乱码
   const t3 = pg.spans.filter((sp) => sp.type3 && sp.text.trim());
   if (t3.length) {
     const chars = (l: Span[]) => l.reduce((n, sp) => n + sp.text.replace(/\s/g, "").length, 0);
     const share = chars(t3) / Math.max(1, chars(pg.spans.filter((sp) => sp.text.trim())));
     const junk = (sp: Span) => /[\u0000-\u001f\u007f-\u009f\ue000-\uf8ff\ufffd]/.test(sp.text);
+    const cjk = /[\u2e80-\u2fdf\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af\uf900-\ufaff]/;
+    const textFonts = new Set(t3.filter((sp) => sp.rawFont && cjk.test(sp.text)).map((sp) => sp.rawFont));
+    const bodyText = (sp: Span) => (sp.rawFont ? textFonts.has(sp.rawFont) : cjk.test(sp.text));
     const body = pg.spans.filter((sp) => !sp.type3 && sp.text.trim());
     const bodyFont = body.length ? body.reduce((a, b) => (b.text.length > a.text.length ? b : a)).font : "Times New Roman";
-    const asInk = raster ? t3.filter((sp) => share < 0.3 || junk(sp)) : [];
+    const asInk = raster ? t3.filter((sp) => (share < 0.3 && !bodyText(sp)) || junk(sp)) : [];
     const gone = new Set(asInk);
     for (const sp of asInk) {
       masks.push({ x0: sp.x0, y0: sp.top, x1: sp.x1, y1: sp.bottom, color: sp.color, bits: null, w: 1, h: 1, vector: true, inv: { ox: 0, oy: 0, a: 0, b: 0, c: 0, d: 0 } });
