@@ -1261,7 +1261,8 @@ await test("中英左右对照 PDF（中文用浏览器嵌入的 Type 3 字体�
     const xml = new ZipPackage(data).readText("word/document.xml");
     eq(report.textCoverage, 1, `${mode}：文字完整性`);
     eq(report.equations, 0, `${mode}：中文正文不应成公式图：${JSON.stringify(report)}`);
-    eq(report.inlineMath ?? 0, 0, `${mode}：中文正文不应成行内图片：${JSON.stringify(report)}`);
+    // 行内图片的个数不在 report 里（只在引擎内部统计），report 用一条说明告诉调用方
+    assert(!report.notes.some((n) => n.includes("行内公式")), `${mode}：中文正文不应成行内图片：${report.notes.join(" | ")}`);
     const text = xml.replace(/<[^>]+>/g, "");
     assert(text.includes("供应商委任经销商为产品在区域内的独家经销商"), `${mode}：中文栏应是文字`);
     assert(text.includes("The Supplier appoints the Distributor"), `${mode}：英文栏应是文字`);
