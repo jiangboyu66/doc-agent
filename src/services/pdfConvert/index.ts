@@ -225,7 +225,11 @@ export async function pdfToDocx(buf: Buffer, opts: { engine?: PdfEngine; title?:
     const n = ocrPages.reduce((a, p) => a + (p.ocrChars ?? 0), 0);
     notes.push(`${ocrPages.length} 页是带 OCR 识别层的扫描件：每页按原样保留为整页图片；压在图上的不可见识别文字（${n} 个字符）没有转成正文，否则会与图里的字重叠成两层。`);
   } else if (pages.length && textChars < 20 * pages.length && pages.some((p) => p.images.length)) {
-    notes.push("这份 PDF 几乎没有可提取的文字，可能是扫描件（整页图片）。转换结果每页保留为一张整页图片，文字需要先做 OCR 识别。");
+    // 每页都是一张铺满页面的图：多半是扫描件；否则是图片排成的页面（幻灯片、绘本），图片按原位置保留
+    const whole = pages.filter((p) => p.images.length).every((p) => p.images.some((im) => (im.x1 - im.x0) * (im.y1 - im.y0) >= 0.85 * p.width * p.height));
+    notes.push(whole
+      ? "这份 PDF 几乎没有可提取的文字，可能是扫描件（整页图片）。转换结果每页保留为一张整页图片，文字需要先做 OCR 识别。"
+      : "这份 PDF 几乎没有可提取的文字，页面内容主要是图片：图片按原位置保留；画在图片里的文字需要先做 OCR 识别才能编辑。");
   }
 
   // 只转换了一部分页（指定了页码范围，或超过单次上限被截断）：如实写进报告，文字完整性只针对这些页

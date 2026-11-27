@@ -678,6 +678,27 @@ await test("纸张大小 / 方向不一样的页（横向附录、A4 说明页�
   }
 });
 
+await test("图片排成的页面（幻灯片 / 绘本：一行标题 + 横跨整页的插图）：插图放在原横坐标、不被挤出页面裁掉，版心不按一行标题收窄；报告不说成扫描件（两种模式）", async () => {
+  const { pdfToDocx } = await import("../src/services/pdfConvert/index.js");
+  const pdf = await fixture("image-slides.pdf");
+  for (const mode of ["exact", "flow"] as const) {
+    const { data, report } = await pdfToDocx(pdf, { mode });
+    eq(report.textCoverage, 1, `${mode}：文字完整性`);
+    assert(report.notes.some((n) => n.includes("页面内容主要是图片")) && !report.notes.some((n) => n.includes("可能是扫描件")), `${mode}：报告应说明页面是图片，而不是扫描件：${report.notes.join(" | ")}`);
+    const xml = new ZipPackage(data).readText("word/document.xml");
+    const margin = Number(xml.match(/<w:pgMar [^>]*w:left="(\d+)"/)![1]) / 20;
+    assert(margin <= 60, `${mode}：版心应按插图放宽（左边距 ${margin}pt）`);
+    const pics = (xml.match(/<w:p\b(?:(?!<\/w:p>)[\s\S])*?<wp:inline\b[\s\S]*?<\/w:p>/g) ?? []);
+    eq(pics.length, 2, `${mode}：两张插图都是独占一段的图`);
+    for (const p of pics) {
+      const ind = Number(p.match(/<w:ind [^>]*w:left="(-?\d+)"/)?.[1] ?? 0) / 20;
+      assert(Math.abs(margin + ind - 50) <= 2, `${mode}：插图应从原来的横坐标 50pt 开始：${margin + ind}`);
+    }
+    const title = (xml.match(/<w:p\b(?:(?!<\/w:p>)[\s\S])*?Spring Picnic[\s\S]*?<\/w:p>/) ?? [""])[0];
+    assert(title && !title.includes("<w:br"), `${mode}：标题应在一行里`);
+  }
+});
+
 // ---------------------------------------------------------------------------
 console.log("\n代理主循环（模拟模型）");
 // ---------------------------------------------------------------------------
@@ -1255,7 +1276,7 @@ await test("所有夹具 PDF：两种排版方式都不报错、文字完整；L
   const run = promisify(execFile);
   const soffice = process.env.SOFFICE_PATH || "soffice";
   const hasSoffice = await run(soffice, ["--version"]).then(() => true, () => false);
-  const names = ["columns", "journal", "figures", "math", "journal-front", "journal-eq", "journal-fig", "bios", "colstart", "signature", "citecolor", "texpaper", "contract-cn", "scan-letter", "furniture-cn", "bates", "rotated-text", "mixed-pages"];
+  const names = ["columns", "journal", "figures", "math", "journal-front", "journal-eq", "journal-fig", "bios", "colstart", "signature", "citecolor", "texpaper", "contract-cn", "scan-letter", "furniture-cn", "bates", "rotated-text", "mixed-pages", "image-slides"];
   const dir = await fs.mkdtemp(path.join(tmp, "pages-"));
   const bad: string[] = [];
   for (const name of names) {

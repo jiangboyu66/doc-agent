@@ -268,12 +268,12 @@ class Writer {
     for (const img of p.images ?? []) if (img.png.length) body.push(this.image(img, !!img.behind));
     for (const f of p.floats ?? []) if (f.img.png.length) body.push(this.floatImage(f));
     for (const f of p.hfImages ?? []) if (f.img.png.length) body.push(this.hfImage(f));
-    for (const img of p.inlineImages ?? []) {
-      if (!img.png.length) continue;
-      // 并排的多张图：每张前面一个制表符，定位到原横坐标
-      if ((p.inlineImages?.length ?? 0) > 1) body.push('<w:r><w:rPr><w:sz w:val="2"/><w:szCs w:val="2"/></w:rPr><w:tab/></w:r>');
+    (p.inlineImages ?? []).forEach((img, i) => {
+      if (!img.png.length) return;
+      // 并排的多张图：每张前面一个制表符，定位到原横坐标（第一张靠缩进定位时不放）
+      if ((p.inlineImages?.length ?? 0) > 1 && !(i === 0 && p.leadImage)) body.push('<w:r><w:rPr><w:sz w:val="2"/><w:szCs w:val="2"/></w:rPr><w:tab/></w:r>');
       body.push(this.inlineImage(img));
-    }
+    });
     for (const sh of p.shapes ?? []) body.push(this.shape(sh));
     for (const tb of p.textBoxes ?? []) body.push(this.textBox(tb));
     for (const r of p.runs) body.push(this.run(r));
