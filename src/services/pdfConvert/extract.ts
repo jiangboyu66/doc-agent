@@ -124,8 +124,9 @@ export interface PageModel {
   rotatedText: number;
   /** 压在扫描图上的不可见文字（OCR 识别层，文字渲染模式 3 / 7）的字符数：不转成正文 */
   ocrChars?: number;
-  /** 旋转文字（坐标轴的竖排标题等）的外接框：本身不转换，但图区域要把它们包进来，渲染时一并画出 */
-  rotated?: Array<{ x0: number; y0: number; x1: number; y1: number; size: number }>;
+  /** 旋转文字（坐标轴的竖排标题等）的外接框与文字：本身不转换，但图区域要把它们包进来，渲染时一并画出。
+   * inFigure：已被包进某个渲染成图片的区域（文字随图保留）；否则这段文字在 Word 里没有了，计入文字完整性的缺失 */
+  rotated?: Array<{ x0: number; y0: number; x1: number; y1: number; size: number; text: string; inFigure?: boolean }>;
   /** 铺满页面的黑白扫描图拆开后的结果（见 scanLayer.ts）；image 是 images 里的那张整页图 */
   scan?: ScanSplit & { image: ImageBox };
 }
@@ -639,14 +640,18 @@ async function extractPage(page: any, index: number, OPS: any, Util: any): Promi
   for (const it of tc.items as any[]) {
     if (!it.str || !it.str.trim()) continue;
     const t = Util.transform(VT, it.transform) as M;
-    const size = Math.hypot(t[2], t[3]);
+    // 只倾斜、不旋转的文字：浏览器给没有斜体字形的字体（中文字体）合成斜体时，用倾斜矩阵画正文（[s, 0, 0.25s, -s]）。
+    // 它是横排正文，按斜体转换；字号取竖直方向的缩放。（2026-11-27 LTB-05：扉页斜体的 IPC 分类号 F16H 25/22 被当成
+    // 旋转文字丢掉，文字完整性仍报 100%）
+    const sheared = t[0] > 0 && t[3] < 0 && Math.abs(t[1]) <= 0.01 * t[0] && Math.abs(t[2]) > 0.01 * -t[3] && Math.abs(t[2]) <= 0.7 * -t[3];
+    const size = sheared ? -t[3] : Math.hypot(t[2], t[3]);
     if (size < 0.5) continue;
-    if (Math.abs(t[1]) > 0.01 * size || Math.abs(t[2]) > 0.01 * size) {
+    if (!sheared && (Math.abs(t[1]) > 0.01 * size || Math.abs(t[2]) > 0.01 * size)) {
       model.rotatedText++;
       const em = Math.hypot(it.transform[0], it.transform[1]) || size;
       const wEm = (it.width || em * it.str.length * 0.5) / em;
       const cs = [apply(t, 0, -0.22), apply(t, wEm, -0.22), apply(t, 0, 0.85), apply(t, wEm, 0.85)];
-      (model.rotated ??= []).push({ x0: Math.min(...cs.map((c) => c[0])), y0: Math.min(...cs.map((c) => c[1])), x1: Math.max(...cs.map((c) => c[0])), y1: Math.max(...cs.map((c) => c[1])), size });
+      (model.rotated ??= []).push({ x0: Math.min(...cs.map((c) => c[0])), y0: Math.min(...cs.map((c) => c[1])), x1: Math.max(...cs.map((c) => c[0])), y1: Math.max(...cs.map((c) => c[1])), size, text: it.str });
       continue;
     }
     const style = tc.styles[it.fontName] ?? {};
@@ -770,7 +775,7 @@ async function extractPage(page: any, index: number, OPS: any, Util: any): Promi
       const sym = mapSymbolFont(expandLigatures((spaced ? pc.str.replace(/ /g, "") : pc.str).replace(/\u00ad/g, "")), fi.family);
       if (!sym.text.trim()) continue;
       const bold = fi.bold || pc.fakeBold, w = pc.x1 - pc.x0, nat = pc.natural;
-      const wordW = measureWord(sym.text, sym.font, bold, fi.italic, Math.round(size * 2) / 2) ?? undefined;
+      const wordW = measureWord(sym.text, sym.font, bold, fi.italic || sheared, Math.round(size * 2) / 2) ?? undefined;
       const chars = Math.max(1, sym.text.length);
       // 等宽字体被替换成更宽的 Courier New（TeX 的打字机字体 CMTT / SFTT 每字 0.525 em，Courier New 是 0.6 em）：
       // 按差值收紧字符间距，使文字仍占原来的宽度，否则并排的作者邮箱、居中的网址会互相挤压、折到下一行。
@@ -786,7 +791,7 @@ async function extractPage(page: any, index: number, OPS: any, Util: any): Promi
         size: Math.round(size * 2) / 2,
         font: sym.font,
         bold,
-        italic: fi.italic,
+        italic: fi.italic || sheared,
         color: pc.color,
         natural: nat,
         spaceW: (spaceEm.get(it.fontName) ?? 0.25) * size,
@@ -794,7 +799,7 @@ async function extractPage(page: any, index: number, OPS: any, Util: any): Promi
         math: fi.math,
         type3: isType3(it.fontName) || undefined,
         wordW,
-        wordSpaceW: measureWord(" ", sym.font, bold, fi.italic, Math.round(size * 2) / 2) ?? undefined,
+        wordSpaceW: measureWord(" ", sym.font, bold, fi.italic || sheared, Math.round(size * 2) / 2) ?? undefined,
         smallCaps: smallCaps || (isSmallCapsFont(rawNames.get(it.fontName)) && /[a-z]/.test(sym.text) && !/[A-Z]/.test(sym.text)) || undefined,
         // 字距加宽 / 紧缩：pdf.js 插了空格的逐字母排列，或单个词（不受两端对齐的词间距影响）的实际宽度明显偏离自然宽度
         tracking: nat && (spaced || (!/\s/.test(sym.text) && sym.text.length >= 3 && Math.abs(w / nat - 1) > 0.12))

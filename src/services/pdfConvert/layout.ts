@@ -801,6 +801,142 @@ function detectSideBySide(page: PageModel, used: Set<Seg>, taken: Set<Span>): Ta
   return out;
 }
 
+/**
+ * 两栏释义表（招股书、合同的"释义 / DEFINITIONS"：左栏词条，右栏释义，每条词条与它的释义第一行同高）：
+ * 写成一张无边框的两列表格，一条一行。不能当成正文的双栏：分栏后词条连续排在左栏、释义连续排在右栏，
+ * 读者对不上哪条释义属于哪个词条，相邻的释义还会并成一段（2026-11-27 LTB-07：48 条释义与词条错位）。
+ * 条件：一段连续的行都只从两个固定位置起排（左栏起点 / 右栏起点），没有行跨过两栏之间的空白；左栏比右栏窄；
+ * 左栏每段（词条）的第一行，都有右栏一段（释义）的第一行与它同高，这样的条目至少 4 条。
+ * 正文的双栏不满足"段首同高"：两栏的段落各排各的。
+ * 写成表格的只有两种清单，其余照旧按制表位写成段落：
+ *   - 会被当成双栏切开的：本页测出的栏间距，或全文共识的栏间距（docGutterX，本页自己测不出时分栏按它切，
+ *     LTB-07 第 7 页），正好落在词条与释义之间；
+ *   - 词条栏宽（释义从版心宽度 25% 以外起排）、有条目折行、又不是条款编号的：不分栏时每个折行各成一段，
+ *     两行的词条与释义的第二行拼进同一段，一句话被切成几段分别翻译。
+ *   释义起点靠左的邮件抬头（From / To / Subject，LTB-14）、条款编号（悬挂缩进另有处理）不改成表格；
+ *   文字压在整页底图上的页（扫描的表单，scan-text.pdf 第 6 页）也不改：精确排版按原位置把每行放在底图的格子上，
+ *   换成表格会和底图错开。
+ * 同一份文件里词条、释义起点相同的清单（listCols，跨页的释义）一并写成表格：前一页的释义改成表格后，
+ * 全文共识的栏间距随之消失，后一页就不再被切开，同一份释义一页是表格、一页是段落。
+ */
+type DefinitionCols = { A: number; B: number };
+function detectDefinitionList(page: PageModel, taken: Set<Span>, docGutterX?: number, listCols: DefinitionCols[] = [], found?: DefinitionCols[]): TableDraft[] {
+  const free = page.spans.filter((sp) => !taken.has(sp) && sp.text.trim() && !sp.img);
+  if (free.length < 12) return [];
+  const lines = buildLines(free).sort((a, b) => a.top - b.top);
+  const X0 = Math.min(...lines.map((l) => l.x0)), X1 = Math.max(...lines.map((l) => l.x1)), W = X1 - X0;
+  if (W < 200) return [];
+  const pageGutter = detectGutter(lines, { x0: X0, x1: X1 });
+  const cuts = [pageGutter?.x, docGutterX].filter((x): x is number => x !== undefined);
+  // 一行里按明显的空白切成几块（左栏词条、右栏释义各一块）。
+  // 招股书封面的"项目 : 内容"列表里，单独的冒号紧贴右栏：块的起点按冒号之后的文字算，冒号另记
+  type Piece = { spans: Span[]; x0: number; x1: number; top: number; bottom: number; colon?: Span };
+  const isColon = (sp: Span) => /^[:：]$/.test(sp.text.trim());
+  const pieces = (l: Line): Piece[] => {
+    const out: Piece[] = [];
+    for (const sp of [...l.spans].sort((a, b) => a.x0 - b.x0)) {
+      const last = out[out.length - 1];
+      if (last && sp.x0 - last.x1 < Math.max(8, 1.5 * sp.size)) {
+        last.spans.push(sp); last.x1 = Math.max(last.x1, sp.x1); last.top = Math.min(last.top, sp.top); last.bottom = Math.max(last.bottom, sp.bottom);
+        if (last.colon && last.spans.length === 2) last.x0 = sp.x0;
+      } else out.push({ spans: [sp], x0: sp.x0, x1: sp.x1, top: sp.top, bottom: sp.bottom, ...(isColon(sp) ? { colon: sp } : {}) });
+    }
+    // 只有一个冒号、后面没有文字的块不算冒号块
+    for (const p of out) if (p.colon && p.spans.length === 1) delete p.colon;
+    return out;
+  };
+  const split = lines.map((l) => ({ l, ps: pieces(l) }));
+  // 右栏起点：版心 15%–60% 处最常见的块起点
+  const starts = new Map<number, number>();
+  for (const { ps } of split) for (const p of ps) if (p.x0 > X0 + 0.15 * W && p.x0 < X0 + 0.6 * W) starts.set(Math.round(p.x0), (starts.get(Math.round(p.x0)) ?? 0) + 1);
+  const ranked = [...starts.entries()].sort((a, b) => b[1] - a[1]);
+  if (!ranked.length || ranked[0][1] < 6) return [];
+  const B = ranked[0][0];
+  const atB = (x: number) => Math.abs(x - B) <= 2;
+  // 左栏起点：右栏起点左侧最常见的块起点
+  const lstarts = new Map<number, number>();
+  for (const { ps } of split) for (const p of ps) if (p.x1 < B - 6) lstarts.set(Math.round(p.x0), (lstarts.get(Math.round(p.x0)) ?? 0) + 1);
+  const lranked = [...lstarts.entries()].sort((a, b) => b[1] - a[1]);
+  if (!lranked.length) return [];
+  const A = lranked[0][0];
+  const atA = (x: number) => Math.abs(x - A) <= 3;
+  // 每行：左块（起于 A、止于右栏之前）、右块（起于 B），二者至少有一个，别无他块
+  type Row = { l: Line; L?: Piece; R?: Piece };
+  const rowOf = ({ l, ps }: { l: Line; ps: Piece[] }): Row | null => {
+    if (!ps.length || ps.length > 2) return null;
+    const L = ps.find((p) => atA(p.x0) && p.x1 < B - 6), R = ps.find((p) => atB(p.x0));
+    if ((L ? 1 : 0) + (R ? 1 : 0) !== ps.length) return null;
+    return { l, L, R };
+  };
+  const out: TableDraft[] = [];
+  let i = 0;
+  while (i < split.length) {
+    const run: Row[] = [];
+    let j = i;
+    for (; j < split.length; j++) {
+      const r = rowOf(split[j]);
+      if (!r) break;
+      // 行距过大（另起一块内容）也结束
+      if (run.length && r.l.top - run[run.length - 1].l.bottom > 3 * r.l.size) break;
+      run.push(r);
+    }
+    i = Math.max(j, i + 1);
+    if (run.length < 8) continue;
+    const left = run.filter((r) => r.L).map((r) => r.L!), right = run.filter((r) => r.R).map((r) => r.R!);
+    if (left.length < 4 || right.length < 4) continue;
+    // 冒号列：有词条的行，右块都以同一位置的冒号开头
+    const withL = run.filter((r) => r.L && r.R);
+    const colons = withL.map((r) => r.R!.colon).filter((c): c is Span => !!c);
+    const colonCol = colons.length >= 4 && colons.length >= 0.8 * withL.length && Math.max(...colons.map((c) => c.x0)) - Math.min(...colons.map((c) => c.x0)) <= 2;
+    const leftW = Math.max(...left.map((p) => p.x1)) - A, rightW = Math.max(...right.map((p) => p.x1)) - B;
+    if (leftW >= (colonCol ? 1 : 0.75) * rightW) continue;
+    // 词条：左栏的段首。词条的续行正好在上一行下方一个行距处；新的词条更低（释义多行，或条目之间有段距），
+    // 或者是紧接上一个词条的右引号另起的引号（条目之间没有段距时）。行距取这一段里相邻两行的最小间距。
+    // 右栏不按行距分段：多行释义之后往往没有额外的段距（LTB-07）
+    const steps = run.slice(1).map((r, k) => r.l.top - run[k].l.top).filter((d, k) => d > 0.5 * run[k + 1].l.size);
+    const lineH = steps.length ? Math.min(...steps) : 0;
+    const text = (p: Piece) => p.spans.map((sp) => sp.text).join("").trim();
+    const quoted = (p: Piece, prev: Piece) => /^[“"「『]/.test(text(p)) && /[”"」』]$/.test(text(prev));
+    // 有冒号列时，带冒号的行就是一个条目的第一行（项目名称折行时续行没有冒号，行距也一样）
+    const ls = colonCol
+      ? withL.filter((r) => r.R!.colon).map((r) => r.L!)
+      : left.filter((p, k) => k === 0 || p.top - left[k - 1].top > 1.12 * lineH + 0.5 || quoted(p, left[k - 1]));
+    // 左栏大多是一行的词条（正文双栏的左栏大多是续行）；每个词条都有右栏的一行与它同高
+    if (ls.length < 0.6 * left.length) continue;
+    const aligned = ls.filter((p) => right.some((q) => Math.abs(q.top - p.top) <= 1.5));
+    if (aligned.length < 4 || aligned.length < 0.8 * ls.length) continue;
+    // 表格从第一条开始：之前只在一栏的行留在正文
+    const first = aligned[0].top;
+    const rows = run.filter((r) => r.l.top >= first - 1.5);
+    const spans = rows.flatMap((r) => r.l.spans);
+    const x0 = Math.min(...spans.map((sp) => sp.x0)) - CELL_MARGIN, x1 = Math.max(...spans.map((sp) => sp.x1)) + CELL_MARGIN;
+    const cx0 = colonCol ? Math.min(...colons.map((c) => c.x0)) : B, cx1 = colonCol ? Math.max(...colons.map((c) => c.x1)) : B;
+    const leftX1 = Math.max(...left.map((p) => p.x1));
+    const sameCols = listCols.some((c) => Math.abs(c.A - A) <= 3 && Math.abs(c.B - B) <= 2);
+    const cut = cuts.some((x) => x >= leftX1 - 1 && x <= cx0 + 1);
+    const wraps = rows.length > aligned.length;
+    const numbered = aligned.filter((p) => CLAUSE_LABEL.test(text(p))).length >= 0.5 * aligned.length;
+    if (!sameCols && !cut && !(wraps && !numbered && cx0 > X0 + 0.25 * W)) continue;
+    found?.push({ A, B });
+    const gx = (leftX1 + cx0) / 2;
+    const y0 = Math.min(...spans.map((sp) => sp.top)) - 1, y1 = Math.max(...spans.map((sp) => sp.bottom)) + 1;
+    // 行界：下一条的第一行之上、上一条最后一行之下的正中
+    const ys = [y0];
+    for (const p of aligned.slice(1)) {
+      const above = rows.filter((r) => r.l.top < p.top - 1.5);
+      const lastBottom = Math.max(...above.map((r) => r.l.bottom));
+      ys.push((lastBottom + Math.min(p.top, ...rows.filter((r) => Math.abs(r.l.top - p.top) <= 1.5).map((r) => r.l.top))) / 2);
+    }
+    ys.push(y1);
+    const xs = colonCol ? [x0, gx, (cx1 + B) / 2, x1] : [x0, gx, x1];
+    // 行界写成不可见的横线（无横线时上下格会被纵向合并成一格）
+    const hs: HSeg[] = ys.map((y) => ({ y, x0, x1, w: 0, color: "none", src: [] }));
+    out.push({ x0, x1, y0, y1, xs, ys, hs, vs: xs.map((x) => ({ x, y0, y1, w: 0, color: "none", src: [] })), spans });
+    for (const sp of spans) taken.add(sp);
+  }
+  return out;
+}
+
 function coverageH(hs: HSeg[], y: number, xa: number, xb: number): HSeg | null {
   const cand = hs.filter((h) => Math.abs(h.y - y) <= 2 && h.x1 > xa && h.x0 < xb);
   const cov = cand.reduce((a, h) => a + Math.min(h.x1, xb) - Math.max(h.x0, xa), 0);
@@ -1786,6 +1922,18 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
   const scanPlan = flow ? planScanPages(pages) : new Map<PageModel, ScanPlan>();
   const scanStats = { textPages: [] as number[], formPages: [] as number[], blocks: 0, inline: 0, furniture: 0, stray: 0, pageNumbers: 0, header: 0 };
 
+  // 全文共识的栏间距（与下面分栏时的共识同一做法：≥ 20% 的文字页测得出栏间距时取其中位数），释义清单检测用：
+  // 本页自己测不出栏间距、却会按共识被切成两栏的释义页（LTB-07 第 7 页）
+  const docGutterX = (() => {
+    const ls = pages.map((pg) => buildLines(pg.spans.filter((sp) => sp.text.trim() && !sp.img)));
+    const found = ls.filter((l) => l.length >= 6).map((l) => detectGutter(l, { x0: Math.min(...l.map((x) => x.x0)), x1: Math.max(...l.map((x) => x.x1)) }));
+    const xs = found.filter((g): g is NonNullable<typeof g> => !!g).map((g) => g.x).sort((a, b) => a - b);
+    return xs.length && xs.length >= 0.2 * found.length ? xs[Math.floor(xs.length / 2)] : undefined;
+  })();
+  // 会被切成两栏的释义清单的词条、释义起点（表格里的文字不算）
+  const listCols: DefinitionCols[] = [];
+  for (const pg of pages) if (!pageBackgrounds(pg).length) detectDefinitionList(pg, new Set(detectTables(pg).tables.flatMap((t) => t.spans)), docGutterX, [], listCols);
+
   // 预处理：矢量图（渲染为图片）、表格、装饰线
   const pre = pages.map((pg) => {
     let figures: ImageBox[] = [];
@@ -1906,6 +2054,7 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
     const inTable = new Set(tables.flatMap((t) => t.spans));
     tables.push(...detectRuledTables(pg, used, inTable));
     tables.push(...detectSideBySide(pg, used, inTable));
+    if (!bgs.length) tables.push(...detectDefinitionList(pg, inTable, docGutterX, listCols));
     const free = pg.spans.filter((s) => !inTable.has(s));
     // 删除线 / 下划线也标在表格单元格里的文字上（2026-11-26 LTB-03 附件一：表内整行删除线丢失，原来只看表格外的文字）；
     // 没对上任何文字的线照旧

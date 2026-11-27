@@ -75,8 +75,10 @@ function docxText(buf: Buffer): string {
   return d.listBlocks().map((b) => b.text.replace(/⟨[^⟩]*⟩/g, "")).join("\n");
 }
 
-function verify(pages: PageModel[], docx: Buffer, rasterText = "") {
-  const src = charCounts(pages.flatMap((p) => p.spans.filter((s) => !s.img).map((s) => s.text)).join(""));
+function verify(pages: PageModel[], docx: Buffer, rasterText = "", lostText = "") {
+  // lostText：没有转成正文、也不在渲染出的图片里的旋转文字。它也是原文，计入分母、记为缺失（之前不计，
+  // 丢了文字仍报 100%）
+  const src = charCounts(pages.flatMap((p) => p.spans.filter((s) => !s.img).map((s) => s.text)).join("") + lostText);
   // 渲染为图片的区域：文字保存在替代文字中，计为已保留
   const out = charCounts(docxText(docx) + rasterText);
   // 并入正文字母的重音符号变成了组合字符（F + ˆ → F̂）：按原来的重音符号计数
@@ -145,10 +147,22 @@ async function runBuiltin(buf: Buffer, title: string, pages: PageModel[], mode: 
     ? `${model.stats.vectorShapes} 处零散的矢量图形（不构成完整的图）未能转换。`
     // 不能渲染时，完整的矢量图、文字被转成轮廓的表格也都算在这里：明确说出来，而不是混在"零散图形"里
     : `${model.stats.vectorShapes} 处矢量图形未能转换：本环境不能渲染，矢量图、以轮廓绘制文字的表格和公式没有保留，请对照原 PDF。`);
-  if (model.stats.rotatedText) notes.push(`${model.stats.rotatedText} 段旋转文字未转换。`);
+  // 旋转文字（竖排、斜放）不转成正文：图里的（坐标轴标题等）随渲染出的图保留，其余的在 Word 里没有了，逐段说出来
+  const figures = renderBoxes(model).filter((r) => r.render?.kind === "figure" && r.png.length);
+  const rotated = pages.flatMap((pg) => (pg.rotated ?? []).map((t) => {
+    t.inFigure = figures.some((f) => f.render!.page === pg.index && t.x0 >= f.x0 - 1 && t.x1 <= f.x1 + 1 && t.y0 >= f.y0 - 1 && t.y1 <= f.y1 + 1);
+    return { ...t, page: pg.index + 1 };
+  }));
+  const lost = rotated.filter((t) => !t.inFigure && t.text.trim());
+  if (lost.length) {
+    const lostPages = [...new Set(lost.map((t) => t.page))];
+    const sample = lost.slice(0, 3).map((t) => `“${t.text.trim().slice(0, 20)}”`).join("、");
+    notes.push(`第 ${formatPageRange(lostPages)} 页有 ${lost.length} 段旋转文字（竖排或斜放）没有转成正文，例如 ${sample}，请对照原 PDF。`);
+  }
+  if (rotated.length > lost.length) notes.push(`${rotated.length - lost.length} 段旋转文字是图中的标注，随图保留。`);
   if (model.stats.columnPages) notes.push(`${model.stats.columnPages} 页检测到双栏排版，已用 Word 分栏还原。`);
   if (model.notes) notes.push(...model.notes);
-  return { data, stats: model.stats, notes, rasterText: model.rasterText };
+  return { data, stats: model.stats, notes, rasterText: model.rasterText, lostText: lost.map((t) => t.text).join("") };
 }
 
 async function findPython(): Promise<string[] | null> {
@@ -235,7 +249,7 @@ export async function pdfToDocx(buf: Buffer, opts: { engine?: PdfEngine; title?:
   }
 
   let data: Buffer;
-  let rasterText = "";
+  let rasterText = "", lostText = "";
   let stats = { pages: pages.length, paragraphs: 0, tables: 0, images: 0, columnPages: 0, figures: 0, equations: 0 };
   let scanPages: ConversionReport["scanPages"];
   if (engine === "builtin") {
@@ -251,6 +265,7 @@ export async function pdfToDocx(buf: Buffer, opts: { engine?: PdfEngine; title?:
     const r = await runBuiltin(buf, opts.title ?? "文档", pages, opts.mode ?? "exact", new Set(unread.map((n) => n - 1)));
     data = r.data;
     rasterText = r.rasterText;
+    lostText = r.lostText;
     const { scan, ...rest } = r.stats;
     stats = rest;
     // 扫描页的说明排在前面：它说的是正文从哪来、哪些页没有转成文字，比版式上的说明要紧
@@ -278,7 +293,7 @@ export async function pdfToDocx(buf: Buffer, opts: { engine?: PdfEngine; title?:
     notes.push("LibreOffice 引擎把每行文字放在独立的文本框里：版面接近，但修改时文字不会自动换行，建议优先使用内置引擎。");
   }
 
-  const v = verify(pages, data, rasterText);
+  const v = verify(pages, data, rasterText, lostText);
   if (v.coverage < 0.995 && v.missing) notes.unshift(`有 ${Math.round((1 - v.coverage) * v.total)} 个字符未能转换（例如：${v.missing}），请对照原 PDF 检查。`);
   if (engine !== "builtin") {
     const d = new DocxDocument(data);

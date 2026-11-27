@@ -1887,6 +1887,60 @@ await test("扫描图拆分（scanLayer）：墨迹太多、碎片太多或和�
   assert(fig && !looksLikeText(fig) && fig.graphicCount >= 1, `一幅带几个标注的附图不是文字页：${fig && JSON.stringify({ lines: fig.textLines, glyphs: fig.glyphCount, graphics: fig.graphicCount })}`);
 });
 
+await test("合成斜体（只倾斜、不旋转的文字）是正文、按斜体转换；真正旋转的文字不转换，但计入文字完整性的缺失并点名", async () => {
+  // 2026-11-27 LTB-05：浏览器用倾斜矩阵合成的斜体 IPC 分类号被当成旋转文字丢掉，文字完整性仍报 100%
+  const { pdfToDocx } = await import("../src/services/pdfConvert/index.js");
+  const pdf = await fixture("italic-rotated.pdf");
+  for (const mode of ["exact", "flow"] as const) {
+    const { data, report } = await pdfToDocx(pdf, { mode });
+    const xml = new ZipPackage(data).readText("word/document.xml");
+    const runs = (xml.match(/<w:r>[\s\S]*?<\/w:r>/g) ?? []).map((r) => ({ italic: r.includes("<w:i/>"), text: (r.match(/<w:t[^>]*>([^<]*)<\/w:t>/g) ?? []).map((t) => t.replace(/<[^>]+>/g, "")).join("") }));
+    for (const want of ["F16H 25/22", "G01L 5/00", "一种合成测试用的丝杠传动装置"]) {
+      const run = runs.find((r) => r.text.includes(want));
+      assert(run, `${mode}：倾斜的文字应转成正文：${want}`);
+      assert(run!.italic, `${mode}：倾斜的文字应为斜体：${want}`);
+    }
+    assert(report.notes.some((n) => n.includes("有 1 段旋转文字")), `${mode}：只有边注是旋转文字：${report.notes.join(" | ")}`);
+    assert(report.textCoverage < 1 && report.missing.includes("仅"), `${mode}：没转换的边注计入缺失：${report.textCoverage} ${report.missing}`);
+    assert(report.notes.some((n) => n.includes("旋转文字") && n.includes("合成测试文件 仅供测试")), `${mode}：说明点名没转换的旋转文字：${report.notes.join(" | ")}`);
+  }
+});
+
+await test("释义清单、封面的“项目 : 内容”清单写成无边框表格，一条一行；正文双栏仍是分栏", async () => {
+  // 2026-11-27 LTB-07：释义页、封面清单被当成正文双栏，词条与释义分在两栏、对不上
+  const { pdfToDocx } = await import("../src/services/pdfConvert/index.js");
+  const pdf = await fixture("definitions.pdf");
+  for (const mode of ["exact", "flow"] as const) {
+    const { data, report } = await pdfToDocx(pdf, { mode });
+    const xml = new ZipPackage(data).readText("word/document.xml");
+    // 格内的换行（exact 保留原来的折行：分段或 <w:br/>）按一个空格算
+    const text = (s: string) => (s.replace(/<\/w:p>|<w:br[^>]*\/>/g, "<w:t> </w:t>").match(/<w:t[^>]*>[^<]*<\/w:t>/g) ?? []).map((t) => t.replace(/<[^>]+>/g, "")).join("").replace(/ +/g, " ").trim();
+    const tables = (xml.match(/<w:tbl>[\s\S]*?<\/w:tbl>/g) ?? []).map((t) => (t.match(/<w:tr[ >][\s\S]*?<\/w:tr>/g) ?? []).map((r) => (r.match(/<w:tc>[\s\S]*?<\/w:tc>/g) ?? []).map(text)));
+    const cover = tables.find((t) => t[0]?.[0]?.startsWith("Number of Offer Shares"));
+    assert(cover, `${mode}：封面清单应写成表格`);
+    eq(cover!.length, 6, `${mode}：封面清单一条一行`);
+    eq(cover![0].join(" | "), "Number of Offer Shares under the Global Offering | : | 80,000,000 Shares (subject to the Over-allotment Option)", `${mode}：折行的项目名称与内容同在一行`);
+    eq(cover![3][0], "Maximum Offer Price", `${mode}：项目名称各自成格`);
+    assert(cover![3][2].startsWith("HK$3.20") && cover![3][2].endsWith("0.00565%"), `${mode}：多行内容同在一格：${cover![3][2]}`);
+    const defs = tables.find((t) => t[0]?.[0] === "“Accountants’ Report”");
+    assert(defs, `${mode}：释义清单应写成表格`);
+    eq(defs!.length, 13, `${mode}：释义一条一行`);
+    for (const row of defs!) eq(row.length, 2, `${mode}：释义表两列：${row.join(" | ")}`);
+    const row = (term: string) => defs!.find((r) => r[0] === term);
+    assert(row("“Companies (Winding Up and Miscellaneous Provisions) Ordinance”")?.[1].startsWith("the Companies (Winding Up"), `${mode}：两行的词条与释义同在一行`);
+    assert(row("“Articles”")?.[1].endsWith("as amended from time to time"), `${mode}：多行释义同在一格`);
+    for (const [term, meaning] of [["“SFC”", "the Securities and Futures Commission"], ["“SFO”", "the Securities and Futures Ordinance"], ["“US$”", "United States dollars"]]) {
+      assert(row(term)?.[1].startsWith(meaning), `${mode}：没有段距、只靠引号分开的条目各自一行：${term}`);
+    }
+    eq(report.columnPages, 1, `${mode}：只有第 3 页的正文双栏用 Word 分栏`);
+    eq(report.textCoverage, 1, `${mode}：文字完整`);
+    // 邮件抬头不会被分栏，仍是按制表位对齐的段落（LTB-14）
+    assert(!tables.some((t) => t.some((r) => r.some((c) => c.startsWith("From:") || c.startsWith("Subject:")))), `${mode}：邮件抬头不改成表格`);
+    const paras = (xml.match(/<w:p[ >][\s\S]*?<\/w:p>/g) ?? []).filter((p) => !/<w:tbl>/.test(p)).map((p) => text(p.replace(/<w:tab\/>/g, "<w:t>\t</w:t>")));
+    for (const label of ["From:", "Subject:", "Attachments:"]) assert(paras.some((p) => p.startsWith(label + "\t")), `${mode}：邮件抬头按制表位对齐：${label}`);
+  }
+});
+
 // ---------------------------------------------------------------------------
 
 await fs.rm(tmp, { recursive: true, force: true });
