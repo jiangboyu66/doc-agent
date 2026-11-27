@@ -710,6 +710,18 @@ await test("从右往左的文字（希伯来文）：写成 bidi 段落；行�
   }
 });
 
+await test("带透明边的图（Office 图表导出）按不透明的部分裁剪：不再伸进右栏、被当成横跨两栏的图把两栏正文挤到下一页（两种模式）", async () => {
+  const { pdfToDocx } = await import("../src/services/pdfConvert/index.js");
+  const pdf = await fixture("transparent-figure.pdf");
+  for (const mode of ["exact", "flow"] as const) {
+    const { data, report } = await pdfToDocx(pdf, { mode });
+    eq(report.textCoverage, 1, `${mode}：文字完整性`);
+    const xml = new ZipPackage(data).readText("word/document.xml");
+    const widths = [...xml.matchAll(/<wp:extent cx="(\d+)"/g)].map((m) => Math.round(Number(m[1]) / 12700));
+    eq(widths.join(","), "200", `${mode}：图宽是不透明部分的 200pt（原图 300pt，右边 100pt 透明）`);
+  }
+});
+
 await test("叠印加粗（同一段文字在几乎同一位置画了四遍）只留一份、记为粗体（两种模式）", async () => {
   const { pdfToDocx } = await import("../src/services/pdfConvert/index.js");
   const pdf = await fixture("overprint.pdf");
@@ -1503,7 +1515,7 @@ await test("所有夹具 PDF：两种排版方式都不报错、文字完整；L
   const run = promisify(execFile);
   const soffice = process.env.SOFFICE_PATH || "soffice";
   const hasSoffice = await run(soffice, ["--version"]).then(() => true, () => false);
-  const names = ["columns", "journal", "figures", "math", "journal-front", "journal-eq", "journal-fig", "bios", "colstart", "signature", "citecolor", "texpaper", "contract-cn", "scan-letter", "furniture-cn", "bates", "rotated-text", "mixed-pages", "image-slides", "open-table", "color-blocks", "form-boxes", "image-rows", "logo-corner", "overprint", "dense-cells", "rtl-list"];
+  const names = ["columns", "journal", "figures", "math", "journal-front", "journal-eq", "journal-fig", "bios", "colstart", "signature", "citecolor", "texpaper", "contract-cn", "scan-letter", "furniture-cn", "bates", "rotated-text", "mixed-pages", "image-slides", "open-table", "color-blocks", "form-boxes", "image-rows", "logo-corner", "overprint", "dense-cells", "rtl-list", "transparent-figure"];
   const dir = await fs.mkdtemp(path.join(tmp, "pages-"));
   const bad: string[] = [];
   for (const name of names) {

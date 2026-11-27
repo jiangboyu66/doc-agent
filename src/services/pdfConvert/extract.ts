@@ -220,6 +220,23 @@ function decodeImage(img: any): { data: Uint8Array | Uint8ClampedArray; w: numbe
 }
 
 /** 取像素区域 [c0,c1) × [r0,r1)（图像行从上到下） */
+/** RGBA 图片里不透明部分（alpha > 8）的像素范围 [c0, c1) × [r0, r1)；整张透明时为 null */
+function opaqueBounds(d: { data: Uint8Array | Uint8ClampedArray; w: number; h: number }): { c0: number; r0: number; c1: number; r1: number } | null {
+  let c0 = d.w, c1 = -1, r0 = d.h, r1 = -1;
+  for (let y = 0; y < d.h; y++) {
+    const row = y * d.w * 4;
+    let first = -1, last = -1;
+    for (let x = 0; x < d.w; x++) if (d.data[row + x * 4 + 3] > 8) { first = x; break; }
+    if (first < 0) continue;
+    for (let x = d.w - 1; x >= first; x--) if (d.data[row + x * 4 + 3] > 8) { last = x; break; }
+    if (first < c0) c0 = first;
+    if (last > c1) c1 = last;
+    if (y < r0) r0 = y;
+    r1 = y;
+  }
+  return c1 < 0 ? null : { c0, r0, c1: c1 + 1, r1: r1 + 1 };
+}
+
 function cropPixels(d: { data: Uint8Array | Uint8ClampedArray; w: number; h: number; ch: 1 | 3 | 4 }, c0: number, r0: number, c1: number, r1: number) {
   const w = c1 - c0, h = r1 - r0, out = new Uint8Array(w * h * d.ch);
   for (let y = 0; y < h; y++) out.set(d.data.subarray(((r0 + y) * d.w + c0) * d.ch, ((r0 + y) * d.w + c1) * d.ch), y * w * d.ch);
@@ -714,6 +731,19 @@ async function extractPage(page: any, index: number, OPS: any, Util: any): Promi
               dec = cropPixels(dec, c0, r0, c1, r1);
               box = vis;
             }
+          }
+        }
+        // 透明边：带透明通道的图片四周常留着大片完全透明的边（Office 图表导出的图片比图表本身宽出一倍）。按不透明的部分裁掉，
+        // 位置跟着收窄。以前整张图按原尺寸算，伸进旁边一栏，被当成横跨两栏的图：两栏正文整体往下挤，栏底的行溢到下一页
+        if (dec && dec.ch === 4 && box.x1 - box.x0 > 2 && box.y1 - box.y0 > 2) {
+          const axisAligned = Math.abs(corners[1][1] - corners[0][1]) < 0.05 && Math.abs(corners[2][0] - corners[0][0]) < 0.05;
+          const t = axisAligned ? opaqueBounds(dec) : null;
+          if (t && (t.c0 > 0.02 * dec.w || dec.w - t.c1 > 0.02 * dec.w || t.r0 > 0.02 * dec.h || dec.h - t.r1 > 0.02 * dec.h)) {
+            const [ox, oy] = corners[0], du = corners[1][0] - ox, dv = corners[2][1] - oy;
+            const xs2 = [ox + (t.c0 / dec.w) * du, ox + (t.c1 / dec.w) * du].sort((a, b) => a - b);
+            const ys2 = [oy + (1 - t.r1 / dec.h) * dv, oy + (1 - t.r0 / dec.h) * dv].sort((a, b) => a - b);
+            dec = cropPixels(dec, t.c0, t.r0, t.c1, t.r1);
+            box = { x0: xs2[0], y0: ys2[0], x1: xs2[1], y1: ys2[1] };
           }
         }
         const png = dec && { png: encodePng(dec.w, dec.h, dec.data, dec.ch), w: dec.w, h: dec.h };
