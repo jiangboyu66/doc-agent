@@ -1188,7 +1188,7 @@ await test("所有夹具 PDF：两种排版方式都不报错、文字完整；L
   const run = promisify(execFile);
   const soffice = process.env.SOFFICE_PATH || "soffice";
   const hasSoffice = await run(soffice, ["--version"]).then(() => true, () => false);
-  const names = ["columns", "journal", "figures", "math", "journal-front", "journal-eq", "journal-fig", "bios", "colstart", "signature", "citecolor", "texpaper", "contract-cn", "scan-letter", "furniture-cn", "bates"];
+  const names = ["columns", "journal", "figures", "math", "journal-front", "journal-eq", "journal-fig", "bios", "colstart", "signature", "citecolor", "texpaper", "contract-cn", "scan-letter", "furniture-cn", "bates", "agreement-front"];
   const dir = await fs.mkdtemp(path.join(tmp, "pages-"));
   const bad: string[] = [];
   for (const name of names) {
@@ -1938,6 +1938,89 @@ await test("释义清单、封面的“项目 : 内容”清单写成无边框�
     assert(!tables.some((t) => t.some((r) => r.some((c) => c.startsWith("From:") || c.startsWith("Subject:")))), `${mode}：邮件抬头不改成表格`);
     const paras = (xml.match(/<w:p[ >][\s\S]*?<\/w:p>/g) ?? []).filter((p) => !/<w:tbl>/.test(p)).map((p) => text(p.replace(/<w:tab\/>/g, "<w:t>\t</w:t>")));
     for (const label of ["From:", "Subject:", "Attachments:"]) assert(paras.some((p) => p.startsWith(label + "\t")), `${mode}：邮件抬头按制表位对齐：${label}`);
+  }
+});
+
+await test("协议的目录、罗马数字页码与下划线（2026-11-27 APA）：目录一条一段、页码前是带点状前导符的右对齐制表位；罗马数字页码写进前置部分的页脚，正文另起一节从 1 编页；附表、附件清单另起一页；只在被定义的词下面的线是字符下划线，定义条款不断开；定义术语索引写成两列表格", async () => {
+  const { pdfToDocx } = await import("../src/services/pdfConvert/index.js");
+  const { extractPdf } = await import("../src/services/pdfConvert/extract.js");
+  const { execFile } = await import("node:child_process");
+  const { promisify } = await import("node:util");
+  const run = promisify(execFile);
+  const soffice = process.env.SOFFICE_PATH || "soffice";
+  const hasSoffice = await run(soffice, ["--version"]).then(() => true, () => false);
+  const pdf = await fixture("agreement-front.pdf");
+  const text = (s: string) => (s.replace(/<w:tab\/>/g, "<w:t>\t</w:t>").replace(/<w:br\/>/g, "<w:t> </w:t>").match(/<w:t[^>]*>[^<]*<\/w:t>/g) ?? []).map((t) => t.replace(/<[^>]+>/g, "")).join("");
+  const dir = await fs.mkdtemp(path.join(tmp, "agreement-"));
+  for (const mode of ["exact", "flow"] as const) {
+    const { data, report } = await pdfToDocx(pdf, { mode });
+    const zip = new ZipPackage(data);
+    const xml = zip.readText("word/document.xml");
+    eq(report.textCoverage, 1, `${mode}：文字完整：${report.missing}`);
+    const paras = xml.replace(/<w:tbl>[\s\S]*?<\/w:tbl>/g, "").match(/<w:p[ >][\s\S]*?<\/w:p>/g) ?? [];
+    // 下划线：落在被定义的词上（字符下划线），没有代替它的带边框空段落；定义条款是一整段
+    const under = (xml.match(/<w:r>(?:(?!<\/w:r>)[\s\S])*?<w:u w:val="single"\/>(?:(?!<\/w:r>)[\s\S])*?<\/w:r>/g) ?? []).map(text);
+    for (const term of ["Northwind", "Buyer", "Accounts Payable", "Accrued Vacation Compensation", "Closing Date", "Confidentiality Agreement", "Conveyed Assets"]) {
+      assert(under.some((u) => u.trim() === term), `${mode}：“${term}”应带字符下划线：${JSON.stringify(under)}`);
+    }
+    assert(under.join("").replace(/\s/g, "").includes("WITNESSETH"), `${mode}：逐字母加宽排的 WITNESSETH 带下划线：${JSON.stringify(under)}`);
+    assert(!under.some((u) => /shall|Holdings|a Kentucky/.test(u)), `${mode}：下划线不延伸到被定义的词以外：${JSON.stringify(under)}`);
+    eq(paras.filter((p) => /<w:pBdr>/.test(p) && !text(p).trim()).length, 0, `${mode}：没有代替下划线的带边框空段落`);
+    for (const [head, tail] of [["“Accounts Payable” shall mean", "relating to the Business."], ["“Accrued Vacation Compensation” shall mean", "Closing Accounts Principles."], ["“Closing” shall mean", "agree in writing."]]) {
+      assert(paras.some((p) => { const t = text(p).replace(/\s+/g, " "); return t.includes(head) && t.includes(tail); }), `${mode}：定义条款是一整段：${head}`);
+    }
+    // 定义术语索引：术语与条款号同在一行——两列表格的一行，或按制表位对齐的一段；整页都是索引的那一页不被当成双栏
+    const rows = (xml.match(/<w:tr[ >][\s\S]*?<\/w:tr>/g) ?? []).map((r) => (r.match(/<w:tc>[\s\S]*?<\/w:tc>/g) ?? []).map((c) => text(c).trim()));
+    const tabbed = paras.map((p) => text(p).trim());
+    for (const [term, loc] of [["Accounts Receivable Facility", "Section 7.1(d)"], ["Northwind", "Preamble"], ["Assumed Tax Liabilities", "Section 2.5(k)"], ["Debt Financing", "Section 6.4(a)"], ["Foreign Jurisdictions", "Section 7.16"]]) {
+      assert(rows.some((r) => r.length === 2 && r[0] === term && r[1] === loc) || tabbed.includes(`${term}\t${loc}`),
+        `${mode}：索引“${term}”与条款号同在一行：${JSON.stringify([...rows.filter((r) => r.some((c) => c.includes(term))), ...tabbed.filter((t) => t.includes(term))])}`);
+    }
+    eq(report.columnPages, 0, `${mode}：没有分栏的页`);
+    if (mode === "exact") continue;
+    // 目录：一条一段，引导点改成带点状前导符的右对齐制表位
+    const toc = paras.map(text).filter((t) => /^(ARTICLE|Section) \d/.test(t) && /\t\d+$/.test(t));
+    eq(toc.length, 39, `${mode}：目录一条一段：${JSON.stringify(toc.slice(0, 6))}`);
+    assert(!paras.map(text).some((t) => /\.{6,}/.test(t)), `${mode}：引导点不留在文字里`);
+    assert(toc.includes("ARTICLE 6. CONDUCT OF ACTIONS RELATING TO ENVIRONMENTAL LOSSES AND OBLIGATIONS RELATING THERETO\t22"), `${mode}：折成两行的目录条目是一段：${toc.find((t) => t.startsWith("ARTICLE 6"))}`);
+    const tocXml = paras.filter((p) => /^(ARTICLE|Section) \d/.test(text(p)) && /\t\d+$/.test(text(p)));
+    assert(tocXml.every((p) => /<w:tab w:val="right" w:pos="\d+" w:leader="dot"\/>/.test(p)), `${mode}：页码前是带点状前导符的右对齐制表位`);
+    // 罗马数字页码：不在正文里；前置部分一节的页脚是小写罗马数字的页码域，正文另起一节（下一页）从 1 编页
+    assert(!/~[ivx]+~/.test(text(xml)), `${mode}：罗马数字页码不留在正文里`);
+    const sects = xml.match(/<w:sectPr>[\s\S]*?<\/w:sectPr>/g) ?? [];
+    const front = sects.findIndex((x) => /<w:pgNumType w:fmt="lowerRoman"/.test(x));
+    assert(front >= 0, `${mode}：前置部分一节用小写罗马数字页码：${sects.map((x) => x.match(/<w:pgNumType[^>]*>/)?.[0]).join(" ")}`);
+    const bodyStart = sects.findIndex((x, k) => k > front && /<w:pgNumType w:start="1"\/>/.test(x));
+    assert(bodyStart > front && !/w:val="continuous"/.test(sects[bodyStart]), `${mode}：正文另起一节、下一页开始、从 1 编页：${sects.map((x) => (x.match(/<w:pgNumType[^>]*>|w:val="continuous"|<w:footerReference[^>]*>/g) ?? []).join(" ")).join(" ‖ ")}`);
+    const footers = zip.names().filter((n) => /^word\/footer\d+\.xml$/.test(n)).map((n) => zip.readText(n));
+    assert(footers.some((f) => /~[\s\S]*PAGE[\s\S]*~/.test(f) && /\\\* roman/.test(f)), `${mode}：前置部分的页脚是"~页码~"`);
+    if (!hasSoffice) continue;
+    // LibreOffice 渲染：附表清单、附件清单、协议正文各自另起一页，页脚分别印 ~i~ … 与 1
+    const f = path.join(dir, `agreement-${mode}.docx`);
+    await fs.writeFile(f, data);
+    await run(soffice, ["--headless", "--convert-to", "pdf", "--outdir", dir, f], { timeout: 120000 }).catch(() => {});
+    const out = await fs.readFile(path.join(dir, `agreement-${mode}.pdf`)).catch(() => null);
+    assert(out, `${mode}：LibreOffice 应能渲染`);
+    const pages = await extractPdf(out!);
+    // 每页按纵坐标分行（相差 3pt 以内算同一行）
+    const lines = (k: number) => {
+      const ss = [...(pages[k]?.spans ?? [])].sort((a, b) => a.top - b.top || a.x0 - b.x0);
+      const out: Array<{ top: number; t: string }> = [];
+      for (const sp of ss) {
+        const last = out[out.length - 1];
+        if (last && Math.abs(sp.top - last.top) <= 3) last.t += " " + sp.text;
+        else out.push({ top: sp.top, t: sp.text });
+      }
+      return out.map((l) => l.t.replace(/\s+/g, " ").trim()).filter(Boolean);
+    };
+    eq(pages.length, 8, `${mode}：页数与原文相同：${pages.map((_, k) => `[${lines(k)[0]} … ${lines(k).slice(-2).join(" / ")}]`).join(" ")}`);
+    eq(lines(3)[0], "SCHEDULE LIST", `${mode}：附表清单另起一页`);
+    eq(lines(4)[0], "EXHIBITS", `${mode}：附件清单另起一页`);
+    eq(lines(5)[0], "AGREEMENT OF PURCHASE AND SALE", `${mode}：协议正文另起一页`);
+    for (const [k, label] of [[1, "~i~"], [2, "~ii~"], [3, "~iii~"], [4, "~iv~"], [5, "1"], [6, "2"]] as const) {
+      // 页码域与两边的"~"是不同的文字片段，取出来的文字中间有空格
+      assert(lines(k).slice(-3).some((t) => t.replace(/\s+/g, "") === label), `${mode}：第 ${k + 1} 页页脚印 ${label}：${JSON.stringify(lines(k).slice(-3))}；页脚部件：${footers.map((x) => x.replace(/<w:instrText[^>]*>|<\/w:instrText>/g, "").match(/w:instr="[^"]*"|<w:t[^>]*>[^<]*/g)?.join("")).join(" ‖ ")}；${JSON.stringify(report.notes ?? [])}`);
+    }
   }
 });
 

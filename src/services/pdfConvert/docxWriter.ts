@@ -39,21 +39,24 @@ class Writer {
   private paraSeq = 0x10000000;
   private sectCount = 0;
   /** 页眉页脚部件：在第一节的 sectPr 中引用 */
-  private hfParts: Array<{ kind: "header" | "footer"; type: "default" | "first" | "even"; name: string; rid: string; paras: Para[] }> = [];
+  private hfParts: Array<{ kind: "header" | "footer"; type: "default" | "first" | "even"; name: string; rid: string; paras: Para[]; front?: boolean }> = [];
 
   constructor(private m: DocModel) {
     let k = 0;
-    const add = (kind: "header" | "footer", set: HeaderSet | undefined) => {
+    const add = (kind: "header" | "footer", set: HeaderSet | undefined, front = false) => {
       if (!set) return;
       for (const type of ["default", "first", "even"] as const) {
         const paras = set[type];
         if (!paras) continue;
+        // 前置部分的首页（封面）与正文共用同一个部件
+        if (front && type === "first" && paras === (kind === "header" ? m.headers : m.footers)?.first) continue;
         k++;
-        this.hfParts.push({ kind, type, name: `${kind}${k}.xml`, rid: `rIdHf${k}`, paras });
+        this.hfParts.push({ kind, type, name: `${kind}${k}.xml`, rid: `rIdHf${k}`, paras, ...(front ? { front: true } : {}) });
       }
     };
     add("header", m.headers);
     add("footer", m.footers);
+    if (m.front) { add("header", m.front.headers, true); add("footer", m.front.footers, true); }
   }
 
   private rPr(r: Run): string {
@@ -94,7 +97,7 @@ class Writer {
     if (r.br) return `<w:r>${this.rPr(r)}<w:br w:clear="none"/></w:r>`;
     if (r.pageMark) return "<w:r><w:lastRenderedPageBreak/></w:r>";
     if (r.field) {
-      const instr = r.fieldDigits ? `${r.field} \\# "${"0".repeat(r.fieldDigits)}"` : r.field;
+      const instr = r.fieldDigits ? `${r.field} \\# "${"0".repeat(r.fieldDigits)}"` : r.fieldFormat ? `${r.field} \\* ${r.fieldFormat}` : r.field;
       return `<w:fldSimple w:instr=" ${esc(instr)} "><w:r>${this.rPr(r)}<w:t>${esc(r.text)}</w:t></w:r></w:fldSimple>`;
     }
     return `<w:r>${this.rPr(r)}<w:t xml:space="preserve">${esc(clean(r.text))}</w:t></w:r>`;
@@ -213,10 +216,18 @@ class Writer {
     // 每一节都显式引用页眉页脚（与继承等效；浏览器预览只认本节的引用）；起始页码只在第一节；
     // 从第一页开始的节标记"首页不同"
     const first = this.sectCount++ === 0;
-    const refs = this.hfParts.length ? this.hfParts.map((h) => `<w:${h.kind}Reference w:type="${h.type}" r:id="${h.rid}"/>`).sort((a, b) => (a.startsWith("<w:header") ? 0 : 1) - (b.startsWith("<w:header") ? 0 : 1)).join("") : "";
-    // 页码不能从负数起（原文第 3 页印 1、前两页不印时，起始页码算出来是 -1）：从 0 起，正文页码比原文大 1
-    const pgNum = first && m.pageNumStart !== undefined ? `<w:pgNumType w:start="${Math.max(0, m.pageNumStart)}"/>` : "";
-    const titlePg = s.titlePg && this.hfParts.some((h) => h.type === "first") ? "<w:titlePg/>" : "";
+    // 前置部分的节引用前置部分的部件（首页 / 封面那一套与正文共用），其余的节引用正文的部件
+    const parts = this.hfParts.filter((h) => (s.front && m.front
+      ? h.front || (h.type === "first" && !this.hfParts.some((x) => x.front && x.kind === h.kind && x.type === "first"))
+      : !h.front));
+    const refs = parts.length ? parts.map((h) => `<w:${h.kind}Reference w:type="${h.type}" r:id="${h.rid}"/>`).sort((a, b) => (a.startsWith("<w:header") ? 0 : 1) - (b.startsWith("<w:header") ? 0 : 1)).join("") : "";
+    // 页码不能从负数起（原文第 3 页印 1、前两页不印时，起始页码算出来是 -1）：从 0 起，正文页码比原文大 1。
+    // 有前置部分时：前置部分的第一节按罗马数字、从它第一页印的数编起（封面另成一节）；正文第一节重新从正文的页码编起
+    const pgNum = s.restart && m.front ? `<w:pgNumType w:start="${Math.max(0, m.front.bodyStart)}"/>`
+      : (s.frontStart || (first && s.front)) && m.front ? `<w:pgNumType w:fmt="${m.front.fmt}" w:start="${Math.max(1, m.front.start)}"/>`
+      : s.front && m.front ? `<w:pgNumType w:fmt="${m.front.fmt}"/>`
+      : first && m.pageNumStart !== undefined ? `<w:pgNumType w:start="${Math.max(0, m.pageNumStart)}"/>` : "";
+    const titlePg = s.titlePg && parts.some((h) => h.type === "first") ? "<w:titlePg/>" : "";
     const cols = s.cols > 1
       ? `<w:cols w:num="${s.cols}" w:space="${tw(s.colGap)}" w:equalWidth="0">${s.colWidths.map((w, i) => `<w:col w:w="${tw(w)}"${i < s.colWidths.length - 1 ? ` w:space="${tw(s.colGap)}"` : ""}/>`).join("")}</w:cols>`
       : '<w:cols w:space="425"/>';
@@ -238,7 +249,7 @@ class Writer {
 
     ppr.push('<w:widowControl w:val="0"/>');
     if (p.borderBottom) ppr.push(`<w:pBdr>${this.border("bottom", p.borderBottom, 0)}</w:pBdr>`);
-    if (p.tabs.length) ppr.push(`<w:tabs>${p.tabs.map((t) => `<w:tab w:val="${t.align}" w:pos="${tw(t.pos)}"/>`).join("")}</w:tabs>`);
+    if (p.tabs.length) ppr.push(`<w:tabs>${p.tabs.map((t) => `<w:tab w:val="${t.align}" w:pos="${tw(t.pos)}"${t.leader ? ` w:leader="${t.leader}"` : ""}/>`).join("")}</w:tabs>`);
     ppr.push('<w:autoSpaceDE w:val="0"/><w:autoSpaceDN w:val="0"/><w:adjustRightInd w:val="0"/><w:snapToGrid w:val="0"/>');
     // 图片段落：单倍行距（行高自动等于图片高度；不用"最小值"——浏览器预览会把它当成行高，图片上方多出一大块空白），其余为固定行距
     // 固定行距会裁掉比行高更高的内容（首字母、行内公式图片）：这种段落改用"最小值"，行高不变、内容不被裁
@@ -254,7 +265,7 @@ class Writer {
     if (ind.length) ppr.push(`<w:ind ${ind.join(" ")}/>`);
     if (p.align !== "left") ppr.push(`<w:jc w:val="${p.align}"/>`);
     if (p.tiny) ppr.push('<w:rPr><w:sz w:val="2"/><w:szCs w:val="2"/></w:rPr>');
-    if (p.sectionEnd) ppr.push(this.sectPr(p.sectionEnd, true));
+    if (p.sectionEnd) ppr.push(this.sectPr(p.sectionEnd, !p.sectionEnd.restart && !p.sectionEnd.frontStart));
 
     const body: string[] = [];
     if (p.columnBreakBefore) body.push('<w:r><w:br w:type="column"/></w:r>');
@@ -311,7 +322,7 @@ class Writer {
     });
     // 表格不能作为 body 的最后一个元素之前的节尾；Word 要求 body 以段落或 sectPr 结束
     if (this.m.blocks[this.m.blocks.length - 1]?.kind === "table") out.push(this.para({ kind: "p", runs: [], align: "left", indLeft: 0, indRight: 0, firstLine: 0, spaceBefore: 0, lineHeight: 1, tabs: [], tiny: true, size: 1 }));
-    return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<w:document ${NS}><w:body>${out.join("")}${this.sectPr(this.m.finalSection, this.m.blocks.some((b) => b.kind === "p" && !!b.sectionEnd))}</w:body></w:document>`;
+    return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<w:document ${NS}><w:body>${out.join("")}${this.sectPr(this.m.finalSection, this.m.blocks.some((b) => b.kind === "p" && !!b.sectionEnd) && !this.m.finalSection.restart && !this.m.finalSection.frontStart)}</w:body></w:document>`;
   }
 
   styles(): string {

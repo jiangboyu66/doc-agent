@@ -12,7 +12,8 @@
 
 import type { FillRect, ImageBox, PageModel, PathBox, Seg, Span } from "./extract.js";
 import { collectHyphenated, collectWords, isSoftHyphen, wordCounts } from "../../documents/hyphen.js";
-import { settleFurniture, type Furniture, type FurniturePick } from "./furniture.js";
+import { romanPage, settleFurniture, toRoman, type FrontMatter, type Furniture, type FurniturePick } from "./furniture.js";
+import { measureWord } from "./fonts.js";
 import { detectDropCaps, detectEquations, detectIconPaths, detectFigures, detectImageGrids, detectMaskInk, rawBase, rasterBox, removeInside, spansText, textHighlights, type Box, type MathCtx } from "./raster.js";
 import type { ScanPiece } from "./scanLayer.js";
 
@@ -42,6 +43,8 @@ export interface Run {
   field?: "PAGE" | "NUMPAGES";
   /** 域的数字格式：页码补零到的位数（PAGE \# "000000"） */
   fieldDigits?: number;
+  /** 页码写成罗马数字（PAGE \* roman / ROMAN：前置部分的页脚"~i~"） */
+  fieldFormat?: "roman" | "ROMAN";
   /** 原 PDF 的分页位置（写成 lastRenderedPageBreak，浏览器预览据此分页） */
   pageMark?: boolean;
   /** 行内图片（没有文字编码的公式 / 符号）：text 为占位符 U+FFFC */
@@ -54,7 +57,7 @@ export interface Run {
   shade?: string;
 }
 
-export interface TabStop { pos: number; align: "left" | "right" }
+export interface TabStop { pos: number; align: "left" | "right"; /** 点状前导符（目录的引导点） */ leader?: "dot" }
 export interface Border { width: number; color: string }
 
 export interface Para {
@@ -128,6 +131,12 @@ export interface SectionProps {
   cols: number; colWidths: number[]; colGap: number;
   /** 本节从第一页开始（流式模式）：首页使用"首页"页眉页脚 */
   titlePg?: boolean;
+  /** 前置部分（罗马数字页码）的节：用前置部分的页眉页脚 */
+  front?: boolean;
+  /** 正文的第一节（前置部分之后）：从下一页开始，页码重新编号 */
+  restart?: boolean;
+  /** 前置部分的第一节（前面有封面）：从下一页开始，按罗马数字从前置部分第一页印的数编起 */
+  frontStart?: boolean;
 }
 
 /** 页眉 / 页脚（流式模式）：首页、奇数页（默认）、偶数页 */
@@ -159,6 +168,11 @@ export interface DocModel {
   footerDist?: number;
   /** 第一页的页码（PDF 中印刷的页码不从 1 开始时） */
   pageNumStart?: number;
+  /**
+   * 前置部分（流式模式）：这几页的页眉页脚、罗马数字页码的格式与起始值（前置部分第一页印的数，目录第一页印 i 时是 1）；
+   * bodyStart：正文第一页的页码
+   */
+  front?: { headers: HeaderSet; footers: HeaderSet; fmt: "lowerRoman" | "upperRoman"; start: number; bodyStart: number };
   /** 需要告诉用户的版面取舍（如写不进 Word 页眉页脚的内容） */
   notes?: string[];
 }
@@ -846,10 +860,16 @@ function detectDefinitionList(page: PageModel, taken: Set<Span>, docGutterX?: nu
     return out;
   };
   const split = lines.map((l) => ({ l, ps: pieces(l) }));
-  // 右栏起点：版心 15%–60% 处最常见的块起点
-  const starts = new Map<number, number>();
-  for (const { ps } of split) for (const p of ps) if (p.x0 > X0 + 0.15 * W && p.x0 < X0 + 0.6 * W) starts.set(Math.round(p.x0), (starts.get(Math.round(p.x0)) ?? 0) + 1);
-  const ranked = [...starts.entries()].sort((a, b) => b[1] - a[1]);
+  // 右栏起点：版心 15%–60% 处最常见的块起点。没有的话再看 60%–92%：定义术语索引（"Term … Location"）的右栏是一列
+  // 短的出处（"Section 7.1(d)"），从版心 80% 处起排（2026-11-27 APA：索引排满三页，被当成正文双栏，术语与条款号对不上）
+  const rankStarts = (lo: number, hi: number) => {
+    const starts = new Map<number, number>();
+    for (const { ps } of split) for (const p of ps) if (p.x0 > X0 + lo * W && p.x0 < X0 + hi * W) starts.set(Math.round(p.x0), (starts.get(Math.round(p.x0)) ?? 0) + 1);
+    return [...starts.entries()].sort((a, b) => b[1] - a[1]);
+  };
+  let ranked = rankStarts(0.15, 0.6);
+  const index = !ranked.length || ranked[0][1] < 6;
+  if (index) ranked = rankStarts(0.6, 0.92);
   if (!ranked.length || ranked[0][1] < 6) return [];
   const B = ranked[0][0];
   const atB = (x: number) => Math.abs(x - B) <= 2;
@@ -889,16 +909,22 @@ function detectDefinitionList(page: PageModel, taken: Set<Span>, docGutterX?: nu
     const colons = withL.map((r) => r.R!.colon).filter((c): c is Span => !!c);
     const colonCol = colons.length >= 4 && colons.length >= 0.8 * withL.length && Math.max(...colons.map((c) => c.x0)) - Math.min(...colons.map((c) => c.x0)) <= 2;
     const leftW = Math.max(...left.map((p) => p.x1)) - A, rightW = Math.max(...right.map((p) => p.x1)) - B;
-    if (leftW >= (colonCol ? 1 : 0.75) * rightW) continue;
+    const text = (p: Piece) => p.spans.map((sp) => sp.text).join("").trim();
+    // 索引：右栏每一块都是与左栏某一行同高的短出处（不折行），这时右栏比左栏窄
+    const isIndex = index && right.every((q) => text(q).length <= 40 && left.some((p) => Math.abs(p.top - q.top) <= 1.5));
+    if (index && !isIndex) continue;
+    if (!isIndex && leftW >= (colonCol ? 1 : 0.75) * rightW) continue;
     // 词条：左栏的段首。词条的续行正好在上一行下方一个行距处；新的词条更低（释义多行，或条目之间有段距），
     // 或者是紧接上一个词条的右引号另起的引号（条目之间没有段距时）。行距取这一段里相邻两行的最小间距。
     // 右栏不按行距分段：多行释义之后往往没有额外的段距（LTB-07）
     const steps = run.slice(1).map((r, k) => r.l.top - run[k].l.top).filter((d, k) => d > 0.5 * run[k + 1].l.size);
     const lineH = steps.length ? Math.min(...steps) : 0;
-    const text = (p: Piece) => p.spans.map((sp) => sp.text).join("").trim();
     const quoted = (p: Piece, prev: Piece) => /^[“"「『]/.test(text(p)) && /[”"」』]$/.test(text(prev));
     // 有冒号列时，带冒号的行就是一个条目的第一行（项目名称折行时续行没有冒号，行距也一样）
-    const ls = colonCol
+    // 索引：右栏有出处的每一行就是一条（一行一条，行距都相同）
+    const ls = isIndex
+      ? left.filter((p) => right.some((q) => Math.abs(q.top - p.top) <= 1.5))
+      : colonCol
       ? withL.filter((r) => r.R!.colon).map((r) => r.L!)
       : left.filter((p, k) => k === 0 || p.top - left[k - 1].top > 1.12 * lineH + 0.5 || quoted(p, left[k - 1]));
     // 左栏大多是一行的词条（正文双栏的左栏大多是续行）；每个词条都有右栏的一行与它同高
@@ -966,6 +992,37 @@ const isCentered = (l: Line, r: Region) => {
   return lg > Math.max(4, 0.04 * w) && Math.abs(lg - rg) <= Math.max(3, 0.025 * w);
 };
 const isRight = (l: Line, r: Region) => r.x1 - l.x1 <= 3 && l.x0 - r.x0 > 0.2 * (r.x1 - r.x0);
+
+/** 行尾是引导点和页码的行（目录的一条）："Section 1.1. Definitions……1""第一章 总则 · · · · · ii" */
+const CONTENTS_END = /\s*(?:[.·…]\s?){4,}\s*(\d{1,4}|[ivxlcdm]{1,7})\s*$/i;
+const contentsLine = (l: Line) => CONTENTS_END.test(l.spans.map((sp) => sp.text).join(""));
+
+/**
+ * 目录的一条（流式模式）：引导点是文字，译文长短一变，页码就不在行尾了。末尾的引导点和页码前的空白改成右对齐、
+ * 带点状前导符的制表位（位置是原来页码的右端），页码跟在后面。返回去掉的引导点（计入完整性校验）；没有改时为 null
+ */
+function contentsTab(runs: Run[], tabs: TabStop[], pos: number): string | null {
+  // 制表符算空白（页码前已有一个大间距写成的制表符时，它连同引导点一起换掉）
+  const all = runs.map((x) => (x.tab ? "\t" : x.br || x.img ? "\u0001" : x.text)).join("");
+  const m = all.match(CONTENTS_END);
+  if (!m || m.index === undefined || m.index === 0) return null;
+  let drop = all.length - m.index;
+  let numFmt: Run | undefined;
+  while (drop > 0 && runs.length) {
+    const last = runs[runs.length - 1];
+    const len = last.tab || last.br || last.img ? 1 : last.text.length;
+    if (!numFmt && !last.tab && !last.br && !last.img && last.text.trim()) numFmt = last;
+    if (len <= drop) { runs.pop(); drop -= len; }
+    else { last.text = last.text.slice(0, last.text.length - drop); drop = 0; }
+  }
+  const tail = runs[runs.length - 1];
+  if (!tail || !numFmt) return null;
+  if (!tail.tab && !tail.br) tail.text = tail.text.replace(/\s+$/, "");
+  runs.push({ ...plainFmt(numFmt), text: "", tab: true, underline: undefined, strike: undefined }, { ...plainFmt(numFmt), text: m[1], underline: undefined });
+  const keep = tabs.filter((t) => t.pos < pos - 2);
+  tabs.splice(0, tabs.length, ...keep, { pos, align: "right", leader: "dot" });
+  return m[0].replace(/[^.·…]/g, "");
+}
 
 /** 行内有制表间距（并排的标签、签字栏）；skipLabel：行首编号后的制表间距不算（悬挂缩进的条款） */
 function hasBigGap(l: Line, skipLabel = false): boolean {
@@ -1096,6 +1153,15 @@ function groupParagraphs(lines: Line[], r: Region, ctx?: Ctx): Array<{ lines: Li
       // （标题等非正文字号的行、两行都居中的行另按原来的判据，不在此列）
       const runOn = !wrapped && leftOk && !hasBigGap(a, true) && pitchKey(a.size) === bodySize && !(isCentered(a, r) && isCentered(l, r)) &&
         continuesSentence(a, l, edge);
+      // 目录（流式模式）：每条自成一段——上一行以引导点和页码结束就另起一段；条目的标题折成两行时（只有最后一行带引导点），
+      // 前面的行接到这一条里
+      const contents = ctx?.mode === "flow";
+      if (contents && contentsLine(a)) { paras.push([l]); paraEdge.push(edges[idx]); return; }
+      if (contents && contentsLine(l) && !P.some(contentsLine) && sizeOk && gapOk && leftOk && !hasBigGap(a, true) && !isCentered(a, r)) {
+        P.push(l);
+        paraEdge[paraEdge.length - 1] = Math.max(paraEdge[paraEdge.length - 1], edges[idx]);
+        return;
+      }
       if (sizeOk && gapOk && (!startsBullet || inlineToken) && !hasBigGap(l) && (((wrapped || runOn) && leftOk && !hasBigGap(a, true)) || centered)) {
         P.push(l);
         paraEdge[paraEdge.length - 1] = Math.max(paraEdge[paraEdge.length - 1], edges[idx]);
@@ -1223,6 +1289,8 @@ interface Ctx {
   counts: Map<string, number>;
   /** 去掉的排版断词连字符（计入完整性校验） */
   softHyphens: number;
+  /** 改成制表位前导符的目录引导点（计入完整性校验） */
+  leaders?: string;
   /** 全文各字号正文的主流行距（基线间距，pt）：判断段内换行的上限 */
   pitch?: Map<number, number>;
   /** 逐行一致模式：本页页首锚点段落上的文本框（排不进文字流原位置的行放在这里） */
@@ -1463,10 +1531,16 @@ function buildPara(lines: Line[], r: Region, blockEdge: number, ctx: Ctx): Para 
       indLeft = 0; firstLine = 0;
     }
   }
+  const lastLine = lines[lines.length - 1];
+  // 目录的一条（2026-11-27 APA：每条都排满到右边界，整章的条目被当成一段正文的折行并成一段，译文里引导点丢掉、
+  // 页码贴在标题后面）：groupParagraphs 已让每条自成一段，这里把引导点改成带前导符的右对齐制表位
+  if (ctx.mode === "flow" && (align === "left" || align === "both") && contentsLine(lastLine)) {
+    const dots = contentsTab(runs, tabs, Math.round((Math.min(lastLine.x1, r.x1) - r.x0) * 20) / 20);
+    if (dots !== null) { align = "left"; ctx.leaders = (ctx.leaders ?? "") + dots; }
+  }
   const kept = runs.map((x) => x.tab || x.br || !!x.text);
   // run 过滤后下标会变化：换算成过滤后的下标
   const remap = (k: number) => kept.slice(0, k).filter(Boolean).length;
-  const lastLine = lines[lines.length - 1];
   return {
     // 末行排满到右边界：以文字块自己的右边缘为准（版心可能被页码等撑宽，比正文的右边缘更靠右）
     // 左对齐的西文段落末行停在句子中间（没有句末标点、占了大半行宽）：下一页 / 下一栏接着写，也算排满
@@ -1655,6 +1729,76 @@ function buildTable(t: TableDraft, fills: FillRect[], originX: number, ctx: Ctx)
 // ---------------------------------------------------------------------------
 // 下划线 / 删除线 / 分隔线
 // ---------------------------------------------------------------------------
+
+/**
+ * 线只在文字项的一部分下面：pdf.js 把同一行里同一字体的文字合成一个文字项，定义条款的第一行
+ * "“Accounts Payable” shall mean (i) all trade accounts payable…"是一项，下划线（一个很扁的填充矩形）只在被定义的词下面。
+ * applyTextDecorations 要求线至少盖住文字项的一半，盖不到的被当成分隔线，写成两行之间一个带下边框的空段落：定义条款
+ * 从第一行之后断成两段（第一行单独成段、常被判成居中），译文换了字宽以后线与文字错开（2026-11-27 APA：357 条这样的线，
+ * 26 条定义的译文被切成两半、中间补了"……"）。
+ * 在线的起止处把文字项切开（按字宽找最近的字符边界，不切在词中间的空格上），线下那一段带下划线，这条线不再是分隔线。
+ * 逐字母加宽排的词（"W I T N E S S E T H"）每个字母下面一小段线：相距不到一个字宽的几段合起来算一条。
+ * 表格里的文字（keep）不动：表格已按原来的文字项分好格。
+ */
+function splitUnderlinedParts(spans: Span[], segs: Seg[], used: Set<Seg>, keep: Set<Span>): Span[] {
+  const hs = mergeH(segs.filter((s) => !used.has(s)));
+  if (!hs.length) return spans;
+  const out: Span[] = [];
+  for (const s of spans) {
+    const width = s.x1 - s.x0;
+    // 线在下划线的位置（与 applyTextDecorations 相同），整条落在这个文字项的左右范围内
+    const band = keep.has(s) || s.img || !s.text.trim() || width <= 0 ? [] : hs
+      .filter((h) => h.y >= s.baseline - 0.5 && h.y <= s.baseline + 0.3 * s.size && h.x0 >= s.x0 - 1 && h.x1 <= s.x1 + 1 && h.x1 - h.x0 >= 0.25 * s.size)
+      .sort((a, b) => a.x0 - b.x0);
+    if (!band.length) { out.push(s); continue; }
+    const groups: HSeg[][] = [];
+    for (const h of band) {
+      const g = groups[groups.length - 1];
+      if (g && h.x0 - Math.max(...g.map((x) => x.x1)) <= s.size) g.push(h);
+      else groups.push([h]);
+    }
+    // 字符边界的横坐标：按目标字体的字宽分配文字项的实际宽度（两端对齐拉开的词间距按比例摊开）；没有字宽数据时按字数平分
+    const chars = [...s.text];
+    const ws = chars.map((ch) => measureWord(ch, s.font, s.bold, s.italic, s.size));
+    const known = ws.every((x) => x !== null && x > 0);
+    const unit = known ? (ws as number[]) : chars.map(() => 1);
+    const total = unit.reduce((a, b) => a + b, 0);
+    const xs = [s.x0];
+    for (const u of unit) xs.push(xs[xs.length - 1] + (u / total) * width);
+    const nearest = (x: number) => xs.reduce((best, v, k) => (Math.abs(v - x) < Math.abs(xs[best] - x) ? k : best), 0);
+    const cuts: Array<[number, number]> = [];
+    for (const g of groups) {
+      let a = nearest(Math.min(...g.map((h) => h.x0))), b = nearest(Math.max(...g.map((h) => h.x1)));
+      while (a < b && !chars[a].trim()) a++;
+      while (b > a && !chars[b - 1].trim()) b--;
+      if (b <= a || (cuts.length && a < cuts[cuts.length - 1][1])) continue;
+      cuts.push([a, b]);
+      for (const h of g) for (const src of h.src) used.add(src);
+    }
+    if (!cuts.length) { out.push(s); continue; }
+    const piece = (a: number, b: number, underline: boolean): Span | null => {
+      if (b <= a) return null;
+      const text = chars.slice(a, b).join("");
+      const f = (xs[b] - xs[a]) / width;
+      return {
+        ...s, text, x0: xs[a], x1: xs[b],
+        natural: s.natural !== undefined ? s.natural * f : undefined,
+        wordW: measureWord(text, s.font, s.bold, s.italic, s.size) ?? (s.wordW !== undefined ? s.wordW * f : undefined),
+        underline: underline || s.underline || undefined,
+      };
+    };
+    let at = 0;
+    for (const [a, b] of cuts) {
+      const before = piece(at, a, false), mid = piece(a, b, true);
+      if (before) out.push(before);
+      if (mid) out.push(mid);
+      at = b;
+    }
+    const rest = piece(at, chars.length, false);
+    if (rest) out.push(rest);
+  }
+  return out;
+}
 
 function applyTextDecorations(spans: Span[], segs: Seg[], used: Set<Seg>): HSeg[] {
   const free = mergeH(segs.filter((s) => !used.has(s)));
@@ -2055,6 +2199,7 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
     tables.push(...detectRuledTables(pg, used, inTable));
     tables.push(...detectSideBySide(pg, used, inTable));
     if (!bgs.length) tables.push(...detectDefinitionList(pg, inTable, docGutterX, listCols));
+    pg.spans = splitUnderlinedParts(pg.spans, pg.segs, used, inTable);
     const free = pg.spans.filter((s) => !inTable.has(s));
     // 删除线 / 下划线也标在表格单元格里的文字上（2026-11-26 LTB-03 附件一：表内整行删除线丢失，原来只看表格外的文字）；
     // 没对上任何文字的线照旧
@@ -2108,7 +2253,7 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
     freshPage = false;
     if (!force && sectKey(next) === sectKey(curSection)) return 0;
     blocks.push(tinyPara({ sectionEnd: curSection }));
-    curSection = { ...next, titlePg: flow && curPage === 0 };
+    curSection = { ...next, titlePg: flow && curPage === 0, ...(front && curPage >= front.first && curPage <= front.last ? { front: true } : {}) };
     return TINY;
   };
 
@@ -2136,7 +2281,12 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
     }
     return out;
   });
-  const norm = (l: Line) => l.spans.map((sp) => sp.text).join(" ").replace(/\d+/g, "#").replace(/\s+/g, " ").trim();
+  // 行的身份：数字归一；只印罗马数字页码的行（"~i~""~ii~"）也归一，几页的页码行才认得出是同一行
+  const norm = (l: Line) => {
+    const t = l.spans.map((sp) => sp.text).join(" ").replace(/\s+/g, " ").trim();
+    const rp = romanPage(t);
+    return (rp ? t.slice(0, rp.at) + "#R" + t.slice(rp.at + rp.token.length) : t).replace(/\d+/g, "#");
+  };
   // 两行紧挨着的页脚（"文档名" + "Page N"）：最下面一行与上一行几乎没有间距，上面逐行往上判断时第一行就停了，
   // 整组页脚留在正文里——流式模式下它连同上方的大段空白排在正文中间，下一页的内容接在它后面。
   // 最下面一组紧挨着、同样小字号、整组与上方正文之间有明显空白的行，在多页重复出现（数字归一后文字相同）就是页脚；
@@ -2165,7 +2315,11 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
   // 页眉页脚每页都在同一高度（±3pt）、文字相同（只有页码等数字不同）：页面最下方 / 最上方连续的这种行就是页脚 / 页眉
   if (pages.length >= 2) {
     const nP = pages.length;
-    const numsOf = (l: Line) => (l.spans.map((sp) => sp.text).join(" ").match(/\d+/g) ?? []).map(Number);
+    const numsOf = (l: Line) => {
+      const t = l.spans.map((sp) => sp.text).join(" ");
+      const rp = romanPage(t.replace(/\s+/g, " ").trim());
+      return rp ? [rp.value] : (t.match(/\d+/g) ?? []).map(Number);
+    };
     // 页码：某一个位置上的数字随页序递增（印刷的数字 − 页序号在这一组里都相同）。
     // 只是数字不同的正文行（"34.4 对于前款所述事项…"与"47.6 对于前款所述事项…"恰好排在页首同一高度）不算
     const pageCounter = (grp: Array<{ i: number; l: Line }>) => {
@@ -2216,8 +2370,16 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
   // 流式模式：只有 Word 页眉页脚能在该页原样再现的行才写进页眉页脚（数字逐位比较，只有页码位可以逐页不同）；
   // 只在一页出现的栏底标题、页首的条款标题、附件标题放回正文。见 furniture.ts
   let furniture: Furniture | undefined;
+  /** 前置部分（罗马数字页码的几页）：单独一节，正文另起一节从 1 编页 */
+  let front: FrontMatter | undefined;
   if (flow && pages.length > 1) {
     furniture = settleFurniture(floating, pre.map((x) => x.pg.height / 2), pre.map((x) => x.pg.index + 1));
+    // 前置部分之后还有正文页才分节（整份文件都是罗马数字页码时就是一节）
+    if (furniture.front && furniture.front.last < pages.length - 1) {
+      front = furniture.front;
+      // 前置部分从第一页开始时，第一节就是它；前面有封面时封面另成一节
+      if (front.first === 0) curSection.front = true;
+    }
     floating.forEach((_, i) => { floating[i] = furniture!.keep[i]; });
     // 写不进 Word 页眉页脚的页眉页脚（另一节的页眉、Bates 号）：不回正文，文字计入完整性校验，notes 里说明
     for (const ls of furniture.hidden) for (const l of ls) rasterText.push(l.spans.map((sp) => sp.text).join(""));
@@ -2311,11 +2473,21 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
     const low = Math.max(...ls.map((l) => l.bottom));
     if (low < pageEnd[i] - 2) return false; // 页面最后是表格 / 图
     const last = ls.filter((l) => l.bottom >= low - 2).sort((a, b) => b.x1 - a.x1)[0];
+    // 目录的最后一条排满到右边界（引导点），但它不接到下一页（2026-11-27 APA：目录最后一页下方空着，附表清单没有另起一页）
+    if (contentsLine(last)) return false;
     const g = gutters[i], edge = g && last.x1 <= g.x ? g.g0 : right;
     return edge - last.x1 <= Math.max(3, 0.03 * (right - left));
   };
-  const brokeEarly = (pi: number) => flow && pi > 0 && !endsMidParagraph(pi - 1) &&
-    bodyBottom - pageEnd[pi - 1] > Math.max(0.2 * (bodyBottom - bodyTop), 8 * mathCtx.bodySize);
+  // 目录在上一页结束、这一页不再是目录（附表清单、正文）：另起一页，不看上一页空出多少
+  const lowest = (ls: Line[]) => ls.length ? ls.reduce((a, b) => (b.bottom > a.bottom ? b : a)) : undefined;
+  const highest = (ls: Line[]) => ls.length ? ls.reduce((a, b) => (b.top < a.top ? b : a)) : undefined;
+  const contentsEnd = (pi: number) => {
+    const last = lowest(pageLines[pi - 1]), next = highest(pageLines[pi]);
+    return !!last && contentsLine(last) && pageEnd[pi - 1] - last.bottom <= 2 && !(next && contentsLine(next)) &&
+      !(next && pageLines[pi].some((l) => contentsLine(l) && l.top - next.bottom < 2 * l.size));
+  };
+  const brokeEarly = (pi: number) => flow && pi > 0 && ((!endsMidParagraph(pi - 1) &&
+    bodyBottom - pageEnd[pi - 1] > Math.max(0.2 * (bodyBottom - bodyTop), 8 * mathCtx.bodySize)) || contentsEnd(pi));
   /** 每页的页眉 / 页脚行（流式模式） */
   const hf: Array<{ head: Line[]; foot: Line[]; imgs: ImageBox[]; mid: number }> = [];
   /** 首页栏底的注释（作者单位、基金等）：流式模式下放进首页页脚，正文增减时位置不变 */
@@ -2371,7 +2543,18 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
     // 逐页保留：除了第一页，每页都从新的一页开始（按本次转换的顺序；只转换部分页时第一页不一定是原 PDF 的第 1 页）
     // 可编辑排版：整页背景（扫描页）所在的页、以及它后面的一页都从新的一页开始，否则下一页的内容会排到扫描图上
     const bgBreak = flow && pi > 0 && (bgs.length > 0 || pre[pi - 1].bgs.length > 0);
-    const anchor = tinyPara({ pageBreakBefore: (!flow && pi > 0) || brokeEarly(pi) || bgBreak, images: [...bgs, ...pg.images.filter((im) => im.behind)], textBoxes: [], shapes });
+    // 前置部分的第一页（前面有封面）：封面一节到此结束，前置部分一节从下一页开始、按罗马数字编页；
+    // 正文的第一页：前置部分一节到此结束，正文一节从下一页开始、从 1 编页（分节符本身换页，不再另加分页）
+    const frontStart = !!front && pi > 0 && pi === front.first;
+    const bodyStart = !!front && pi === front.last + 1;
+    if (frontStart) {
+      blocks.push(tinyPara({ sectionEnd: { ...curSection } }));
+      curSection = { ...curSection, front: true, frontStart: true, titlePg: false };
+    } else if (bodyStart) {
+      blocks.push(tinyPara({ sectionEnd: { ...curSection, front: true } }));
+      curSection = { ...curSection, front: undefined, frontStart: undefined, titlePg: false, restart: true };
+    }
+    const anchor = tinyPara({ pageBreakBefore: !frontStart && !bodyStart && ((!flow && pi > 0) || brokeEarly(pi) || bgBreak), images: [...bgs, ...pg.images.filter((im) => im.behind)], textBoxes: [], shapes });
     freshPage = true;
     const anchorAt = blocks.length;
     blocks.push(anchor);
@@ -2804,19 +2987,31 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
   }
 
   // 流式模式：页眉页脚
-  const hfOut = flow ? buildHeaders(hf, notes, notesBottom, { x0: left, x1: right }, right, ctx, headerDist ?? mTop / 2, furniture) : undefined;
+  const hfOut = flow ? buildHeaders(hf, notes, notesBottom, { x0: left, x1: right }, right, ctx, headerDist ?? mTop / 2, furniture, front) : undefined;
   // 完整性校验：每页计入 Word 在这一页实际显示的页眉页脚（页码域按该页的页码展开），而不是判成页眉页脚的原文——
   // 判错的行若没有写进去，缺的字会如实计为未转换
   if (hfOut) {
     const shown = (ps: Para[] | undefined, i: number) => (ps ?? []).map((p) => p.runs.map((r) =>
       r.field === "PAGE" ? String(i + hfOut.start).padStart(r.fieldDigits ?? 0, "0") : r.field === "NUMPAGES" ? String(pre.length) : r.tab ? "" : r.text).join("")).join("\n");
+    const fo = hfOut.front;
+    // 前置部分第 i 页印的罗马数字：它第一页印 fo.start
+    const romanAt = (i: number, upper: boolean) => { const t = toRoman(fo!.start + i - front!.first); return upper ? t.toUpperCase() : t; };
+    const shownFront = (ps: Para[] | undefined, i: number) => (ps ?? []).map((p) => p.runs.map((r) =>
+      r.field === "PAGE" && r.fieldFormat ? romanAt(i, r.fieldFormat === "ROMAN")
+        : r.field === "PAGE" ? String(i + hfOut.start) : r.tab ? "" : r.text).join("")).join("\n");
     pre.forEach((_, i) => {
       const part = i === 0 && hfOut.headers.first ? "first" : hfOut.headers.even && (i + hfOut.start) % 2 === 0 ? "even" : "default";
+      // 前置部分的页（封面用首页的那一套，与正文相同）
+      if (fo && front && i >= front.first && i <= front.last && part !== "first") {
+        rasterText.push(shownFront(fo.headers.default, i), shownFront(fo.footers.default, i));
+        return;
+      }
       rasterText.push(shown(hfOut.headers[part], i), shown(hfOut.footers[part], i));
     });
   }
   // 去掉的排版断词连字符：计入完整性校验
   if (ctx.softHyphens) rasterText.push("-".repeat(ctx.softHyphens));
+  if (ctx.leaders) rasterText.push(ctx.leaders);
 
   return {
     pageW, pageH,
@@ -2830,7 +3025,8 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
     },
     rasterText: rasterText.join("\n"),
     mode: ctx.mode,
-    ...(hfOut ? { headers: hfOut.headers, footers: hfOut.footers, pageNumStart: hfOut.pageNumStart, headerDist, footerDist } : {}),
+    ...(hfOut ? { headers: hfOut.headers, footers: hfOut.footers, pageNumStart: hfOut.front ? undefined : hfOut.pageNumStart, headerDist, footerDist } : {}),
+    ...(hfOut?.front ? { front: hfOut.front } : {}),
     ...(furniture?.notes.length ? { notes: furniture.notes } : {}),
   };
 }
@@ -2903,8 +3099,8 @@ function mergeSplitParagraphs(blocks: Block[], ctx: Ctx) {
 
 /** 流式模式：由每页的页眉页脚行生成首页 / 奇数页 / 偶数页的页眉页脚，页码改为 PAGE 域 */
 function buildHeaders(hf: Array<{ head: Line[]; foot: Line[]; imgs: ImageBox[]; mid: number }>, notes: Para[], notesBottom: number, body: Region, right: number, ctx: Ctx, headerTop: number,
-  furniture?: Furniture):
-  { headers: HeaderSet; footers: HeaderSet; pageNumStart?: number; start: number } | undefined {
+  furniture?: Furniture, front?: FrontMatter):
+  { headers: HeaderSet; footers: HeaderSet; pageNumStart?: number; start: number; front?: NonNullable<DocModel["front"]> } | undefined {
   const n = hf.length;
   if (!hf.some((x) => x.head.length || x.foot.length || x.imgs.length) && !notes.length) return undefined;
   const lineText = (l: Line) => l.spans.map((s) => s.text).join(" ");
@@ -3025,7 +3221,31 @@ function buildHeaders(hf: Array<{ head: Line[]; foot: Line[]; imgs: ImageBox[]; 
     }
     footers.first = [...notes, ...f0];
   }
-  return { headers, footers, pageNumStart: pageNumStart !== undefined && pageNumStart !== 1 ? pageNumStart : undefined, start: pageNumStart ?? 1 };
+  // 前置部分：取它第一页的页眉页脚，罗马数字页码换成罗马数字格式的 PAGE 域；封面仍用首页那一套
+  let frontOut: NonNullable<DocModel["front"]> | undefined;
+  if (front) {
+    const i = front.first;
+    const fHeaders: HeaderSet = { default: mk(hf[i].head, i) }, fFooters: HeaderSet = { default: mk(hf[i].foot, i, "foot") };
+    const token = front.upper ? toRoman(front.value).toUpperCase() : toRoman(front.value);
+    const re = new RegExp(`(?<![A-Za-z])${token}(?![A-Za-z])`);
+    let marked = false;
+    for (const p of [...fFooters.default!, ...fHeaders.default!]) {
+      const k = p.runs.findIndex((r) => !r.tab && !r.field && re.test(r.text));
+      if (k < 0 || marked) continue;
+      const r = p.runs[k], at = r.text.search(re);
+      const parts: Run[] = [];
+      if (at > 0) parts.push({ ...r, text: r.text.slice(0, at) });
+      parts.push({ ...r, text: token, field: "PAGE", fieldFormat: front.upper ? "ROMAN" : "roman" });
+      if (at + token.length < r.text.length) parts.push({ ...r, text: r.text.slice(at + token.length) });
+      p.runs.splice(k, 1, ...parts);
+      marked = true;
+    }
+    if (marked) {
+      if (titlePg) { fHeaders.first = headers.first; fFooters.first = footers.first; }
+      frontOut = { headers: fHeaders, footers: fFooters, fmt: front.upper ? "upperRoman" : "lowerRoman", start: front.value, bodyStart: printed(front.last + 1) };
+    }
+  }
+  return { headers, footers, pageNumStart: pageNumStart !== undefined && pageNumStart !== 1 ? pageNumStart : undefined, start: pageNumStart ?? 1, ...(frontOut ? { front: frontOut } : {}) };
 }
 
 type PageItem = { side: "full" | "L" | "R" } & (

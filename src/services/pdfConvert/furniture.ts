@@ -11,6 +11,10 @@
  *   - 页码域只放在真正的页码位上：页眉里的版本号、合同编号即使恰好等于某一页的页码，也保持原文。
  *   - 补零到固定位数、逐页等于印刷页码的编号（从第 1 页起编的 Bates 号 ALX000001）也是页码位：写成带
  *     数字格式的 PAGE 域（PAGE \# "000000"），两页的文件也认得出来。
+ *   - 前置部分的罗马数字页码（目录、附表清单的页脚"~i~""- ii -"，正文另从 1 编页）：连续几页、逐页加一的罗马数字。
+ *     它们写进单独一节（前置部分）的页脚，页码域用罗马数字，正文另起一节从 1 编页（front）。
+ *     （2026-11-27 APA：认不出"~i~"是页码，它留在正文里靠段前距排到页底，译文变短后排到页面中间，
+ *     又占着页底，后面的附表清单、附件清单、协议正文都没有另起一页）
  */
 
 import type { Line } from "./layout.js";
@@ -26,6 +30,39 @@ export interface FurniturePick {
   titlePg: boolean;
 }
 
+/** 前置部分：罗马数字页码的连续几页（页序号从 0 起） */
+export interface FrontMatter {
+  first: number;
+  last: number;
+  /** 第 first 页印的罗马数字的值（i = 1） */
+  value: number;
+  upper: boolean;
+  /** 印着罗马数字页码的行（逐页） */
+  lines: Set<Line>;
+}
+
+const ROMAN: Array<[string, number]> = [["m", 1000], ["cm", 900], ["d", 500], ["cd", 400], ["c", 100], ["xc", 90], ["l", 50], ["xl", 40], ["x", 10], ["ix", 9], ["v", 5], ["iv", 4], ["i", 1]];
+export function toRoman(n: number): string {
+  let out = "";
+  for (const [s, v] of ROMAN) while (n >= v) { out += s; n -= v; }
+  return out;
+}
+/**
+ * 只印罗马数字页码的行（"~i~""- ii -""Page iv""(vii)"）：数字的值、大小写和它在行里的位置；不是时为 null。
+ * 只认规范写法（"iiii""ic" 不是），大小写混排的不是
+ */
+export function romanPage(text: string): { value: number; upper: boolean; at: number; token: string } | null {
+  const m = text.match(/^([\s~\-–—_·•|/()（）\[\]]*(?:page\s*|p\.\s*)?)([ivxlcdm]{1,7})[\s~\-–—_·•|/()（）\[\]]*$/i);
+  if (!m) return null;
+  const token = m[2];
+  if (token !== token.toLowerCase() && token !== token.toUpperCase()) return null;
+  const low = token.toLowerCase();
+  let value = 0, rest = low;
+  for (const [s, v] of ROMAN) while (rest.startsWith(s)) { value += v; rest = rest.slice(s.length); }
+  if (rest || !value || toRoman(value) !== low || value > 50) return null;
+  return { value, upper: token !== low, at: m[1].length, token };
+}
+
 export interface Furniture {
   /** 写进页眉页脚的行（逐页） */
   keep: Line[][];
@@ -37,6 +74,8 @@ export interface Furniture {
   paddedPageLines: Map<Line, number>;
   pick: FurniturePick;
   notes: string[];
+  /** 前置部分的罗马数字页码（没有时为 undefined） */
+  front?: FrontMatter;
 }
 
 /** 行的文字：相邻片段之间有可见间距才加空格（"ABC000" + "1234" 是一个编号 ABC0001234，与写进 Word 的段落一致） */
@@ -53,7 +92,7 @@ const lineText = (l: Line) => {
 /** 看起来像页码的行（数字归一后）：带"页 / Page / p."，或只有数字与装饰符号 */
 const PAGEISH = /页|page|p\.|^[#\s\-–—_·•|/／()（）\[\]]*$/i;
 
-type Item = { l: Line; i: number; s: string; runs: Array<{ v: string; at: number }>; kind: Array<"P" | "Z" | "C" | undefined> };
+type Item = { l: Line; i: number; s: string; runs: Array<{ v: string; at: number }>; kind: Array<"P" | "Z" | "C" | "R" | undefined>; roman?: { value: number; upper: boolean }; raw?: string };
 
 /** 页码：某一位数字减去页序号在多数页上相同（与 buildHeaders 原来的判据一致） */
 function pageOffset(lines: Line[][], n: number): number | undefined {
@@ -92,11 +131,17 @@ function ranges(nums: number[]): string {
  */
 export function settleFurniture(floating: Line[][], mids: number[], pageNos: number[]): Furniture {
   const n = floating.length;
-  const start = pageOffset(floating, n);
   const items: Item[] = [];
   floating.forEach((ls, i) => {
     for (const l of ls) {
       const s = lineText(l);
+      // 罗马数字页码：按它的值当成一个数字位（"~iv~" 与 "~v~" 是同一行、数字不同）
+      const rp = romanPage(s);
+      if (rp) {
+        const t = s.slice(0, rp.at) + rp.value + s.slice(rp.at + rp.token.length);
+        items.push({ l, i, s: t, runs: [{ v: String(rp.value), at: rp.at }], kind: [undefined], roman: { value: rp.value, upper: rp.upper }, raw: s });
+        continue;
+      }
       const runs = [...s.matchAll(/\d+/g)].map((m) => ({ v: m[0], at: m.index! }));
       items.push({ l, i, s, runs, kind: runs.map(() => undefined) });
     }
@@ -108,7 +153,32 @@ export function settleFurniture(floating: Line[][], mids: number[], pageNos: num
     if (!groups.has(k)) groups.set(k, []);
     groups.get(k)!.push(it);
   }
+  // 罗马数字页码：逐页加一（值与页序号之差不变），至少两页
+  for (const g of groups.values()) {
+    if (!g.every((it) => it.roman)) continue;
+    const off = new Map<number, Item[]>();
+    for (const it of g) { const k = it.roman!.value - it.i; if (!off.has(k)) off.set(k, []); off.get(k)!.push(it); }
+    const best = [...off.values()].sort((a, b) => b.length - a.length)[0];
+    if (best && new Set(best.map((it) => it.i)).size >= 2) for (const it of best) it.kind[0] = "R";
+  }
+  // 前置部分：从文件开头几页起、罗马数字页码连续的几页（中间不缺页）。这几行写进前置部分那一节的页脚，
+  // 不参与正文页眉页脚的选取。文件中间的罗马数字页码（附件另起的编号）不是前置部分，照旧按逐页递增的编号处理
+  const romans = items.filter((it) => it.kind[0] === "R").sort((a, b) => a.i - b.i);
+  const frontItems: Item[] = [];
+  for (const it of romans) {
+    if (frontItems.length && it.i - frontItems[frontItems.length - 1].i > 1) break;
+    frontItems.push(it);
+  }
+  const front: FrontMatter | undefined = frontItems.length >= 2 && frontItems[0].i <= 3 ? {
+    first: frontItems[0].i, last: frontItems[frontItems.length - 1].i, value: frontItems[0].roman!.value,
+    upper: frontItems[0].roman!.upper, lines: new Set(frontItems.map((it) => it.l)),
+  } : undefined;
+  // 正文的页码按前置部分以外的页统计（前置部分占了好几页时，正文页码也要占这些页的多数）
+  const inFront = (i: number) => !!front && i >= front.first && i <= front.last;
+  const nBody = front ? n - (front.last - front.first + 1) : n;
+  const start = front ? pageOffset(floating.map((ls, i) => (inFront(i) ? [] : ls)), nBody) : pageOffset(floating, n);
   for (const [tpl, g] of groups) {
+    if (g.every((it) => it.roman)) continue;
     for (let j = 0; j < g[0].runs.length; j++) {
       // 页码位：逐页等于印刷页码（不是小数、千分位的一部分，没有前导零），并且出现在足够多的页上
       if (start !== undefined) {
@@ -116,14 +186,14 @@ export function settleFurniture(floating: Line[][], mids: number[], pageNos: num
           const { v, at } = it.runs[j];
           return v === String(it.i + start) && v.length <= 4 && !/[.,]$/.test(it.s.slice(0, at)) && !/^[.,]\d/.test(it.s.slice(at + v.length));
         });
-        if (new Set(hits.map((h) => h.i)).size >= Math.max(2, Math.ceil(0.4 * n))) for (const h of hits) h.kind[j] = "P";
+        if (new Set(hits.map((h) => h.i)).size >= Math.max(2, Math.ceil(0.4 * nBody))) for (const h of hits) h.kind[j] = "P";
         // 补零的页码：同一位数、数值逐页等于印刷页码
         const width = g[0].runs[j].v.length;
         const padded = g.filter((it) => {
           const { v } = it.runs[j];
           return !it.kind[j] && v.length === width && width > String(it.i + start).length && v.startsWith("0") && Number(v) === it.i + start;
         });
-        if (new Set(padded.map((h) => h.i)).size >= Math.max(2, Math.ceil(0.4 * n))) for (const h of padded) h.kind[j] = "Z";
+        if (new Set(padded.map((h) => h.i)).size >= Math.max(2, Math.ceil(0.4 * nBody))) for (const h of padded) h.kind[j] = "Z";
       }
       // 其余逐页递增的编号：连续三页以上、每页加一；只认页码样式的行（另起的页码）和 Bates 号这样的长编号，
       // 条款号、附件号碰巧逐页递增也不算
@@ -145,7 +215,7 @@ export function settleFurniture(floating: Line[][], mids: number[], pageNos: num
   const key = (it: Item) => {
     let k = "", at = 0;
     it.runs.forEach((r, j) => {
-      k += it.s.slice(at, r.at) + (it.kind[j] === "P" ? "#P" : it.kind[j] === "Z" ? `#Z${r.v.length}` : it.kind[j] === "C" ? "#C" : r.v);
+      k += it.s.slice(at, r.at) + (it.kind[j] === "P" ? "#P" : it.kind[j] === "Z" ? `#Z${r.v.length}` : it.kind[j] === "C" ? "#C" : it.kind[j] === "R" ? "#R" : r.v);
       at = r.at + r.v.length;
     });
     return (k + it.s.slice(at)).replace(/\s+/g, "");
@@ -163,8 +233,9 @@ export function settleFurniture(floating: Line[][], mids: number[], pageNos: num
   const counters: Item[] = [];
   const candidates: Item[] = [];
   for (const it of items) {
+    if (front?.lines.has(it.l)) { keep[it.i].push(it.l); continue; }
     if (pagesOf.get(keys.get(it)!)!.size < 2) continue; // 只在一页出现：回到正文
-    if (it.kind.includes("C")) counters.push(it);
+    if (it.kind.includes("C") || it.kind.includes("R")) counters.push(it);
     else candidates.push(it);
   }
 
@@ -187,7 +258,8 @@ export function settleFurniture(floating: Line[][], mids: number[], pageNos: num
     }
     return best;
   };
-  const rest = [...Array(n).keys()].slice(1);
+  // 前置部分的页有自己的一套（罗马数字页码），不参与正文那一套的选取
+  const rest = [...Array(n).keys()].slice(1).filter((i) => !inFront(i));
   const oddRep = major(rest.filter((i) => printed(i) % 2 === 1)), evenRep = major(rest.filter((i) => printed(i) % 2 === 0));
   const evenOdd = oddRep !== undefined && evenRep !== undefined && sigs[oddRep] !== sigs[evenRep];
   const defPage = evenOdd ? oddRep! : major(rest) ?? 0;
@@ -217,7 +289,7 @@ export function settleFurniture(floating: Line[][], mids: number[], pageNos: num
       byKey.get(k)!.push(it);
     }
     for (const [k, g] of [...byKey.entries()].slice(0, 3)) {
-      const sample = g[0].s.replace(/\s+/g, " ").trim();
+      const sample = (g[0].raw ?? g[0].s).replace(/\s+/g, " ").trim();
       notes.push(say(k.split("\u0000")[0], ranges(g.map((it) => pageNos[it.i])), sample.length > 30 ? `${sample.slice(0, 30)}…` : sample));
     }
   };
@@ -230,5 +302,6 @@ export function settleFurniture(floating: Line[][], mids: number[], pageNos: num
     paddedPageLines: new Map(items.flatMap((it) => it.runs.flatMap((r, j) => (it.kind[j] === "Z" ? [[it.l, r.v.length] as [Line, number]] : [])))),
     pick: { pageNumStart: start, defPage, evenRep: evenOdd ? evenRep : undefined, evenOdd, titlePg },
     notes,
+    ...(front ? { front } : {}),
   };
 }
