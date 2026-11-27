@@ -500,6 +500,9 @@ async function extractPage(page: any, index: number, OPS: any, Util: any): Promi
           model.segs.push({ x0, y0, x1, y1, width: Math.min(w, h) || 0.5, color: gs.fill, horizontal: w >= h });
         } else if (isRectLike && w > 2 && h > 2 && !isWhite(gs.fill)) {
           model.fills.push({ x0, y0, x1, y1, color: gs.fill });
+        } else if (isRectLike && w * h >= 0.85 * model.width * model.height && gs.fill !== "FFFFFF" && !/^F[EF]F[EF]F[EF]$/.test(gs.fill)) {
+          // 铺满页面的浅色底（米色、浅灰的页面颜色）：接近白色也是有意设的页面颜色，记下来（作为页面背景色）；纯白的不记
+          model.fills.push({ x0, y0, x1, y1, color: gs.fill });
         }
       }
       if (stroke) {

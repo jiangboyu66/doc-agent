@@ -240,6 +240,7 @@ class Writer {
     if (p.heading) ppr.push(`<w:pStyle w:val="Heading${p.heading}"/>`);
     else if (p.pageBreakBefore) ppr.push(`<w:pStyle w:val="PageStart"/>`);
     if (p.keepNext) ppr.push("<w:keepNext/>");
+    else if (p.keepNext === false && p.heading) ppr.push('<w:keepNext w:val="0"/>');
     if (p.pageBreakBefore && p.heading) ppr.push("<w:pageBreakBefore/>");
 
     ppr.push('<w:widowControl w:val="0"/>');
@@ -318,7 +319,9 @@ class Writer {
     });
     // 表格不能作为 body 的最后一个元素之前的节尾；Word 要求 body 以段落或 sectPr 结束
     if (this.m.blocks[this.m.blocks.length - 1]?.kind === "table") out.push(this.para({ kind: "p", runs: [], align: "left", indLeft: 0, indRight: 0, firstLine: 0, spaceBefore: 0, lineHeight: 1, tabs: [], tiny: true, size: 1 }));
-    return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<w:document ${NS}><w:body>${out.join("")}${this.sectPr(this.m.finalSection, !this.m.finalSection.newPage && this.m.blocks.some((b) => b.kind === "p" && !!b.sectionEnd))}</w:body></w:document>`;
+    // 页面颜色（各页都铺着同一种颜色的底）
+    const bg = this.m.background ? `<w:background w:color="${this.m.background}"/>` : "";
+    return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<w:document ${NS}>${bg}<w:body>${out.join("")}${this.sectPr(this.m.finalSection, !this.m.finalSection.newPage && this.m.blocks.some((b) => b.kind === "p" && !!b.sectionEnd))}</w:body></w:document>`;
   }
 
   styles(): string {
@@ -382,7 +385,7 @@ class Writer {
     add("word/settings.xml",
       `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<w:settings xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">` +
       // 流式模式：自动断词（行尾排版断词已去掉，重新排版时由 Word 断词，行宽与原文接近）
-      `<w:zoom w:percent="100"/><w:defaultTabStop w:val="420"/>${flow ? '<w:autoHyphenation/>' : ""}` +
+      `<w:zoom w:percent="100"/>${this.m.background ? "<w:displayBackgroundShape/>" : ""}<w:defaultTabStop w:val="420"/>${flow ? '<w:autoHyphenation/>' : ""}` +
       `${hf.some((h) => h.type === "even") ? "<w:evenAndOddHeaders/>" : ""}<w:characterSpacingControl w:val="doNotCompress"/>` +
       `<w:compat><w:compatSetting w:name="compatibilityMode" w:uri="http://schemas.microsoft.com/office/word" w:val="15"/></w:compat></w:settings>`);
     add("word/_rels/document.xml.rels",

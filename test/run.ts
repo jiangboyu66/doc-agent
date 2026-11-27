@@ -709,17 +709,55 @@ await test("左右两边不画竖线的统计表（只有内部竖线、横线�
     const xml = new ZipPackage(data).readText("word/document.xml");
     const tbls = xml.match(/<w:tbl>[\s\S]*?<\/w:tbl>/g) ?? [];
     eq(tbls.length, 1, `${mode}：应只有一张表`);
-    eq((tbls[0].match(/<w:gridCol /g) ?? []).length, 7, `${mode}：7 列`);
-    const rows = tbls[0].match(/<w:tr>[\s\S]*?<\/w:tr>/g) ?? [];
-    const head = (rows[0].match(/<w:tc>[\s\S]*?<\/w:tc>/g) ?? []).map(textOf);
+    const tbl = tbls[0] ?? "";
+    eq((tbl.match(/<w:gridCol /g) ?? []).length, 7, `${mode}：7 列`);
+    const rows = tbl.match(/<w:tr>[\s\S]*?<\/w:tr>/g) ?? [];
+    const head = ((rows[0] ?? "").match(/<w:tc>[\s\S]*?<\/w:tc>/g) ?? []).map(textOf);
     eq(head.join("|"), "行业名称|指标名称|计量单位|大型|中型|小型|微型", `${mode}：表头`);
     // 最左一列（行业名称）与最右一列（微型）的内容在同一张表里、同一行
     const gong = rows.find((r) => textOf(r).includes("从业人员(X)") && textOf(r).includes("X<20"));
     assert(!!gong && textOf(gong).includes("300≤X<1000"), `${mode}：工业第一行的各列应在同一行里`);
     assert(rows.some((r) => textOf(r).includes("工业")), `${mode}：最左一列在表里`);
     // 左右两边原本没有竖线：表格的左右外框是空的
-    const firstCell = rows[1].match(/<w:tc>[\s\S]*?<\/w:tc>/)![0];
+    const firstCell = (rows[1] ?? "").match(/<w:tc>[\s\S]*?<\/w:tc>/)?.[0] ?? "";
     assert(!/<w:left w:val="single"/.test(firstCell), `${mode}：最左一列不应加出原文没有的竖线`);
+  }
+});
+
+await test("带底色的文字块（横幅、一行指标卡片、带色条的提示框、侧边栏）与页面底色：文字不被截成图；可编辑排版写成带底纹的表格格子，白字不落在白纸上（两种模式）", async () => {
+  const { pdfToDocx } = await import("../src/services/pdfConvert/index.js");
+  const pdf = await fixture("color-blocks.pdf");
+  const textOf = (x: string) => (x.match(/<w:t[^>]*>([^<]*)<\/w:t>/g) ?? []).map((t) => t.replace(/<[^>]+>/g, "")).join("");
+  for (const mode of ["exact", "flow"] as const) {
+    const { data, report } = await pdfToDocx(pdf, { mode });
+    eq(report.textCoverage, 1, `${mode}：文字完整性`);
+    const pkg = new ZipPackage(data);
+    const xml = pkg.readText("word/document.xml");
+    // 侧边栏、横幅里的字是正文，不在图片里
+    assert(!/<pic:pic>/.test(xml), `${mode}：带底色的文字块不应被截成图片`);
+    for (const t of ["Quarterly Operations Review", "CONTACT", "Python / SQL", "Example University, 2014 - 2017"]) assert(xml.includes(t), `${mode}：正文里应有"${t}"`);
+    // 两页都铺着同一种浅米色：Word 的页面颜色
+    assert(xml.includes('<w:background w:color="FFFDF6"/>'), `${mode}：页面颜色`);
+    assert(pkg.readText("word/settings.xml").includes("<w:displayBackgroundShape/>"), `${mode}：显示页面颜色`);
+    if (mode !== "flow") continue;
+    const tbls = xml.match(/<w:tbl>[\s\S]*?<\/w:tbl>/g) ?? [];
+    const cellOf = (t: string) => tbls.flatMap((x) => x.match(/<w:tc>[\s\S]*?<\/w:tc>/g) ?? []).find((c) => textOf(c).includes(t)) ?? "";
+    const fill = (c: string) => c.match(/<w:shd [^>]*w:fill="([0-9A-F]{6})"/)?.[1];
+    // 横幅：深色底纹的格子里排白色标题
+    eq(fill(cellOf("Quarterly Operations Review")), "0F2B4C", "flow：横幅的底纹");
+    assert(/<w:color w:val="FFFFFF"\/>/.test(cellOf("Quarterly Operations Review")), "flow：横幅里是白字");
+    // 三张指标卡片在同一张表的同一行里，各有底纹
+    const cardRow = tbls.flatMap((x) => x.match(/<w:tr>[\s\S]*?<\/w:tr>/g) ?? []).find((r) => textOf(r).includes("98.7%"));
+    assert(!!cardRow && textOf(cardRow).includes("4.2 h") && textOf(cardRow).includes("-11%"), "flow：三张指标卡片应在同一行");
+    eq(((cardRow ?? "").match(/<w:shd [^>]*w:fill="(?!auto)/g) ?? []).length, 3, "flow：三张卡片各有底纹（卡片之间的空格子没有）");
+    // 提示框：浅色底纹 + 左边的色条写成左边框
+    const note = cellOf("Decision needed:");
+    eq(fill(note), "FFF0DB", "flow：提示框的底纹");
+    assert(/<w:left w:val="single" w:sz="\d+" w:space="0" w:color="F28F00"\/>/.test(note), "flow：提示框左边的色条写成左边框");
+    // 侧边栏与旁边的正文并成两格：侧边栏一格深色底纹，正文在同一行的另一格
+    const sideRow = tbls.flatMap((x) => x.match(/<w:tr>[\s\S]*?<\/w:tr>/g) ?? []).find((r) => textOf(r).includes("CONTACT"));
+    assert(!!sideRow && textOf(sideRow).includes("Zhang Wei"), "flow：侧边栏与正文应在同一行的两格里");
+    eq(fill(cellOf("CONTACT")), "0F2B4C", "flow：侧边栏的底纹");
   }
 });
 
@@ -1300,7 +1338,7 @@ await test("所有夹具 PDF：两种排版方式都不报错、文字完整；L
   const run = promisify(execFile);
   const soffice = process.env.SOFFICE_PATH || "soffice";
   const hasSoffice = await run(soffice, ["--version"]).then(() => true, () => false);
-  const names = ["columns", "journal", "figures", "math", "journal-front", "journal-eq", "journal-fig", "bios", "colstart", "signature", "citecolor", "texpaper", "contract-cn", "scan-letter", "furniture-cn", "bates", "rotated-text", "mixed-pages", "image-slides", "open-table"];
+  const names = ["columns", "journal", "figures", "math", "journal-front", "journal-eq", "journal-fig", "bios", "colstart", "signature", "citecolor", "texpaper", "contract-cn", "scan-letter", "furniture-cn", "bates", "rotated-text", "mixed-pages", "image-slides", "open-table", "color-blocks"];
   const dir = await fs.mkdtemp(path.join(tmp, "pages-"));
   const bad: string[] = [];
   for (const name of names) {

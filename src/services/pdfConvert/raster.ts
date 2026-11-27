@@ -173,11 +173,31 @@ export function detectIconPaths(pg: PageModel, tableBoxes: Box[]): ImageBox[] {
  * 表格（只有横平竖直的线、落在已识别的表格范围内）不算；包含大量正文字号文字的簇（彩色文字框）不算。
  * 图内的文字、以及紧贴图边的小字号标注一并归入图。
  */
+/**
+ * 带文字的色块（简历的侧边栏、报告的横幅、指标卡片、提示框）：填充的矩形里排着两行以上、成词的文字。
+ * 它是文字的底色，不是图：不参与图的识别，否则整块连同里面的文字被截成图片，文字没法编辑
+ */
+export function textPanels(pg: PageModel): Box[] {
+  const pageArea = pg.width * pg.height;
+  return pg.fills.filter((f) => {
+    const w = f.x1 - f.x0, h = f.y1 - f.y0;
+    if (w < 40 || h < 14 || w * h > 0.85 * pageArea) return false;
+    const inner = pg.spans.filter((s) => s.text.trim() && centerIn(s, f));
+    const chars = inner.reduce((n, s) => n + s.text.replace(/\s/g, "").length, 0);
+    const rows = new Set(inner.map((s) => Math.round(s.baseline / 3))).size;
+    // 浅色（白）字：离了底色就看不见，一行标题也算
+    const light = inner.some((s) => { const n = parseInt(s.color, 16); return 0.299 * (n >> 16 & 255) + 0.587 * (n >> 8 & 255) + 0.114 * (n & 255) > 200; });
+    return (chars >= 6 && rows >= 2) || (chars >= 2 && light);
+  });
+}
+
 export function detectFigures(pg: PageModel, bodySize: number, tableBoxes: Box[]): ImageBox[] {
   type El = { box: Box; curvy: number; colored: number; paths: number; image: boolean };
   const els: El[] = [];
   const pageArea = pg.width * pg.height;
+  const panels = textPanels(pg);
   for (const p of pg.paths) {
+    if (p.filled && !p.curved && !p.diagonal && panels.some((f) => Math.abs(f.x0 - p.x0) < 0.5 && Math.abs(f.y0 - p.y0) < 0.5 && Math.abs(f.x1 - p.x1) < 0.5 && Math.abs(f.y1 - p.y1) < 0.5)) continue;
     // 贯穿整页的细线（页眉线、栏线）不参与聚类
     // （横跨正文的表格横线要保留：它把表格的各列连成一簇）
     const thinH = p.y1 - p.y0 < 3, thinV = p.x1 - p.x0 < 3;
@@ -252,7 +272,8 @@ export function detectFigures(pg: PageModel, bodySize: number, tableBoxes: Box[]
     if (tbl > 0.6 * area(c.box) && curvy < 4) continue;
     figs.push({ ...c.box });
   }
-  if (!figs.length) return [];
+  const bigCurve = (c: { els: El[] }) => c.els.some((e) => e.curvy && e.box.x1 - e.box.x0 >= 20 && e.box.y1 - e.box.y0 >= 20);
+  if (!figs.length && !clusters.some(bigCurve)) return [];
 
   // 合并相互接近的图区域，吸收图内文字与紧贴图边的小字号标注
   const out: ImageBox[] = [];
@@ -308,6 +329,11 @@ export function detectFigures(pg: PageModel, bodySize: number, tableBoxes: Box[]
         break;
       }
     }
+  }
+  // 没能并进哪幅图、单独一个够大的曲线图形（圆形头像框、示意图里单独的圆）：Word 里画不出来，单独成图保留
+  for (const c of weak) {
+    const k = clusters.find((x) => x.box === c);
+    if (k && bigCurve(k) && !merged.some((m) => overlapArea(m, c) > 0)) merged.push({ ...c });
   }
   for (const r0 of merged) {
     let r = { ...r0 };

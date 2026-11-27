@@ -13,7 +13,7 @@
 import type { FillRect, ImageBox, PageModel, PathBox, RotatedText, Seg, Span } from "./extract.js";
 import { collectHyphenated, collectWords, isSoftHyphen, wordCounts } from "../../documents/hyphen.js";
 import { settleFurniture, type Furniture, type FurniturePick } from "./furniture.js";
-import { detectDropCaps, detectEquations, detectIconPaths, detectFigures, detectImageGrids, detectMaskInk, rawBase, rasterBox, removeInside, rotatedTextIn, spansText, textHighlights, type Box, type MathCtx } from "./raster.js";
+import { detectDropCaps, detectEquations, detectIconPaths, detectFigures, detectImageGrids, detectMaskInk, rawBase, rasterBox, removeInside, rotatedTextIn, spansText, textHighlights, textPanels, type Box, type MathCtx } from "./raster.js";
 import type { ScanPiece } from "./scanLayer.js";
 
 export interface Run {
@@ -151,6 +151,8 @@ export interface SectionProps {
 export interface HeaderSet { default?: Para[]; first?: Para[]; even?: Para[] }
 
 export interface DocModel {
+  /** 页面颜色（各页都铺着同一种颜色的底，写成 Word 的页面颜色） */
+  background?: string;
   pageW: number;
   pageH: number;
   margins: { top: number; bottom: number; left: number; right: number };
@@ -523,6 +525,95 @@ function detectTables(page: PageModel): { tables: TableDraft[]; used: Set<Seg> }
     if (t) t.spans.push(s);
   }
   return { tables, used };
+}
+
+/**
+ * 可编辑排版里带文字的色块 → 一格的表格：格子的底纹由色块本身给出（buildTable 按覆盖格子的填充取底纹），
+ * 文字按原位置排在格内（段前距还原内边距）。色块边上的细线、细条（提示框左边的色条）写成格子的边框。
+ * 已在表格里的、与已有表格大面积重叠的、文字跨出色块边缘的（只是一段文字下面的底色带）不算
+ */
+function panelTables(page: PageModel, tables: TableDraft[], used: Set<Seg>, taken: Set<Span>): TableDraft[] {
+  const out: TableDraft[] = [];
+  const ov = (a: Box, b: Box) => Math.max(0, Math.min(a.x1, b.x1) - Math.max(a.x0, b.x0)) * Math.max(0, Math.min(a.y1, b.y1) - Math.max(a.y0, b.y0));
+  const ar = (b: Box) => (b.x1 - b.x0) * (b.y1 - b.y0);
+  const panels = textPanels(page).sort((a, b) => ar(a) - ar(b));
+  const singles: TableDraft[] = [];
+  for (const f of panels) {
+    if (tables.some((t) => ov(t, f) > 0.3 * ar(f)) || out.some((t) => ov(t, f) > 0)) continue;
+    const spans = page.spans.filter((sp) => !taken.has(sp) && (sp.x0 + sp.x1) / 2 > f.x0 && (sp.x0 + sp.x1) / 2 < f.x1 && (sp.top + sp.bottom) / 2 > f.y0 && (sp.top + sp.bottom) / 2 < f.y1);
+    if (!spans.some((sp) => sp.text.trim())) continue;
+    const crossing = page.spans.some((sp) => sp.text.trim() && !spans.includes(sp) && !taken.has(sp) && sp.x1 > f.x0 + 1 && sp.x0 < f.x1 - 1 && sp.bottom > f.y0 + 1 && sp.top < f.y1 - 1);
+    if (crossing) continue;
+    const textTop = Math.min(...spans.map((sp) => sp.top)), textBottom = Math.max(...spans.map((sp) => sp.bottom));
+    // 从页顶通到页底、贴着左 / 右页边的色块（简历的侧边栏）：与旁边的正文并成两格的表格——侧边栏一格（带底色）、
+    // 正文一格；否则一格的侧边栏表格有整页高，旁边的正文全排到它后面去
+    const leftSide = f.x0 <= 6, rightSide = f.x1 >= page.width - 6;
+    if (f.y1 - f.y0 > 0.5 * page.height && (leftSide || rightSide)) {
+      const rest = page.spans.filter((sp) => !taken.has(sp) && !spans.includes(sp) && sp.text.trim() && (sp.top + sp.bottom) / 2 > f.y0 && (sp.top + sp.bottom) / 2 < f.y1 &&
+        (leftSide ? sp.x0 >= f.x1 - 1 : sp.x1 <= f.x0 + 1));
+      if (rest.length) {
+        const all = [...spans, ...rest];
+        const y0 = Math.max(f.y0, Math.min(...all.map((sp) => sp.top)) - 4), y1 = Math.min(f.y1, Math.max(...all.map((sp) => sp.bottom)) + 4);
+        const xs = leftSide ? [f.x0, f.x1, Math.max(...rest.map((sp) => sp.x1)) + CELL_MARGIN] : [Math.min(...rest.map((sp) => sp.x0)) - CELL_MARGIN, f.x0, f.x1];
+        const box = { x0: xs[0], x1: xs[2], y0, y1 };
+        if (!tables.some((t) => ov(t, box) > 0) && !out.some((t) => ov(t, box) > 0)) {
+          out.push({ ...box, xs, ys: [y0, y1], hs: [], vs: xs.map((x) => ({ x, y0, y1, w: 0, color: "none", src: [] })), spans: all });
+          for (const sp of all) taken.add(sp);
+          continue;
+        }
+      }
+    }
+    // 格子只包到文字上下（色块比文字高得多时，多出来的底色不算版面高度）
+    const pad = Math.max(4, Math.min(textTop - f.y0, f.y1 - textBottom));
+    const fy0 = Math.max(f.y0, textTop - pad), fy1 = Math.min(f.y1, textBottom + pad);
+    // 色块边上的线 / 细条 → 格子边框（Word 的边框最粗 6pt）
+    const edgeV = (x: number) => page.segs.filter((g) => !g.horizontal && !used.has(g) && Math.abs(g.x0 - x) <= 3 && Math.min(g.y0, g.y1) <= f.y0 + 3 && Math.max(g.y0, g.y1) >= f.y1 - 3);
+    const edgeH = (y: number) => page.segs.filter((g) => g.horizontal && !used.has(g) && Math.abs(g.y0 - y) <= 3 && Math.min(g.x0, g.x1) <= f.x0 + 3 && Math.max(g.x0, g.x1) >= f.x1 - 3);
+    const bars = (side: "l" | "r" | "t" | "b") => page.fills.filter((b) => b !== f && Math.min(b.x1 - b.x0, b.y1 - b.y0) <= 6 && (
+      side === "l" ? Math.abs(b.x0 - f.x0) <= 2 && b.y0 <= f.y0 + 3 && b.y1 >= f.y1 - 3 && b.x1 - b.x0 <= 6 :
+      side === "r" ? Math.abs(b.x1 - f.x1) <= 2 && b.y0 <= f.y0 + 3 && b.y1 >= f.y1 - 3 && b.x1 - b.x0 <= 6 :
+      side === "t" ? Math.abs(b.y0 - f.y0) <= 2 && b.x0 <= f.x0 + 3 && b.x1 >= f.x1 - 3 && b.y1 - b.y0 <= 6 :
+      Math.abs(b.y1 - f.y1) <= 2 && b.x0 <= f.x0 + 3 && b.x1 >= f.x1 - 3 && b.y1 - b.y0 <= 6));
+    const vs: VSeg[] = [f.x0, f.x1].map((x, k) => {
+      const g = edgeV(x)[0], b = bars(k ? "r" : "l")[0];
+      return g ? { x, y0: fy0, y1: fy1, w: g.width, color: g.color, src: [g] } : b ? { x, y0: fy0, y1: fy1, w: Math.min(6, b.x1 - b.x0), color: b.color, src: [] } : { x, y0: fy0, y1: fy1, w: 0, color: "none", src: [] };
+    });
+    const hs: HSeg[] = [fy0, fy1].flatMap((y, k) => {
+      const g = (fy0 === f.y0 && !k) || (fy1 === f.y1 && k) ? edgeH(y)[0] : undefined, b = (fy0 === f.y0 && !k) || (fy1 === f.y1 && k) ? bars(k ? "b" : "t")[0] : undefined;
+      return g ? [{ y, x0: f.x0, x1: f.x1, w: g.width, color: g.color, src: [g] }] : b ? [{ y, x0: f.x0, x1: f.x1, w: Math.min(6, b.y1 - b.y0), color: b.color, src: [] }] : [];
+    });
+    for (const v of vs) v.src.forEach((g) => used.add(g));
+    for (const h of hs) h.src.forEach((g) => used.add(g));
+    out.push({ x0: f.x0, x1: f.x1, y0: fy0, y1: fy1, xs: [f.x0, f.x1], ys: [fy0, fy1], hs, vs, spans });
+    for (const sp of spans) taken.add(sp);
+  }
+  // 同一高度并排的几个色块（一行指标卡片）：并成一张一行的表，卡片之间的空隙是没有底纹的空格子，
+  // 否则一张张单独的表格只能上下排，卡片排成斜着的一串
+  out.sort((a, b) => a.x0 - b.x0);
+  for (const t of out) {
+    const row = singles.find((r) => {
+      const oy = Math.min(r.y1, t.y1) - Math.max(r.y0, t.y0);
+      return oy > 0.8 * Math.min(r.y1 - r.y0, t.y1 - t.y0) && t.x0 >= r.x1 - 0.5;
+    });
+    if (!row) { singles.push(t); continue; }
+    const gap = t.x0 - row.x1;
+    if (gap > 0.5) {
+      row.xs.push(t.x0);
+      row.vs.push({ x: t.x0, y0: Math.min(row.y0, t.y0), y1: Math.max(row.y1, t.y1), w: 0, color: "none", src: [] });
+    }
+    // 后一个色块的左边框接在空隙之后；表格的上下边界取各块的最外侧
+    const [vl, vr] = t.vs;
+    if (gap > 0.5) row.vs[row.vs.length - 1] = { ...vl, x: t.x0 };
+    else row.vs[row.vs.length - 1] = vl.w ? { ...vl, x: t.x0 } : row.vs[row.vs.length - 1];
+    row.xs.push(t.x1);
+    row.vs.push(vr);
+    row.hs.push(...t.hs.map((h) => ({ ...h })));
+    row.spans.push(...t.spans);
+    row.x1 = t.x1; row.y0 = Math.min(row.y0, t.y0); row.y1 = Math.max(row.y1, t.y1);
+    row.ys = [row.y0, row.y1];
+  }
+  for (const r of singles) r.hs = r.hs.map((h) => ({ ...h, y: Math.abs(h.y - r.y0) < Math.abs(h.y - r.y1) ? r.y0 : r.y1 }));
+  return singles;
 }
 
 /**
@@ -2079,6 +2170,8 @@ export function buildDocModel(pages0: PageModel[], opts: BuildOpts = {}): DocMod
       equations: sum("equations"), inlineMath: sum("inlineMath"), ...(scan ? { scan } : {}),
     },
     rasterText: models.map((m) => m.rasterText).filter(Boolean).join("\n"),
+    // 页面颜色是整篇文档的设置：各组一致时才写
+    ...(first.background && models.every((m) => m.background === first.background) ? { background: first.background } : {}),
     mode: first.mode,
     // 可编辑排版的页眉页脚：各节共用第一组的
     ...(first.headers ? { headers: first.headers, footers: first.footers, pageNumStart: first.pageNumStart, headerDist: first.headerDist, footerDist: first.footerDist } : {}),
@@ -2091,6 +2184,17 @@ function buildDocModelGroup(pages0: PageModel[], opts: BuildOpts = {}): DocModel
   // 识别时会从页面中移除元素、插入行内公式：总在副本上进行，失败回退时原始结果不受影响
   // 浅拷贝：页面上的数组会被换掉（成图区域里的文字移走）；旋转文字会被标上 raster，逐个复制，渲染失败重建时不受上一次影响
   const pages = pages0.map((p) => ({ ...p, ...(p.rotated ? { rotated: p.rotated.map((t) => ({ ...t })) } : {}) }));
+  // 铺满页面的色块：各页（八成以上）都是同一种颜色的 → 文档的页面颜色（Word 的"页面颜色"），不再逐页画；
+  // 只有个别页有的（幻灯片的深色标题页）是那一页的背景：可编辑排版里这一页前后分页、背景按页面坐标放在这一页上。
+  // 以前可编辑排版不画正文区域的色块，深色标题页上的白字落在白纸上看不见
+  const isFull = (f: FillRect, pg: PageModel) => (f.x1 - f.x0) * (f.y1 - f.y0) >= 0.85 * pg.width * pg.height;
+  const fullOf = (pg: PageModel) => pg.fills.filter((f) => isFull(f, pg)).sort((a, b) => (b.x1 - b.x0) * (b.y1 - b.y0) - (a.x1 - a.x0) * (a.y1 - a.y0))[0];
+  const docBg = (() => {
+    const cs = pages.map(fullOf).filter((f): f is FillRect => !!f).map((f) => f.color);
+    return cs.length && cs.length >= 0.8 * pages.length && cs.every((c) => c === cs[0]) ? cs[0] : undefined;
+  })();
+  if (docBg) for (const pg of pages) pg.fills = pg.fills.filter((f) => !(f.color === docBg && isFull(f, pg)));
+  const pageFill = pages.map(fullOf);
   const allText = pages0.map((p) => p.spans.map((s) => s.text).join(" ")).join("\n");
   const ctx: Ctx = { mode: opts.mode ?? "exact", spacing: new Map(), words: collectWords(allText), hyphenated: new Set(), counts: wordCounts(allText), softHyphens: 0 };
   // 行尾断开的写法不算"本身带连字符"：只收集行中间出现的
@@ -2236,6 +2340,9 @@ function buildDocModelGroup(pages0: PageModel[], opts: BuildOpts = {}): DocModel
     const inTable = new Set(tables.flatMap((t) => t.spans));
     tables.push(...detectRuledTables(pg, used, inTable));
     tables.push(...detectSideBySide(pg, used, inTable));
+    // 可编辑排版：带文字的色块（横幅、指标卡片、提示框）写成一格的带底纹表格，文字随表格移动、底色跟着文字走。
+    // 以前可编辑排版不画正文区域的色块，白字落在白纸上看不见
+    if (flow) tables.push(...panelTables(pg, tables, used, inTable));
     const free = pg.spans.filter((s) => !inTable.has(s));
     const rules = applyTextDecorations(free, pg.segs, used);
     return { pg, tables, free, rules, figures, frames, bgs, formLines: undefined as Line[] | undefined };
@@ -2575,13 +2682,26 @@ function buildDocModelGroup(pages0: PageModel[], opts: BuildOpts = {}): DocModel
       const x = (s.x0 + s.x1) / 2, y = (s.y0 + s.y1) / 2;
       shapes.push({ kind: "line", x0: s.horizontal ? s.x0 : x, y0: s.horizontal ? y : s.y0, x1: s.horizontal ? s.x1 : x, y1: s.horizontal ? y : s.y1, width: s.width, color: s.color, behind: false });
     }
+    // 表格里的色块：盖住所在格子大半的是格子的底纹（由表格画）；其余（格内的进度条、小色块）逐页保留时照常画出来，
+    // 不压字的放在文字上方——放在文字下方会被格子的底纹盖住。以前表格范围里的色块一律不画，简历侧边栏的技能进度条丢了
+    const shadeOfCell = (f: FillRect) => tables.some((t) => {
+      if (!(f.x0 >= t.x0 - 2 && f.x1 <= t.x1 + 2 && f.y0 >= t.y0 - 2 && f.y1 <= t.y1 + 2)) return false;
+      const cx = (f.x0 + f.x1) / 2, cy = (f.y0 + f.y1) / 2;
+      const k = t.xs.findIndex((x, i) => i + 1 < t.xs.length && cx >= x && cx < t.xs[i + 1]);
+      const r = t.ys.findIndex((y, i) => i + 1 < t.ys.length && cy >= y && cy < t.ys[i + 1]);
+      if (k < 0 || r < 0) return true;
+      return (f.x1 - f.x0) * (f.y1 - f.y0) >= 0.5 * (t.xs[k + 1] - t.xs[k]) * (t.ys[r + 1] - t.ys[r]);
+    });
     for (const f of pg.fills) {
-      if (inTableArea(f.x0, f.y0, f.x1, f.y1) || !keepShape(f.y0, f.y1)) continue;
-      shapes.push({ kind: "rect", x0: f.x0, y0: f.y0, x1: f.x1, y1: f.y1, width: 0, color: f.color, behind: true });
+      const inT = inTableArea(f.x0, f.y0, f.x1, f.y1);
+      if (f === pageFill[pi]) { shapes.push({ kind: "rect", x0: f.x0, y0: f.y0, x1: f.x1, y1: f.y1, width: 0, color: f.color, behind: true }); continue; }
+      if ((flow ? inT : shadeOfCell(f)) || !keepShape(f.y0, f.y1)) continue;
+      const overText = inT && pg.spans.some((s) => s.text.trim() && s.x1 > f.x0 && s.x0 < f.x1 && s.bottom > f.y0 && s.top < f.y1);
+      shapes.push({ kind: "rect", x0: f.x0, y0: f.y0, x1: f.x1, y1: f.y1, width: 0, color: f.color, behind: !inT || overText });
     }
     // 逐页保留：除了第一页，每页都从新的一页开始（按本次转换的顺序；只转换部分页时第一页不一定是原 PDF 的第 1 页）
     // 可编辑排版：整页背景（扫描页）所在的页、以及它后面的一页都从新的一页开始，否则下一页的内容会排到扫描图上
-    const bgBreak = flow && pi > 0 && (bgs.length > 0 || pre[pi - 1].bgs.length > 0);
+    const bgBreak = flow && pi > 0 && (bgs.length > 0 || pre[pi - 1].bgs.length > 0 || !!pageFill[pi] || !!pageFill[pi - 1]);
     const anchor = tinyPara({ pageBreakBefore: (!flow && pi > 0) || brokeEarly(pi) || bgBreak, images: [...bgs, ...pg.images.filter((im) => im.behind)], textBoxes: [], shapes });
     freshPage = true;
     const anchorAt = blocks.length;
@@ -3049,6 +3169,14 @@ function buildDocModelGroup(pages0: PageModel[], opts: BuildOpts = {}): DocModel
     const k = valid.indexOf(sig(p));
     if (k >= 0) p.heading = Math.min(3, k + 1);
   }
+  // 标题样式带"与下段同页"：一连串标题（误判的大字号短段落）连成比一页还长的链时，LibreOffice 先空出一页再排。
+  // 连续三段以上的标题只让最后两段保持与下段同页
+  for (let i = 0; i < topLevel.length; ) {
+    let j = i;
+    while (j < topLevel.length && topLevel[j].heading) j++;
+    if (j - i > 3) for (let k = i; k < j - 2; k++) topLevel[k].keepNext = false;
+    i = j === i ? i + 1 : j;
+  }
 
   // 流式模式：页眉页脚
   const hfOut = flow ? buildHeaders(hf, notes, notesBottom, { x0: left, x1: right }, right, ctx, headerDist ?? mTop / 2, furniture) : undefined;
@@ -3077,6 +3205,7 @@ function buildDocModelGroup(pages0: PageModel[], opts: BuildOpts = {}): DocModel
     },
     rasterText: rasterText.join("\n"),
     mode: ctx.mode,
+    ...(docBg ? { background: docBg } : {}),
     ...(hfOut ? { headers: hfOut.headers, footers: hfOut.footers, pageNumStart: hfOut.pageNumStart, headerDist, footerDist } : {}),
     ...(furniture?.notes.length ? { notes: furniture.notes } : {}),
   };
@@ -3366,6 +3495,8 @@ const HEADING_NUM = /^(第[一二三四五六七八九十百\d]+[章节部分篇
 function isHeadingCandidate(p: Para, bodySize: number, bodyFont: string): boolean {
   const text = p.runs.map((r) => r.text).join("").trim();
   if (!text || text.length > 100 || p.runs.some((r) => r.br)) return false;
+  // 带项目符号的是列表项（幻灯片上的要点字号大，也不是标题）
+  if (/^[•◦▪▫●○■□‣⁃∙·–—-]\s/u.test(text)) return false;
   if (/[。；;，,]$/.test(text)) return false;
   const runs = p.runs.filter((r) => r.text.trim());
   const bold = runs.every((r) => r.bold);
