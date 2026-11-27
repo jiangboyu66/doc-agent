@@ -10,6 +10,7 @@
 
 import fs from "node:fs/promises";
 import os from "node:os";
+import * as zlibSync from "node:zlib";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -63,6 +64,25 @@ function eq<T>(a: T, b: T, msg: string) {
 const count = (s: string, sub: string | RegExp) => (typeof sub === "string" ? s.split(sub).length - 1 : (s.match(new RegExp(sub, "g")) ?? []).length);
 const docText = (buf: Buffer) => new DocxDocument(buf).listBlocks().map((b) => b.text).join("\n");
 const docXml = (buf: Buffer) => new ZipPackage(buf).readText("word/document.xml");
+/** 8 位灰度、无隔行的 PNG（引擎的 encodePng 写的：每行滤波方式 0）解成像素 */
+const decodeGrayPng = (png: Buffer) => {
+  const { inflateSync } = zlibSync;
+  const w = png.readUInt32BE(16), h = png.readUInt32BE(20);
+  assert(png[24] === 8 && png[25] === 0, "只解 8 位灰度 PNG");
+  const parts: Buffer[] = [];
+  for (let at = 8; at < png.length;) {
+    const len = png.readUInt32BE(at), type = png.toString("ascii", at + 4, at + 8);
+    if (type === "IDAT") parts.push(png.subarray(at + 8, at + 8 + len));
+    at += 12 + len;
+  }
+  const raw = inflateSync(Buffer.concat(parts));
+  const data = new Uint8Array(w * h);
+  for (let y = 0; y < h; y++) {
+    assert(raw[y * (w + 1)] === 0, "只解滤波方式 0 的行");
+    data.set(raw.subarray(y * (w + 1) + 1, y * (w + 1) + 1 + w), y * w);
+  }
+  return { w, h, data };
+};
 const O = (track = false) => ({ track, author: "测试 作者", date: "2026-09-29T00:00:00Z" });
 
 // ---------------------------------------------------------------------------
@@ -1786,7 +1806,7 @@ await test("文字替换式扫描件（scan-text.pdf，WIPO 专利小册子的�
     const pkg = new ZipPackage(data);
     const xml = pkg.readText("word/document.xml");
     const headers = pkg.names().filter((n) => /^word\/header\d*\.xml$/.test(n)).map((n) => pkg.readText(n)).join("");
-    return { report, xml, headers, paras: (xml.match(/<w:p[ >][\s\S]*?<\/w:p>/g) ?? []).map(paraText), media: pkg.names().filter((n) => n.startsWith("word/media/")).length };
+    return { report, xml, headers, pkg, paras: (xml.match(/<w:p[ >][\s\S]*?<\/w:p>/g) ?? []).map(paraText), media: pkg.names().filter((n) => n.startsWith("word/media/")).length };
   };
   const flow = await read("flow");
   eq(flow.report.textCoverage, 1, "文字完整性");
@@ -1798,7 +1818,7 @@ await test("文字替换式扫描件（scan-text.pdf，WIPO 专利小册子的�
   assert(flow.paras.some((t) => /document number\s*\[IMG\]\s*of the series/.test(t)), `第 1 页句中的字应留在原行：${flow.paras.join(" | ").slice(0, 600)}`);
   assert(flow.paras.some((t) => /according to claim\s*\[IMG\]\s*, wherein the frames are stored/.test(t)), "第 2 页第一处权利要求编号应留在原行");
   assert(flow.paras.some((t) => /according to claim\s*\[IMG\]\s*, wherein the angle is corrected/.test(t)), "第 2 页第二处权利要求编号应留在原行");
-  eq((flow.xml.match(/name="pdf2word-glyph \d+"/g) ?? []).length, 3, "句中的字标成 pdf2word-glyph");
+  eq((flow.xml.match(/name="pdf2word-glyph \d+"/g) ?? []).length, 5, "句中的字、表单格里的两个词标成 pdf2word-glyph");
   // 没有文字层、看得出是文字的第 5 页：整页图标成 pdf2word-page 5，调用方识别后可以替换
   eq((flow.xml.match(/name="pdf2word-page 5"/g) ?? []).length, 1, "没读出来的页标成 pdf2word-page 5");
   assert(!/pdf2word-page 4/.test(flow.xml), "附图页不标");
@@ -1807,13 +1827,38 @@ await test("文字替换式扫描件（scan-text.pdf，WIPO 专利小册子的�
   for (const line of ["Box No. 1", "Box No. 12", "The applicant confirms the statement made in this box of the form"]) {
     assert(new RegExp(`<w:txbxContent>(?:(?!</w:txbxContent>)[\\s\\S])*${line.replace(/\./g, "\\.")}`).test(flow.xml), `表单文字应在文本框里：${line}`);
   }
+  // 表单格里只在扫描图里的词：从格线图上取出来，作为小图片放回原位的文本框（夹在一行文字中间的仍在那一行里），格线图上抹掉
+  const boxes = (flow.xml.match(/<w:txbxContent>[\s\S]*?<\/w:txbxContent>/g) ?? []).map((t) => ({ text: paraText(t), glyph: /name="pdf2word-glyph \d+"/.test(t) }));
+  assert(boxes.some((b) => b.glyph && /listed in the\s*\[IMG\]\s*to it/.test(b.text)), `夹在一行中间的词应留在那一行的文本框里：${boxes.filter((b) => b.glyph).map((b) => b.text).join(" | ")}`);
+  assert(boxes.some((b) => b.glyph && b.text.trim() === "[IMG]"), "独占一处的词应自成一个文本框");
+  eq(boxes.filter((b) => b.glyph).length, 2, "表单格里的两个词各在一个文本框里");
+  const glyphRun = flow.xml.match(/<w:r><w:rPr>((?:(?!<\/w:rPr>).)*)<\/w:rPr><w:drawing><wp:inline[^>]*>(?:(?!<\/wp:inline>)[\s\S])*?name="pdf2word-glyph/);
+  assert(glyphRun && /<w:rFonts /.test(glyphRun[1]) && /<w:sz w:val="\d+"\/>/.test(glyphRun[1]), `只以图片存在的字带着那一行的字体、字号：${glyphRun?.[1]}`);
+  {
+    // 格线图：两个词的位置上没有墨迹了（原扫描图上有）
+    const pkg = flow.pkg;
+    const rels = pkg.readText("word/_rels/document.xml.rels");
+    const at = flow.xml.indexOf('name="pdf2word-form 6"');
+    const rid = flow.xml.slice(at).match(/r:embed="([^"]+)"/)![1];
+    const target = rels.match(new RegExp(`Id="${rid}"[^>]*Target="([^"]+)"`))![1];
+    const gray = decodeGrayPng(pkg.read(`word/${target}`));
+    const K = gray.w / 595;
+    const darkIn = (x0: number, y0: number, x1: number, y1: number) => {
+      let n = 0;
+      for (let y = Math.round(y0 * K); y < Math.round(y1 * K); y++) for (let x = Math.round(x0 * K); x < Math.round(x1 * K); x++) if (gray.data[y * gray.w + x] < 128) n++;
+      return n;
+    };
+    eq(darkIn(66, 664 - 8, 114, 664 + 2.5), 0, "独占一处的词（Category）已从格线图上抹掉");
+    assert(darkIn(60, 80, 535, 81) > 100, "格线还在");
+  }
   // 每页相同的页眉块（公开号条）写进 Word 页眉，不在正文里重复
   assert(/<w:drawing>/.test(flow.headers), "页眉里应有公开号条的图片");
-  eq(flow.media, 10, "图片数：1 幅附图 + 3 个字 + 页眉 3 块（WO、2099/000001、PCT 号）+ 第 4、5、6 页各一张整页图");
+  eq(flow.media, 12, "图片数：1 幅附图 + 3 个字 + 表单格里 2 个词 + 页眉 3 块（WO、2099/000001、PCT 号）+ 第 4、5、6 页各一张整页图");
   const notes = flow.report.notes.join("\n");
   assert(/第 1–3 页的文字画在整页扫描图上面/.test(notes) && /可能有识别错误/.test(notes), `应说明正文来自 PDF 已有的识别文字：${notes}`);
   assert(/写进了 Word 页眉页脚/.test(notes), "应说明页眉块写进了页眉");
   assert(/第 6 页是带表格线的表单：格线保留为垫底的图片，文字按原位置放在文本框里/.test(notes), "应说明表单页的做法");
+  assert(/格里 2 处没被识别成文字的词从格线图里取出/.test(notes), `应说明表单格里取出的词：${notes}`);
   assert(/第 4 页没有文字层/.test(notes), "应说明哪些页是整页附图");
   assert(/第 5 页是没有做过文字识别的扫描页/.test(notes), "应说明哪些页的文字没有转成正文");
   // 逐行一致模式不重排文字，整页图照旧垫在文字下面；没有文字层的页同样要归类、标出
@@ -1833,6 +1878,38 @@ await test("文字替换式扫描件（scan-text.pdf，WIPO 专利小册子的�
   } finally {
     if (prev === undefined) delete process.env.PDF_RASTER; else process.env.PDF_RASTER = prev;
   }
+});
+
+await test("扫描页页顶只在一两页出现的公开号条（scan-strip.pdf，WIPO 小册子的节选）：落在正文区域时这一页从新的一页开始，不接在上一页正文的末尾", async () => {
+  const { pdfToDocx } = await import("../src/services/pdfConvert/index.js");
+  const { data, report } = await pdfToDocx(await fixture("scan-strip.pdf"), { mode: "flow" });
+  eq(report.textCoverage, 1, "文字完整性");
+  const xml = new ZipPackage(data).readText("word/document.xml");
+  const strip = xml.search(/<wp:docPr id="\d+" name="图片 \d+"/);
+  assert(strip > 0, "第 2 页的公开号条应作为图片留在正文里");
+  const before = xml.slice(0, strip);
+  const lastText = Math.max(before.lastIndexOf("<w:t>"), before.lastIndexOf("<w:t "));
+  assert(lastText > 0 && before.lastIndexOf('w:val="PageStart"') > lastText, "第 1 页正文之后、第 2 页的公开号条之前应换页");
+  // 第 3 页页顶没有公开号条，第 2 页排满：不另外换页
+  eq((xml.match(/w:val="PageStart"/g) ?? []).length, 1, "只在第 2 页之前换页");
+});
+
+await test("扫描件首页（scan-front.pdf，WIPO 小册子首页的版式）：附图略微越过栏间距的中线仍在左栏，右栏的摘要整段在它旁边（分栏符隔开），不被附图切成上下两段", async () => {
+  const { pdfToDocx } = await import("../src/services/pdfConvert/index.js");
+  const { data, report } = await pdfToDocx(await fixture("scan-front.pdf"), { mode: "flow" });
+  eq(report.textCoverage, 1, "文字完整性");
+  const xml = new ZipPackage(data).readText("word/document.xml");
+  const paras = (xml.match(/<w:p[ >][\s\S]*?<\/w:p>/g) ?? [])
+    .map((p) => (p.includes('w:type="column"') ? "[COLBR]" : "") + (/<wp:inline/.test(p) ? "[IMG]" : "") + p.replace(/<[^>]+>/g, ""))
+    .filter((t) => t.trim());
+  const figure = paras.findIndex((t) => t.startsWith("[IMG]"));
+  assert(figure > 0, `附图应是独占一段的图：${paras.join(" | ").slice(0, 400)}`);
+  eq(paras[figure + 1], "[COLBR]", "附图之后是分栏符，摘要排在右栏");
+  const abstract = paras[figure + 2] ?? "";
+  assert(abstract.startsWith("(57) Abstract: The present technology") && abstract.endsWith("bullet-time video."), `摘要整段在附图旁边：${abstract.slice(0, 120)}`);
+  assert(!paras.slice(0, figure).some((t) => t.includes("Abstract")), "摘要的开头不排在附图上面");
+  const last = xml.slice(xml.lastIndexOf("<w:sectPr"));
+  assert(/<w:cols w:num="2"/.test(last), "附图与摘要在两栏的一节里");
 });
 
 await test("扫描页印成图的页码：按位数变化推出编号，写成页码域；两位数的数字粘成一块时按宽度算位数；推不出来时不写", async () => {

@@ -156,7 +156,7 @@ export interface DocModel {
      * 扫描页的位图层（可编辑排版）：拆开的文字页、格线垫底 + 文字放进文本框的表单页（页码从 1 起）；作为行内图片插回的漏认字、
      * 没保留的页眉页脚块与零散墨迹的个数，换成页码文字的页数
      */
-    scan?: { textPages: number[]; formPages: number[]; blocks: number; inline: number; furniture: number; stray: number; pageNumbers: number; header: number };
+    scan?: { textPages: number[]; formPages: number[]; blocks: number; inline: number; formWords: number; furniture: number; stray: number; pageNumbers: number; header: number };
   };
   /** 渲染为图片的区域中的文字（计入完整性校验） */
   rasterText: string;
@@ -595,6 +595,12 @@ interface ScanPlan {
   pageNumber?: { box: Box; text: string };
   /** images 里每页都一样、留给页眉页脚的块 */
   header: Set<ImageBox>;
+  /**
+   * images 里页顶窄条（公开号、条码）的块：只有一两页有、不是每页重复的页眉，留在这一页。落在正文区域里时（其他页的正文排得
+   * 比它高），这一页从新的一页开始：可编辑排版不保留原文的分页，上一页排满（没有提前换页）时这一页的内容接着排，页顶的窄条
+   * 就跑到了上一页正文的末尾（WO2017038541A1 节选第 2 页的"WO 2017/038541 A1"和条码排在了第 1 页的底部，2026-11-27）
+   */
+  topStrip?: Set<ImageBox>;
 }
 
 /**
@@ -650,16 +656,19 @@ function planScanPages(pages: PageModel[]): Map<PageModel, ScanPlan> {
       continue;
     }
     const drop = strips.size >= 3 ? strips.get(pg) : undefined;
-    const header = new Set<ImageBox>();
+    const header = new Set<ImageBox>(), top = new Set<ImageBox>();
     const images: ImageBox[] = sc.pieces.filter((p) => !drop?.has(p) || keep.has(p)).map((p) => {
       const im: ImageBox = { x0: p.x0, y0: p.y0, x1: p.x1, y1: p.y1, png: p.png, pxW: p.pxW, pxH: p.pxH, scan: p.kind, ...(p.line ? { line: p.line } : {}) };
       if (keep.has(p)) header.add(im);
+      // 页顶的窄条留在了这一页（不足三页有，不进页眉）
+      else if (!drop && strips.get(pg)?.has(p) && (p.y0 + p.y1) / 2 < pg.height / 2) top.add(im);
       return im;
     });
     const num = [...(drop ?? [])].find((p) => numbers.has(p));
     plans.set(pg, {
       form: false, images, header, furniture: [...(drop ?? [])].filter((p) => !keep.has(p) && !numbers.has(p)).length,
       ...(num ? { pageNumber: { box: { x0: num.x0, y0: num.y0, x1: num.x1, y1: num.y1 }, text: numbers.get(num)! } } : {}),
+      ...(top.size ? { topStrip: top } : {}),
     });
   }
   return plans;
@@ -2064,7 +2073,7 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
 
   // 扫描页的位图层（见 scanLayer.ts）：可编辑排版下，文字画在位图上面的页不把整页位图垫在文字下面
   const scanPlan = flow ? planScanPages(pages) : new Map<PageModel, ScanPlan>();
-  const scanStats = { textPages: [] as number[], formPages: [] as number[], blocks: 0, inline: 0, furniture: 0, stray: 0, pageNumbers: 0, header: 0 };
+  const scanStats = { textPages: [] as number[], formPages: [] as number[], blocks: 0, inline: 0, formWords: 0, furniture: 0, stray: 0, pageNumbers: 0, header: 0 };
 
   // 全文共识的栏间距（与下面分栏时的共识同一做法：≥ 20% 的文字页测得出栏间距时取其中位数），释义清单检测用：
   // 本页自己测不出栏间距、却会按共识被切成两栏的释义页（LTB-07 第 7 页）
@@ -2097,9 +2106,33 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
         // 表单页：线框和框里的字合起来才看得懂。扫描图（识别出的字已从图里抹掉，剩下格线）整页垫在下面，
         // 每行文字按原位置放进文本框（独占一页）：翻译只换文字，格线和位置不动
         scanStats.formPages.push(pg.index + 1);
-        whole.role = "form";
-        whole.pageNo = pg.index + 1;
-        return { pg, tables: [], free: [], rules: [], figures: [], frames: [], bgs: [whole], formLines: buildLines(pg.spans.filter((sp) => sp.text.trim())) };
+        // 格里没被识别成文字的词（只在扫描图里）：从格线图上取出来（垫底的换成抹掉它们的图），作为行内小图片放回原位、
+        // 进那一行的文本框，标成 pdf2word-glyph，调用方识别成文字后和格里的字一样翻译
+        const words = pg.scan!.formWords;
+        const bg: ImageBox = words ? { ...whole, png: words.background } : whole;
+        bg.role = "form";
+        bg.pageNo = pg.index + 1;
+        if (words) {
+          const real = pg.spans.filter((sp) => sp.text.trim());
+          const sizes = real.map((sp) => sp.size).sort((a, b) => a - b);
+          const usual = sizes.length ? sizes[Math.floor(sizes.length / 2)] : 10;
+          const added: Span[] = [];
+          for (const p of words.pieces) {
+            const im: ImageBox = { x0: p.x0, y0: p.y0, x1: p.x1, y1: p.y1, png: p.png, pxW: p.pxW, pxH: p.pxH, scan: p.kind, role: "glyph", ...(p.line ? { line: p.line } : {}) };
+            // 独占一处的词：字号取本页文字的众数，基线在词的下沿
+            const size = p.line?.size ?? usual, baseline = p.line?.baseline ?? p.y1;
+            const near = (sp: Span) => Math.abs(sp.baseline - baseline) + Math.max(0, sp.x0 - p.x1, p.x0 - sp.x1) / 100;
+            const ref = real.length ? real.reduce((a, b) => (near(b) < near(a) ? b : a)) : undefined;
+            added.push({
+              text: "\uFFFC", x0: p.x0, x1: p.x1, top: baseline - 0.75 * size, bottom: baseline + 0.22 * size, baseline, size,
+              font: ref?.font ?? "SimSun", bold: false, italic: false, color: "000000", natural: p.x1 - p.x0, wordW: p.x1 - p.x0,
+              spaceW: ref?.spaceW ?? 0.25 * size, wordSpaceW: ref?.wordSpaceW, img: im,
+            });
+          }
+          pg.spans = [...pg.spans, ...added];
+          scanStats.formWords += added.length;
+        }
+        return { pg, tables: [], free: [], rules: [], figures: [], frames: [], bgs: [bg], formLines: buildLines(pg.spans.filter((sp) => sp.text.trim())) };
       } else {
         scanStats.textPages.push(pg.index + 1);
         const real = pg.spans.filter((sp) => sp.text.trim());
@@ -2554,7 +2587,10 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
       blocks.push(tinyPara({ sectionEnd: { ...curSection, front: true } }));
       curSection = { ...curSection, front: undefined, frontStart: undefined, titlePg: false, restart: true };
     }
-    const anchor = tinyPara({ pageBreakBefore: !frontStart && !bodyStart && ((!flow && pi > 0) || brokeEarly(pi) || bgBreak), images: [...bgs, ...pg.images.filter((im) => im.behind)], textBoxes: [], shapes });
+    // 页顶的窄条（公开号、条码）落在正文区域里的扫描页：同样从新的一页开始，窄条才在页顶（见 ScanPlan.topStrip）。
+    // 落在页眉区域的（其他页的正文都排在它下面）写进这一页的页眉，不占正文，不必换页
+    const stripBreak = flow && pi > 0 && [...(scanPlan.get(pg)?.topStrip ?? [])].some((im) => !inMarginZone(im.y0, im.y1));
+    const anchor = tinyPara({ pageBreakBefore: !frontStart && !bodyStart && ((!flow && pi > 0) || brokeEarly(pi) || bgBreak || stripBreak), images: [...bgs, ...pg.images.filter((im) => im.behind)], textBoxes: [], shapes });
     freshPage = true;
     const anchorAt = blocks.length;
     blocks.push(anchor);
@@ -2590,10 +2626,22 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
     const colLine = new Array(lines.length).fill(false);
     if (gutter) {
       const atColEdge = (l: Line, k: LineSide) => (k === "L" ? Math.abs(l.x1 - gutter.g0) <= 2 : k === "R" ? Math.abs(l.x1 - right) <= 2 : false);
+      const parts = (l: Line) => ({ L: l.spans.filter((sp) => (sp.x0 + sp.x1) / 2 < gutter.x), R: l.spans.filter((sp) => (sp.x0 + sp.x1) / 2 >= gutter.x) });
       for (let i = 0; i < lines.length; ) {
         if (kinds[i] === "cross") { i++; continue; }
         let j = i + 1;
-        while (j < lines.length && kinds[j] !== "cross" && lines[j].top - lines[j - 1].bottom < 2.5 * Math.max(lines[j].size, lines[j - 1].size)) j++;
+        let lastL = kinds[i] === "R" ? -Infinity : lines[i].bottom;
+        while (j < lines.length && kinds[j] !== "cross" && lines[j].top - lines[j - 1].bottom < 2.5 * Math.max(lines[j].size, lines[j - 1].size)) {
+          // 两侧都有字、却离左栏的上一行很远、左右两半又都伸进了栏间距的一行：不是两栏里的一行，是分栏区域下面的一行通栏文字，
+          // 字距恰好落在栏间距上（WO2017038541A1 首页著录项目下面的 "(54) Title: VIDEO PROCESSING … METHOD, AND PROGRAM"，
+          // 被切成左右两栏的两行，2026-11-27）。从这里另起一段再判断
+          if (kinds[j] === "two" && lines[j].top - lastL >= 2.5 * lines[j].size) {
+            const { L, R } = parts(lines[j]);
+            if (Math.max(...L.map((sp) => sp.x1)) > gutter.g0 + 1 && Math.min(...R.map((sp) => sp.x0)) < gutter.g1 - 1) break;
+          }
+          if (kinds[j] !== "R") lastL = lines[j].bottom;
+          j++;
+        }
         const seg = lines.slice(i, j), ks = kinds.slice(i, j);
         const two = ks.filter((k) => k === "two").length;
         const edge = seg.filter((l, k) => atColEdge(l, ks[k])).length;
@@ -2602,7 +2650,8 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
         const segTop = Math.min(...seg.map((l) => l.top)), segBottom = Math.max(...seg.map((l) => l.bottom));
         // 或者紧挨着栏内的表格/图（两栏表题并排、表题与表格之间没有跨栏内容）
         const onlySide = ks.every((k) => k === "L") ? "L" : ks.every((k) => k === "R") ? "R" : null;
-        const facing = [...tables, ...figures, ...pg.images.filter((im) => !im.render)].some((t) => {
+        // 版心外固定在页边的图（首页左边距里竖排的公开号条码）不在哪一栏旁边
+        const facing = [...tables, ...figures, ...pg.images.filter((im) => !im.render && !im.pinned)].some((t) => {
           const side = t.x1 <= gutter.x + 2 ? "L" : t.x0 >= gutter.x - 2 ? "R" : "full";
           if (side === "full") return false;
           if (onlySide && side !== onlySide) return t.y0 < segBottom + 6 && t.y1 > segTop - 6;
@@ -2735,9 +2784,11 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
     //   - 其余：独占一段的行内图片，并排的几张放在同一段里
     const pics = [...pg.images.filter((im) => !im.behind), ...figures].sort((a, b) => a.y0 - b.y0);
     const rest: ImageBox[] = [];
+    // 从扫描图上裁下来的块：外接框含留白和线框，略微越过栏间距的中线不算通栏；没碰到另一栏的文字就属于这一栏
+    const sideOfImage = (img: ImageBox): "full" | "L" | "R" =>
+      img.scan && gutter ? (img.x1 <= gutter.g1 - 1 ? "L" : img.x0 >= gutter.g0 + 1 ? "R" : "full") : sideOf(img.x0, img.x1);
     for (const img of pics) {
-      // 从扫描图上裁下来的块：外接框含留白和线框，略微越过栏间距的中线不算通栏；没碰到另一栏的文字就属于这一栏
-      const side = img.scan && gutter ? (img.x1 <= gutter.g1 - 1 ? "L" : img.x0 >= gutter.g0 + 1 ? "R" : "full") : sideOf(img.x0, img.x1);
+      const side = sideOfImage(img);
       // 流式模式：页眉页脚区域的图片（徽标）写进页眉页脚，每页都在原位置，不随正文移动
       if (inMarginZone(img.y0, img.y1)) { (flow ? hf[pi].imgs : anchor.images!).push(img); continue; }
       const beside = besideOf(img, side);
@@ -2762,7 +2813,7 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
     }
     const groups: ImageBox[][] = [];
     for (const img of rest) {
-      const g = groups.find((gr) => gr.some((o) => sideOf(o.x0, o.x1) === sideOf(img.x0, img.x1) &&
+      const g = groups.find((gr) => gr.some((o) => sideOfImage(o) === sideOfImage(img) &&
         Math.min(o.y1, img.y1) - Math.max(o.y0, img.y0) > 0.5 * Math.min(o.y1 - o.y0, img.y1 - img.y0)));
       if (g) g.push(img); else groups.push([img]);
     }
@@ -2770,7 +2821,10 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
       const overlap = g.some((a, i) => g.some((b, j) => j > i && Math.min(a.x1, b.x1) - Math.max(a.x0, b.x0) > 2));
       if (overlap) { anchor.images!.push(...g); continue; } // 互相叠放的图片：保持页面绝对坐标
       const x0 = Math.min(...g.map((i) => i.x0)), x1 = Math.max(...g.map((i) => i.x1));
-      items.push({ kind: "image", imgs: g, side: sideOf(x0, x1), top: Math.min(...g.map((i) => i.y0)) });
+      // 与上面判断旁边有没有文字时用同一个归属：扫描图上裁下来的附图略微越过栏间距的中线（WO2017038541A1 首页的附图右缘
+      // 在 325，栏间距中线 316），按通栏排会把右栏的摘要从附图处切成两段、各成一节（2026-11-27）
+      const sides = new Set(g.map(sideOfImage));
+      items.push({ kind: "image", imgs: g, side: sides.size === 1 ? [...sides][0] : sideOf(x0, x1), top: Math.min(...g.map((i) => i.y0)) });
     }
     items.sort((a, b) => a.top - b.top);
 
@@ -2869,7 +2923,11 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
         if (flow) {
           markRegion(L.blocks);
           markRegion(R.blocks);
-          blocks.push(...L.blocks, ...R.blocks);
+          // 左栏以图片、表格结束（左栏是附图，右栏是摘要）：右栏的文字在它旁边，不是接着它往下排的续文。分栏符把右栏留在右栏；
+          // 不加时 Word 平衡两栏，右栏开头的几行排到了左栏的附图下面（WO2017038541A1 首页，2026-11-27）
+          const lastL = [...L.blocks].reverse().find((b) => !(b.kind === "p" && b.tiny && !b.inlineImages));
+          const beside = R.blocks.length > 0 && !!lastL && (lastL.kind === "table" || (lastL.kind === "p" && !!lastL.inlineImages));
+          blocks.push(...L.blocks, ...(beside ? [tinyPara({ columnBreakBefore: true })] : []), ...R.blocks);
           cursor = Math.max(L.cursor, R.cursor);
           continue;
         }

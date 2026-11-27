@@ -7,7 +7,7 @@
 第 3 页  正文
 第 4 页  只有附图，没有文字层
 第 5 页  没做识别的整页文字扫描（没有文字层，但看得出是文字）
-第 6 页  带表格线的表单，格子里是真正的文字
+第 6 页  带表格线的表单，格子里是真正的文字；两个词只在扫描图里（一个夹在一行文字中间，一个独占一处）
 
 易错点：把整页图衬在文字后面，Word 里文字一重排就和图错位；把图直接丢掉，附图和那几个字就没了。
 应当把图拆开：附图单独成图，句中的字留在原来的位置，每页重复的页眉去掉，没有文字层的页按整页图保留并如实上报。"""
@@ -152,7 +152,17 @@ for x in (x0, 200, x1):
 for r in range(rows):
     TEXT.append((x0 + 6, top + r * 50 + 20, 10, f"Box No. {r + 1}"))
     TEXT.append((206, top + r * 50 + 20, 10, "The applicant confirms the statement made in this box of the form"))
-    TEXT.append((206, top + r * 50 + 34, 10, "and attaches the documents that are listed in the annex to it"))
+    if r == 2:
+        # 格里漏认的词（只在扫描图里，WIPO 检索报告的"カテゴリー*""パテントファミリー"就是这样）：这个夹在一行文字中间
+        before = "and attaches the documents that are listed in the "
+        TEXT.append((206, top + r * 50 + 34, 10, before))
+        x = 206 + pdfmetrics.stringWidth(before, "Helvetica", 10) + 1.5
+        ink(dr, x, top + r * 50 + 34, "annex", 10)
+        TEXT.append((x + pdfmetrics.stringWidth("annex", "Helvetica", 10) + 3, top + r * 50 + 34, 10, "to it"))
+    else:
+        TEXT.append((206, top + r * 50 + 34, 10, "and attaches the documents that are listed in the annex to it"))
+# 这个独占一处（格里没有别的字挨着它）
+ink(dr, x0 + 6, top + 11 * 50 + 40, "Category", 10)
 place(im)
 c.save()
 

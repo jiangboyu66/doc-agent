@@ -87,8 +87,13 @@ class Writer {
       const k = r.imgScale ?? 1;
       const { cx, cy, xml } = this.picture(k === 1 ? r.img : { ...r.img, x1: r.img.x0 + (r.img.x1 - r.img.x0) * k, y1: r.img.y0 + (r.img.y1 - r.img.y0) * k });
       const lower = Math.round((r.imgLower ?? 0) * 2); // 半磅；正值为降低，负值为升高
+      // 只以图片存在的字（pdf2word-glyph）：带上这一行的字体、字号。调用方把它识别成文字、换成文字 run 时沿用这些格式；
+      // 独占一个文本框的词（表单格里的词）旁边没有别的文字可以照着排
+      const f = esc(r.font), hp = Math.max(2, Math.round(r.size * 2));
+      const own = r.img.role === "glyph" && r.font ? `<w:rFonts w:ascii="${f}" w:hAnsi="${f}" w:eastAsia="${f}" w:cs="${f}"/>` : "";
+      const sz = r.img.role === "glyph" && r.size ? `<w:sz w:val="${hp}"/><w:szCs w:val="${hp}"/>` : "";
       return (
-        `<w:r><w:rPr><w:noProof/>${lower ? `<w:position w:val="${-lower}"/>` : ""}</w:rPr><w:drawing><wp:inline distT="0" distB="0" distL="0" distR="0">` +
+        `<w:r><w:rPr>${own}<w:noProof/>${lower ? `<w:position w:val="${-lower}"/>` : ""}${sz}</w:rPr><w:drawing><wp:inline distT="0" distB="0" distL="0" distR="0">` +
         `<wp:extent cx="${cx}" cy="${cy}"/><wp:effectExtent l="0" t="0" r="0" b="0"/>${xml}</wp:inline></w:drawing></w:r>`
       );
     }

@@ -281,7 +281,8 @@ export async function pdfToDocx(buf: Buffer, opts: { engine?: PdfEngine; title?:
         (scan.stray ? `；${scan.stray} 处零散墨迹没有保留` : "") +
         "。正文来自 PDF 里已有的识别文字，可能有识别错误，重要的数字、日期请对照原 PDF。");
     }
-    if (scan?.formPages.length) notes.push(`第 ${formatPageRange(scan.formPages)} 页是带表格线的表单：格线保留为垫底的图片，文字按原位置放在文本框里。`);
+    if (scan?.formPages.length) notes.push(`第 ${formatPageRange(scan.formPages)} 页是带表格线的表单：格线保留为垫底的图片，文字按原位置放在文本框里` +
+      (scan.formWords ? `；格里 ${scan.formWords} 处没被识别成文字的词从格线图里取出，以小图片放回原位的文本框（图片名 pdf2word-glyph）` : "") + "。");
     // 整份都是整页图片时前面已有说明；这里只说混在文字页中间的
     if (picture.length && textChars >= 20 * pages.length) notes.push(`第 ${formatPageRange(picture)} 页没有文字层（附图等），按整页图片保留。`);
     if (unread.length && textChars >= 20 * pages.length) notes.push(`第 ${formatPageRange(unread)} 页是没有做过文字识别的扫描页，按整页图片保留（图片名 pdf2word-page 加页码），其中的文字没有转成正文。`);

@@ -42,6 +42,13 @@ export interface ScanSplit {
   glyphCount: number;
   graphicCount: number;
   graphicArea: number;
+  /**
+   * 表单页（一个线框占了大半页、文字大半在框里：国际检索报告）才有。表单页的位图整页垫在文本框下面，格里没被识别成文字的词
+   * （"カテゴリー*""パテントファミリー""データベー"）留在图里，既不是文字、也没人读它，翻译后仍是原文（WO2017038541A1 的
+   * 检索报告，2026-11-27）。这里把它们从位图上取出来：pieces 是每个词裁成的小图（落在一行文字里的带上那一行的基线与字号），
+   * background 是抹掉这些词之后的整页位图（PNG，与原图同样大小）。调用方把词作为行内小图片放回原位，由它识别成文字。
+   */
+  formWords?: { pieces: ScanPiece[]; background: Buffer };
 }
 
 interface Gray { data: Uint8Array | Uint8ClampedArray; w: number; h: number }
@@ -79,11 +86,15 @@ export function splitScan(gray: Gray, box: Box, texts: TextBox[]): ScanSplit | n
   interface Comp { c0: number; r0: number; c1: number; r1: number; n: number }
   const comps: Comp[] = [];
   const stack = new Int32Array(dark + 1);
+  // 每格属于哪个连通块（编号从 1 起）：表单页要把格里的词从位图上抹掉时，按块抹，不碰挨着的格线
+  const label = new Uint16Array(gw * gh);
   for (let start = 0; start < grid.length && comps.length <= MAX_COMPONENTS; start++) {
     if (grid[start] !== 1) continue;
     let top = 0;
+    const id = comps.length + 1;
     stack[top++] = start;
     grid[start] = 2;
+    label[start] = id;
     const cp: Comp = { c0: gw, r0: gh, c1: -1, r1: -1, n: 0 };
     while (top) {
       const at = stack[--top], r = (at / gw) | 0, c = at - r * gw;
@@ -99,7 +110,7 @@ export function splitScan(gray: Gray, box: Box, texts: TextBox[]): ScanSplit | n
           const cc = c + dc;
           if (cc < 0 || cc >= gw) continue;
           const k = rr * gw + cc;
-          if (grid[k] === 1) { grid[k] = 2; stack[top++] = k; }
+          if (grid[k] === 1) { grid[k] = 2; label[k] = id; stack[top++] = k; }
         }
       }
     }
@@ -109,16 +120,17 @@ export function splitScan(gray: Gray, box: Box, texts: TextBox[]): ScanSplit | n
 
   // 连通块 → 页面坐标，分类
   type Kind = "glyph" | "graphic";
-  const items: Array<Box & { kind: Kind; n: number }> = [];
+  const items: Array<Box & { kind: Kind; n: number; id: number }> = [];
   const rules: Box[] = [];
-  for (const cp of comps) {
+  for (let ci = 0; ci < comps.length; ci++) {
+    const cp = comps[ci];
     const b = { x0: box.x0 + cp.c0 * ux, y0: box.y0 + cp.r0 * uy, x1: box.x0 + (cp.c1 + 1) * ux, y1: box.y0 + (cp.r1 + 1) * uy };
     const cw = b.x1 - b.x0, ch = b.y1 - b.y0;
     if (cw < 1.3 && ch < 1.3) continue; // 噪点
     // 细长的线：粗细不到 2.5 pt，或不到长度的 1.2%（扫描略歪的长线会跨几行像素）
     const thin = Math.max(2.5, 0.012 * Math.max(cw, ch));
     if ((ch <= thin && cw >= 30) || (cw <= thin && ch >= 30)) { rules.push(b); continue; }
-    items.push({ ...b, kind: cw > 30 || ch > 30 ? "graphic" : "glyph", n: cp.n });
+    items.push({ ...b, kind: cw > 30 || ch > 30 ? "graphic" : "glyph", n: cp.n, id: ci + 1 });
   }
 
   // 文字与墨迹的关系：字框下有墨迹的片段占多少
@@ -186,34 +198,86 @@ export function splitScan(gray: Gray, box: Box, texts: TextBox[]): ScanSplit | n
   boxes = boxes.filter((b) => b.n >= 6 || b.graphic);
   if (boxes.length > MAX_PIECES) return null;
 
-  const pieces: ScanPiece[] = boxes.map((b) => {
-    // 落在文字行里的漏认字：与它同一行、左右紧挨着的文字片段
+  /** 落在文字行里的漏认字：与它同一行、左右紧挨着的文字片段的基线与字号；压在文字上的（重影）返回 null */
+  const lineOf = (b: Box): ScanPiece["line"] | null => {
+    const cy = (b.y0 + b.y1) / 2, bw2 = b.x1 - b.x0, bh2 = b.y1 - b.y0;
     let line: ScanPiece["line"];
-    if (!b.graphic && !duplicated) {
-      const cy = (b.y0 + b.y1) / 2, bw2 = b.x1 - b.x0, bh2 = b.y1 - b.y0;
-      let best = Infinity;
-      for (const t of real) {
-        const th = t.y1 - t.y0;
-        if (cy < t.y0 - 0.15 * th || cy > t.y1 + 0.15 * th || bh2 > 1.8 * th || bw2 > 14 * t.size) continue;
-        const gap = Math.max(t.x0 - b.x1, b.x0 - t.x1);
-        // 压在文字上的（重影、同一个字画了两遍）不算漏认
-        if (gap < 0 && Math.min(t.x1, b.x1) - Math.max(t.x0, b.x0) > 0.5 * Math.min(bw2, t.x1 - t.x0)) { line = undefined; best = -1; break; }
-        if (gap <= 2.5 * t.size && gap < best) { best = gap; line = { baseline: t.baseline, size: t.size }; }
-      }
+    let best = Infinity;
+    for (const t of real) {
+      const th = t.y1 - t.y0;
+      if (cy < t.y0 - 0.15 * th || cy > t.y1 + 0.15 * th || bh2 > 1.8 * th || bw2 > 14 * t.size) continue;
+      const gap = Math.max(t.x0 - b.x1, b.x0 - t.x1);
+      // 压在文字上的（重影、同一个字画了两遍）不算漏认
+      if (gap < 0 && Math.min(t.x1, b.x1) - Math.max(t.x0, b.x0) > 0.5 * Math.min(bw2, t.x1 - t.x0)) return null;
+      if (gap <= 2.5 * t.size && gap < best) { best = gap; line = { baseline: t.baseline, size: t.size }; }
     }
-    // 四周留 1 pt，不贴着笔画裁；行内的块按行高裁
+    return line;
+  };
+  /** 从位图上裁下一块：四周留 1 pt，不贴着笔画裁；行内的块按行高裁 */
+  const cut = (b: Box, kind: ScanPiece["kind"], glyphs: number, line: ScanPiece["line"]): ScanPiece => {
     const x0 = Math.max(box.x0, b.x0 - (line ? 0.5 : 1)), x1 = Math.min(box.x1, b.x1 + (line ? 0.5 : 1));
     const y0 = Math.max(box.y0, line ? Math.min(b.y0, line.baseline - 0.8 * line.size) : b.y0 - 1), y1 = Math.min(box.y1, line ? Math.max(b.y1, line.baseline) : b.y1 + 1);
     const c0 = Math.max(0, Math.floor(((x0 - box.x0) / bw) * w)), c1 = Math.min(w, Math.ceil(((x1 - box.x0) / bw) * w));
     const r0 = Math.max(0, Math.floor(((y0 - box.y0) / bh) * h)), r1 = Math.min(h, Math.ceil(((y1 - box.y0) / bh) * h));
     const pw = Math.max(1, c1 - c0), ph = Math.max(1, r1 - r0), out = new Uint8Array(pw * ph);
     for (let y = 0; y < ph; y++) out.set(data.subarray((r0 + y) * w + c0, (r0 + y) * w + c0 + pw), y * pw);
-    return { x0, y0, x1, y1, kind: b.graphic ? "graphic" : "glyphs", glyphs: b.glyphs, ...(line ? { line } : {}), png: encodePng(pw, ph, out, 1), pxW: pw, pxH: ph };
-  });
+    return { x0, y0, x1, y1, kind, glyphs, ...(line ? { line } : {}), png: encodePng(pw, ph, out, 1), pxW: pw, pxH: ph };
+  };
+  const pieces: ScanPiece[] = boxes.map((b) => cut(b, b.graphic ? "graphic" : "glyphs", b.glyphs, !b.graphic && !duplicated ? lineOf(b) ?? undefined : undefined));
   pieces.sort((a, b) => a.y0 - b.y0 || a.x0 - b.x0);
   const graphics = kept.filter((it) => it.kind === "graphic");
   const graphicArea = Math.min(1, graphics.reduce((a, g) => a + (g.x1 - g.x0) * (g.y1 - g.y0), 0) / (bw * bh));
-  return { pieces, rules, inkUnderText, textLines, ink, glyphCount: kept.length - graphics.length, graphicCount: graphics.length, graphicArea };
+  const split: ScanSplit = { pieces, rules, inkUnderText, textLines, ink, glyphCount: kept.length - graphics.length, graphicCount: graphics.length, graphicArea };
+
+  // 表单页（与 layout.ts 的判断相同：一个线框占了页面宽的六成、高的四成半以上，页上一半以上的字在框里）：
+  // 格线连成一个大块，格里的漏认字在上面"并块"时都被并进了格线，只能另外按字聚成词
+  const chars = (list: TextBox[]) => list.reduce((n, t) => n + t.text.replace(/\s/g, "").length, 0);
+  const inside = (p: Box) => real.filter((t) => { const cx = (t.x0 + t.x1) / 2, cy = (t.y0 + t.y1) / 2; return cx >= p.x0 && cx <= p.x1 && cy >= p.y0 && cy <= p.y1; });
+  const frames = duplicated ? [] : pieces.filter((p) => p.kind === "graphic" && p.x1 - p.x0 >= 0.6 * bw && p.y1 - p.y0 >= 0.45 * bh && chars(inside(p)) >= 0.5 * chars(real));
+  if (frames.length) {
+    const gl = kept.filter((it) => it.kind === "glyph");
+    const up = gl.map((_, i) => i);
+    const root = (i: number): number => { while (up[i] !== i) { up[i] = up[up[i]]; i = up[i]; } return i; };
+    const byX = gl.map((_, i) => i).sort((a, b) => gl[a].x0 - gl[b].x0);
+    for (let a = 0; a < byX.length; a++) {
+      const p = gl[byX[a]];
+      for (let b = a + 1; b < byX.length; b++) {
+        const q = gl[byX[b]];
+        if (q.x0 - p.x1 > GX) break;
+        const gx = Math.max(0, Math.max(p.x0, q.x0) - Math.min(p.x1, q.x1)), gy = Math.max(0, Math.max(p.y0, q.y0) - Math.min(p.y1, q.y1));
+        if (gx <= GX && gy <= GY) { const ra = root(byX[a]), rb = root(byX[b]); if (ra !== rb) up[ra] = rb; }
+      }
+    }
+    const words = new Map<number, number[]>();
+    for (let i = 0; i < gl.length; i++) { const r = root(i); (words.get(r) ?? words.set(r, []).get(r)!).push(i); }
+    const lifted = new Uint8Array(comps.length + 1);
+    const out: ScanPiece[] = [];
+    for (const ids of words.values()) {
+      const m = ids.map((i) => gl[i]);
+      const b = { x0: Math.min(...m.map((o) => o.x0)), y0: Math.min(...m.map((o) => o.y0)), x1: Math.max(...m.map((o) => o.x1)), y1: Math.max(...m.map((o) => o.y1)) };
+      const hh = b.y1 - b.y0, cx = (b.x0 + b.x1) / 2, cy = (b.y0 + b.y1) / 2;
+      // 格里的词：落在线框里（框外页顶、页底的公开号、页码是页面装饰，照旧留在图里）；至少两个字形、其中至少两个有词高的
+      // 一半上下（不是一串点、一条虚线），词高像一行字（4–24 pt）。单个的字形（类别栏的 "A"、复选框）留在格线图里：
+      // 它们多半不是要翻译的字，读错了反而会丢
+      if (!frames.some((p) => cx >= p.x0 && cx <= p.x1 && cy >= p.y0 && cy <= p.y1)) continue;
+      if (m.length < 2 || m.filter((o) => o.y1 - o.y0 >= 0.45 * hh).length < 2 || hh < 4 || hh > 24 || m.reduce((n, o) => n + o.n, 0) < 6) continue;
+      const line = lineOf(b);
+      if (line === null) continue;
+      out.push(cut(b, "glyphs", m.length, line));
+      for (const o of m) lifted[o.id] = 1;
+    }
+    if (out.length) {
+      // 抹掉取出来的词：只抹这些连通块自己的像素
+      const cleared = Uint8Array.from(data);
+      for (let y = 0; y < h; y++) {
+        const row = y * w, gr = Math.floor(y / f) * gw;
+        for (let x = 0; x < w; x++) if (data[row + x] < 128 && lifted[label[gr + ((x / f) | 0)]]) cleared[row + x] = 255;
+      }
+      out.sort((a, b) => a.y0 - b.y0 || a.x0 - b.x0);
+      split.formWords = { pieces: out, background: encodePng(w, h, cleared, 1) };
+    }
+  }
+  return split;
 }
 
 /** 成行的字形：相邻（间距不超过约一个字）且对齐的字形连成一行；数长度 ≥ 150 pt、至少 12 个字形的行，横竖都算 */
