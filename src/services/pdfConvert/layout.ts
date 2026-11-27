@@ -494,6 +494,20 @@ function detectTables(page: PageModel): { tables: TableDraft[]; used: Set<Seg> }
     const xs = cluster(c.vs.map((v) => v.x), 2);
     const ys = cluster(c.hs.map((h) => h.y), 2);
     if (xs.length < 2 || ys.length < 2) continue;
+    // 左右两边不画竖线的表格（统计表常见：只有内部竖线，横线左右伸到表格边上）：横线大多伸到同一处、
+    // 那一条里还有文字的，把横线的端点当作表格的左 / 右边界。以前表格只按竖线算宽，最左、最右两列落在表格外，
+    // 被另一种表格识别成一张两列的表，中间各列成了另一张表排到后面
+    const yIn = (sp: Span) => (sp.top + sp.bottom) / 2 > ys[0] && (sp.top + sp.bottom) / 2 < ys[ys.length - 1];
+    for (const end of ["x0", "x1"] as const) {
+      const edge = end === "x0" ? xs[0] : xs[xs.length - 1];
+      const out = c.hs.map((h) => h[end]).filter((x) => (end === "x0" ? x < edge - 8 : x > edge + 8));
+      if (out.length < 0.6 * c.hs.length) continue;
+      const x = end === "x0" ? Math.min(...out) : Math.max(...out);
+      if (out.filter((v) => Math.abs(v - x) <= 3).length < 0.6 * c.hs.length) continue;
+      const lo = Math.min(x, edge), hi = Math.max(x, edge);
+      if (!page.spans.some((sp) => sp.text.trim() && yIn(sp) && (sp.x0 + sp.x1) / 2 > lo && (sp.x0 + sp.x1) / 2 < hi)) continue;
+      if (end === "x0") xs.unshift(x); else xs.push(x);
+    }
     const x0 = xs[0], x1 = xs[xs.length - 1], y0 = ys[0], y1 = ys[ys.length - 1];
     if (x1 - x0 < 20 || y1 - y0 < 8) continue;
     if (isChartGrid(page, x0, y0, x1, y1, (xs.length - 1) * (ys.length - 1))) continue;

@@ -699,6 +699,30 @@ await test("图片排成的页面（幻灯片 / 绘本：一行标题 + 横跨�
   }
 });
 
+await test("左右两边不画竖线的统计表（只有内部竖线、横线伸到表格边上）：整张表一起识别，最左、最右两列不被拆成另一张表（两种模式）", async () => {
+  const { pdfToDocx } = await import("../src/services/pdfConvert/index.js");
+  const pdf = await fixture("open-table.pdf");
+  const textOf = (x: string) => (x.match(/<w:t[^>]*>([^<]*)<\/w:t>/g) ?? []).map((t) => t.replace(/<[^>]+>/g, "").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&")).join("");
+  for (const mode of ["exact", "flow"] as const) {
+    const { data, report } = await pdfToDocx(pdf, { mode });
+    eq(report.textCoverage, 1, `${mode}：文字完整性`);
+    const xml = new ZipPackage(data).readText("word/document.xml");
+    const tbls = xml.match(/<w:tbl>[\s\S]*?<\/w:tbl>/g) ?? [];
+    eq(tbls.length, 1, `${mode}：应只有一张表`);
+    eq((tbls[0].match(/<w:gridCol /g) ?? []).length, 7, `${mode}：7 列`);
+    const rows = tbls[0].match(/<w:tr>[\s\S]*?<\/w:tr>/g) ?? [];
+    const head = (rows[0].match(/<w:tc>[\s\S]*?<\/w:tc>/g) ?? []).map(textOf);
+    eq(head.join("|"), "行业名称|指标名称|计量单位|大型|中型|小型|微型", `${mode}：表头`);
+    // 最左一列（行业名称）与最右一列（微型）的内容在同一张表里、同一行
+    const gong = rows.find((r) => textOf(r).includes("从业人员(X)") && textOf(r).includes("X<20"));
+    assert(!!gong && textOf(gong).includes("300≤X<1000"), `${mode}：工业第一行的各列应在同一行里`);
+    assert(rows.some((r) => textOf(r).includes("工业")), `${mode}：最左一列在表里`);
+    // 左右两边原本没有竖线：表格的左右外框是空的
+    const firstCell = rows[1].match(/<w:tc>[\s\S]*?<\/w:tc>/)![0];
+    assert(!/<w:left w:val="single"/.test(firstCell), `${mode}：最左一列不应加出原文没有的竖线`);
+  }
+});
+
 // ---------------------------------------------------------------------------
 console.log("\n代理主循环（模拟模型）");
 // ---------------------------------------------------------------------------
@@ -1276,7 +1300,7 @@ await test("所有夹具 PDF：两种排版方式都不报错、文字完整；L
   const run = promisify(execFile);
   const soffice = process.env.SOFFICE_PATH || "soffice";
   const hasSoffice = await run(soffice, ["--version"]).then(() => true, () => false);
-  const names = ["columns", "journal", "figures", "math", "journal-front", "journal-eq", "journal-fig", "bios", "colstart", "signature", "citecolor", "texpaper", "contract-cn", "scan-letter", "furniture-cn", "bates", "rotated-text", "mixed-pages", "image-slides"];
+  const names = ["columns", "journal", "figures", "math", "journal-front", "journal-eq", "journal-fig", "bios", "colstart", "signature", "citecolor", "texpaper", "contract-cn", "scan-letter", "furniture-cn", "bates", "rotated-text", "mixed-pages", "image-slides", "open-table"];
   const dir = await fs.mkdtemp(path.join(tmp, "pages-"));
   const bad: string[] = [];
   for (const name of names) {
