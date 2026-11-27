@@ -165,9 +165,13 @@ function loadMetrics() {
 
 const CJK = /[⺀-鿿豈-﫿＀-￯　-〿가-힯]/;
 
-/** 有内置字宽表的 Word 字体 */
+/**
+ * 有内置字宽表的 Word 字体。Cambria、Calibri 的字宽取自与它们字宽相同的 Caladea、Carlito（scripts/font-metrics.py）：
+ * 原 PDF 用的是别的字体（或同名字体的另一个版本）时，逐页保留按原字宽排的行在 Word / LibreOffice 里会变宽、折行，
+ * 整栏挤到下一页（夹具 columns 的"Caladea"比 Office 的 Cambria 窄 4%，转出来 2 页变 3 页）
+ */
 export function hasMetrics(family: string): boolean {
-  return family === "Times New Roman" || family === "Arial" || family === "Courier New";
+  return family === "Times New Roman" || family === "Arial" || family === "Courier New" || family === "Cambria" || family === "Calibri";
 }
 
 /**

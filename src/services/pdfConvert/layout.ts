@@ -2572,8 +2572,9 @@ function buildDocModelGroup(pages0: PageModel[], opts: BuildOpts = {}): DocModel
   };
 
   // 页眉 / 页脚：页面最上 / 最下 10% 内、与正文之间有明显空白的行，改为绝对定位，不参与文字流。
-  // 只有一页的文档没有"每页重复"可以佐证：只收比正文小的行（页码、页角的文件名）；正文字号或更大的（页首的标题、
-  // 页底的签名行）留在正文里。以前单页申请表的标题进了页眉，可编辑排版下它不是正文，标题下面的一排图也被当成页眉的装饰
+  // 只有一页的文档没有"每页重复"可以佐证：页眉只收比正文小的行（页角的文件名、密级），正文字号或更大的（页首的标题）
+  // 留在正文里。以前单页申请表的标题进了页眉，可编辑排版下它不是正文，标题下面的一排图也被当成页眉的装饰。
+  // 页脚照旧：页底的密级标签、页码即使与正文同样大，放进正文也只能靠段前距顶到页底，可编辑排版下一挤就到了第二页
   const single = pages.length === 1;
   const pageLines = pre.map((x) => buildLines(x.free));
   const floating = pageLines.map((ls, i) => {
@@ -2582,7 +2583,7 @@ function buildDocModelGroup(pages0: PageModel[], opts: BuildOpts = {}): DocModel
     // 页脚：从下往上
     for (let k = ls.length - 1; k >= 0; k--) {
       const l = ls[k], prev = ls[k - 1];
-      if (l.top < H * 0.9 || (single && l.size >= 0.95 * mathCtx.bodySize)) break;
+      if (l.top < H * 0.9) break;
       // 页脚可以有好几行（期刊首页的 doi、收稿日期、版权行），但都与第一行页脚同样字号、且比正文小；
       // 遇到正文字号的行就停：页码上方紧挨着的正文末行、栏底的公式不能被卷进页脚
       const footLike = out.length > 0 && Math.abs(l.size - out[0].size) < 0.6 && l.size < 0.95 * mathCtx.bodySize;
