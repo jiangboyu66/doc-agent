@@ -113,7 +113,7 @@ function renderBoxes(model: DocModel): ImageBox[] {
   };
   const block = (b: Block) => {
     if (b.kind === "p") para(b);
-    else for (const row of b.rows) for (const c of row.cells) for (const x of c.blocks) block(x as Block);
+    else for (const row of b.rows) for (const c of row.cells) { for (const x of c.blocks) block(x as Block); for (const n of c.nested ?? []) block(n.table); }
   };
   model.blocks.forEach(block);
   for (const set of [model.headers, model.footers]) for (const k of ["default", "first", "even"] as const) for (const p of (set as any)?.[k] ?? []) para(p);

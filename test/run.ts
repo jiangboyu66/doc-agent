@@ -651,6 +651,73 @@ await test("旋转文字（竖排表头、页边竖排说明、竖排标签、�
   }
 });
 
+await test("一排图从版心左边开始：第一张图前不写制表符（否则整排错后一个制表位、最后一张折行）；单页文档的标题留在正文（两种模式）", async () => {
+  const { pdfToDocx } = await import("../src/services/pdfConvert/index.js");
+  const pdf = await fixture("image-rows.pdf");
+  for (const mode of ["exact", "flow"] as const) {
+    const { data, report } = await pdfToDocx(pdf, { mode });
+    eq(report.textCoverage, 1, `${mode}：文字完整性`);
+    const pkg = new ZipPackage(data);
+    const xml = pkg.readText("word/document.xml");
+    const rows = (xml.match(/<w:p\b[^>]*>(?:(?!<\/w:p>)[\s\S])*?<w:drawing>[\s\S]*?<\/w:p>/g) ?? []).filter((p) => (p.match(/<wp:inline/g) ?? []).length === 6);
+    eq(rows.length, 2, `${mode}：两排图，各成一段、每段六张`);
+    for (const p of rows) {
+      const tab = p.indexOf("<w:tab/>"), img = p.indexOf("<w:drawing>");
+      assert(tab === -1 || tab > img, `${mode}：第一张图前不应有制表符`);
+      eq((p.match(/<w:tab w:val="left" w:pos="\d+"\/>/g) ?? []).length, 5, `${mode}：后五张图各一个制表位`);
+      assert(!/<w:tab w:val="left" w:pos="0"\/>/.test(p), `${mode}：不应有 0 处的制表位`);
+    }
+    // 单页文档没有"每页重复"可以佐证：比正文大的标题不进页眉
+    assert(xml.includes("Create basic shapes"), `${mode}：标题在正文里`);
+    for (const name of pkg.names().filter((n) => /^word\/header\d*\.xml$/.test(n))) assert(!pkg.readText(name).includes("Create basic shapes"), `${mode}：标题不应在页眉里`);
+  }
+});
+
+await test("只有一行大字的绘本式幻灯片：默认字号不超过 14pt；页角伸进右边距的小徽标所在的段落右缩进为负；可编辑排版不把徽标挤到下一页", async () => {
+  const { pdfToDocx } = await import("../src/services/pdfConvert/index.js");
+  const pdf = await fixture("logo-corner.pdf");
+  for (const mode of ["exact", "flow"] as const) {
+    const { data } = await pdfToDocx(pdf, { mode });
+    const pkg = new ZipPackage(data);
+    const sz = Number(pkg.readText("word/styles.xml").match(/<w:rPrDefault><w:rPr>(?:(?!<\/w:rPr>).)*<w:sz w:val="(\d+)"/)?.[1]);
+    assert(sz > 0 && sz <= 28, `${mode}：默认字号不超过 14pt（${sz / 2}pt）`);
+    if (mode !== "flow") continue;
+    const xml = pkg.readText("word/document.xml");
+    const logo = (xml.match(/<w:p\b[^>]*>(?:(?!<\/w:p>)[\s\S])*?<wp:inline[\s\S]*?<\/w:p>/g) ?? [])[0] ?? "";
+    assert(/<w:ind w:left="\d+" w:right="-\d+"\/>/.test(logo), "flow：徽标所在的段落右缩进为负");
+  }
+});
+
+await test("竖排文字与表格：伸出表格、穿过格线的竖排标签不放进哪一格；三线表里跨几行的竖排文字所在的一行加高、它伸进的几行相应收矮；竖排格里的位置用空段还原（两种模式）", async () => {
+  const { pdfToDocx } = await import("../src/services/pdfConvert/index.js");
+  const pdf = await fixture("rotated-table.pdf");
+  const textOf = (x: string) => (x.match(/<w:t[^>]*>([^<]*)<\/w:t>/g) ?? []).map((t) => t.replace(/<[^>]+>/g, "")).join("");
+  const label = "Vertical text from bottom to top";
+  for (const mode of ["exact", "flow"] as const) {
+    const { data, report } = await pdfToDocx(pdf, { mode });
+    eq(report.textCoverage, 1, `${mode}：文字完整性`);
+    const xml = new ZipPackage(data).readText("word/document.xml");
+    // 竖排标签：从下往上读的竖排文本框，不在表格的格子里，也不被横着接在格内文字后面
+    eq(xml.split(label).length - 1, 1, `${mode}：标签只出现一次`);
+    const boxes = (xml.match(/<wp:anchor [\s\S]*?<\/wp:anchor>/g) ?? []).filter((b) => b.includes("<w:txbxContent>"));
+    assert(boxes.some((b) => textOf(b) === label && b.includes('vert="vert270"')), `${mode}：标签应是竖排文本框`);
+    const [t1 = "", t2 = "", ...more] = xml.match(/<w:tbl>[\s\S]*?<\/w:tbl>/g) ?? [];
+    assert(!!t2 && !more.length, `${mode}：两张表`);
+    assert(!t1.includes(label), `${mode}：标签不在第一张表的格子里`);
+    if (mode !== "flow") continue;
+    // 三线表：两段竖排文字各在一格里（btLr），格里的位置用固定行高的空段还原，不用段前距
+    // （LibreOffice 把 btLr 格里的段前距放到段落的另一侧，竖排表头的字贴在格子左边）
+    const cells = (t2.match(/<w:tc>[\s\S]*?<\/w:tc>/g) ?? []).filter((c) => c.includes('<w:textDirection w:val="btLr"/>'));
+    eq(cells.map(textOf).join(" | "), "Document.getToC()Document.loadPage() | read a page reada page read apage read a page", "flow：竖排文字的两格");
+    for (const c of cells) assert(!/<w:spacing w:before="[1-9]/.test(c) && /<w:spacing w:before="0" w:after="0" w:line="\d+" w:lineRule="exact"\/><w:rPr><w:sz w:val="2"\/>/.test(c), "flow：竖排格里用空段定位");
+    // 竖排文字所在的那一行按文字的长度加高，它伸进的其余几行扣掉被占去的部分：整张表的行高合计与原文（165pt）相近
+    const hs = (t2.match(/<w:trHeight w:val="(\d+)"/g) ?? []).map((m) => Number(m.match(/\d+/)![0]) / 20);
+    eq(hs.length, 7, "flow：三线表 7 行");
+    const sum = hs.reduce((a, b) => a + b, 0);
+    assert(sum <= 165 + 12, `flow：三线表的行高合计不应比原文高出一大截：${hs.join(" ")} = ${sum}`);
+  }
+});
+
 await test("纸张大小 / 方向不一样的页（横向附录、A4 说明页、/Rotate 180、带偏移的裁剪框）各自分节、写自己的纸张大小，宽表格不被裁；裁剪框外的东西不转换（两种模式）", async () => {
   const { pdfToDocx } = await import("../src/services/pdfConvert/index.js");
   const pdf = await fixture("mixed-pages.pdf");
@@ -758,6 +825,52 @@ await test("带底色的文字块（横幅、一行指标卡片、带色条的�
     const sideRow = tbls.flatMap((x) => x.match(/<w:tr>[\s\S]*?<\/w:tr>/g) ?? []).find((r) => textOf(r).includes("CONTACT"));
     assert(!!sideRow && textOf(sideRow).includes("Zhang Wei"), "flow：侧边栏与正文应在同一行的两格里");
     eq(fill(cellOf("CONTACT")), "0F2B4C", "flow：侧边栏的底纹");
+  }
+});
+
+await test("表单格子里的字符方格、照片框写成套在格子里的小表格；格子里的填写线、书写线留在格子里（两种模式）", async () => {
+  const { pdfToDocx } = await import("../src/services/pdfConvert/index.js");
+  const pdf = await fixture("form-boxes.pdf");
+  const textOf = (x: string) => (x.match(/<w:t[^>]*>([^<]*)<\/w:t>/g) ?? []).map((t) => t.replace(/<[^>]+>/g, "")).join("");
+  // 同一层的元素（不进入套在里面的同名元素）
+  const top = (x: string, tag: string) => {
+    const out: string[] = [];
+    let depth = 0, start = 0;
+    for (const m of x.matchAll(new RegExp(`<${tag}>|<${tag} [^>]*>|</${tag}>`, "g"))) {
+      if (!m[0].startsWith("</")) { if (depth++ === 0) start = m.index!; }
+      else if (--depth === 0) out.push(x.slice(start, m.index! + m[0].length));
+    }
+    return out;
+  };
+  for (const mode of ["exact", "flow"] as const) {
+    const { data, report } = await pdfToDocx(pdf, { mode });
+    eq(report.textCoverage, 1, `${mode}：文字完整性`);
+    const xml = new ZipPackage(data).readText("word/document.xml");
+    const body = xml.slice(xml.indexOf("<w:body>"));
+    const tbls = top(body, "w:tbl");
+    eq(tbls.length, 2, `${mode}：正文里只有两张表（小表格都套在格子里）`);
+    const [form, money] = tbls;
+    eq((top(form, "w:tblGrid")[0].match(/<w:gridCol /g) ?? []).length, 5, `${mode}：申请表 5 列`);
+    const rows = top(form, "w:tr");
+    eq(rows.length, 4, `${mode}：申请表 4 行`);
+    // 身份证号后面那一格（合并了 3 列）里套着 18 个方格的小表格
+    const idRow = top(rows[1], "w:tc");
+    eq(textOf(idRow[0]), "身份证号", `${mode}：第 2 行第 1 格`);
+    const boxes = top(idRow[1], "w:tbl");
+    eq(boxes.length, 1, `${mode}：身份证号那一格里套着一张小表格`);
+    eq((top(boxes[0], "w:tc")).length, 18, `${mode}：18 个字符方格`);
+    // 照片框在最右一列合并的格子里，"照片"只出现一次
+    const photoCell = top(rows[0], "w:tc").find((c) => c.includes("照片")) ?? "";
+    assert(top(photoCell, "w:tbl").length === 1 && /<w:vMerge w:val="restart"\/>/.test(photoCell), `${mode}：照片框是最右一列合并格里的小表格`);
+    eq(xml.split("照片").length - 1, 1, `${mode}："照片"只出现一次`);
+    if (mode !== "flow") continue;
+    // 可编辑排版：填写线是那一行里带下划线的制表符，书写线是格子里带下边框的段落；表格后面没有多出来的横线
+    const [amount, note] = top(money, "w:tr").map((r) => top(r, "w:tc")[1]);
+    assert(textOf(amount).includes("人民币（大写）") && textOf(amount).includes("¥"), "flow：提取金额一格");
+    eq((amount.match(/<w:r><w:rPr>(?:(?!<\/w:rPr>).)*<w:u w:val="single"\/>(?:(?!<\/w:rPr>).)*<\/w:rPr><w:tab\/><\/w:r>/g) ?? []).length, 2, "flow：两条填写线写成带下划线的制表符");
+    eq((note.match(/<w:pBdr><w:bottom /g) ?? []).length, 2, "flow：备注格里的两条书写线");
+    const after = body.slice(body.indexOf(money) + money.length);
+    assert(!after.includes("<w:pBdr>"), "flow：表格后面不应多出横线");
   }
 });
 
@@ -1338,7 +1451,7 @@ await test("所有夹具 PDF：两种排版方式都不报错、文字完整；L
   const run = promisify(execFile);
   const soffice = process.env.SOFFICE_PATH || "soffice";
   const hasSoffice = await run(soffice, ["--version"]).then(() => true, () => false);
-  const names = ["columns", "journal", "figures", "math", "journal-front", "journal-eq", "journal-fig", "bios", "colstart", "signature", "citecolor", "texpaper", "contract-cn", "scan-letter", "furniture-cn", "bates", "rotated-text", "mixed-pages", "image-slides", "open-table", "color-blocks"];
+  const names = ["columns", "journal", "figures", "math", "journal-front", "journal-eq", "journal-fig", "bios", "colstart", "signature", "citecolor", "texpaper", "contract-cn", "scan-letter", "furniture-cn", "bates", "rotated-text", "mixed-pages", "image-slides", "open-table", "color-blocks", "form-boxes", "image-rows", "logo-corner"];
   const dir = await fs.mkdtemp(path.join(tmp, "pages-"));
   const bad: string[] = [];
   for (const name of names) {

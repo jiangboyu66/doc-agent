@@ -47,6 +47,8 @@ export interface Span {
   tracking?: number;
   /** 文字底色（Word 的突出显示 / 字符底纹，PDF 里是紧贴文字的填充矩形），RRGGBB */
   bg?: string;
+  /** 填写线（表格里"人民币（大写）______"文字旁边、与文字同一基线的横线）：没有文字，写成带下划线的制表符 */
+  blank?: boolean;
 }
 
 /**

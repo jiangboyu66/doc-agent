@@ -291,7 +291,17 @@ class Writer {
     if (c.shade) pr.push(`<w:shd w:val="clear" w:color="auto" w:fill="${c.shade}"/>`);
     if (c.textDirection) pr.push(`<w:textDirection w:val="${c.textDirection}"/>`);
     if (c.vAlign !== "top") pr.push(`<w:vAlign w:val="${c.vAlign}"/>`);
-    const content = c.blocks.length ? c.blocks.map((p) => this.para(p)).join("") : this.para({ kind: "p", runs: [], align: "left", indLeft: 0, indRight: 0, firstLine: 0, spaceBefore: 0, lineHeight: 12, tabs: [], size: 10 });
+    // 格子里套的表格插在各段之间；格子的最后一个元素必须是段落（Word 的要求），以表格结尾时补一个极小的空段
+    const empty = { kind: "p" as const, runs: [], align: "left" as const, indLeft: 0, indRight: 0, firstLine: 0, spaceBefore: 0, lineHeight: 12, tabs: [], size: 10 };
+    const parts: string[] = [];
+    let lastTable = false;
+    for (let i = 0; i <= c.blocks.length; i++) {
+      for (const n of c.nested ?? []) if (n.at === i) { parts.push(this.table(n.table)); lastTable = true; }
+      if (i < c.blocks.length) { parts.push(this.para(c.blocks[i])); lastTable = false; }
+    }
+    if (!parts.length) parts.push(this.para(empty));
+    else if (lastTable) parts.push(this.para({ ...empty, lineHeight: 1, size: 1, tiny: true }));
+    const content = parts.join("");
     return `<w:tc><w:tcPr>${pr.join("")}</w:tcPr>${content}</w:tc>`;
   }
 
@@ -326,7 +336,10 @@ class Writer {
 
   styles(): string {
     const f = esc(this.m.bodyFont);
-    const hp = Math.round(this.m.bodySize * 2);
+    // 默认字号不超过 14pt：每段文字都写了自己的字号，默认字号只用于段落标记。LibreOffice 按它（而不是段落标记自己的字号）
+    // 算只有一张图的段落的行高——几乎没有文字的文档（只有一行 50pt 标题的幻灯片）默认字号是 50pt，
+    // 页角 32pt 高的小徽标那一段被撑到 73pt 高，挤到下一页，后面各页整体错后一页
+    const hp = Math.round(Math.min(14, this.m.bodySize) * 2);
     const heading = (n: number) =>
       `<w:style w:type="paragraph" w:styleId="Heading${n}"><w:name w:val="heading ${n}"/><w:basedOn w:val="Normal"/><w:next w:val="Normal"/><w:uiPriority w:val="9"/><w:qFormat/>` +
       `<w:pPr><w:keepNext/><w:outlineLvl w:val="${n - 1}"/></w:pPr></w:style>`;

@@ -122,6 +122,8 @@ export interface Cell {
   /** 竖排单元格（表头的竖排文字）：btLr 从下往上读，tbRl 从上往下读 */
   textDirection?: "btLr" | "tbRl";
   blocks: Para[];
+  /** 格子里套的表格（表单里身份证号、银行卡号的字符方格，照片框）：at 是插在第几段之前 */
+  nested?: Array<{ at: number; table: Table }>;
 }
 
 export interface Table {
@@ -416,6 +418,8 @@ interface TableDraft {
   rules?: HSeg[];
   /** 落在表格里的图片（格里的徽标、照片、行内小图标） */
   imgs?: ImageBox[];
+  /** 整个落在这张表某一格里的小表格（字符方格、照片框） */
+  nested?: TableDraft[];
 }
 
 function cluster(values: number[], tol: number): number[] {
@@ -518,13 +522,27 @@ function detectTables(page: PageModel): { tables: TableDraft[]; used: Set<Seg> }
     for (const h of c.hs) h.src.forEach((s) => used.add(s));
     for (const v of c.vs) v.src.forEach((s) => used.add(s));
   }
-  // 文字归属：中心点落在表格内
+  // 整个落在另一张表某一格里的小表格（表单里身份证号的字符方格、照片框）：套在那一格里。
+  // 以前它们作为单独的表格排在大表格后面，大表格里留着空格子，后面的内容被挤到下一页
+  const within = (a: TableDraft, b: TableDraft) => a !== b && a.x0 >= b.x0 - 1 && a.x1 <= b.x1 + 1 && a.y0 >= b.y0 - 1 && a.y1 <= b.y1 + 1 && (a.x1 - a.x0) * (a.y1 - a.y0) < (b.x1 - b.x0) * (b.y1 - b.y0);
+  const top = tables.filter((t) => !tables.some((o) => within(t, o)));
+  for (const t of tables) {
+    if (top.includes(t)) continue;
+    // 直接外层：包含它的最小的一张
+    const host = tables.filter((o) => within(t, o)).sort((a, b) => (a.x1 - a.x0) * (a.y1 - a.y0) - (b.x1 - b.x0) * (b.y1 - b.y0))[0];
+    (host.nested ??= []).push(t);
+  }
+  // 文字归属：中心点落在表格内（落在套着的小表格里的归小表格）
+  const inner = (t: TableDraft, cx: number, cy: number): TableDraft => {
+    const n = (t.nested ?? []).find((x) => cx > x.x0 && cx < x.x1 && cy > x.y0 && cy < x.y1);
+    return n ? inner(n, cx, cy) : t;
+  };
   for (const s of page.spans) {
     const cx = (s.x0 + s.x1) / 2, cy = (s.top + s.bottom) / 2;
-    const t = tables.find((t) => cx > t.x0 && cx < t.x1 && cy > t.y0 && cy < t.y1);
-    if (t) t.spans.push(s);
+    const t = top.find((t) => cx > t.x0 && cx < t.x1 && cy > t.y0 && cy < t.y1);
+    if (t) inner(t, cx, cy).spans.push(s);
   }
-  return { tables, used };
+  return { tables: top, used };
 }
 
 /**
@@ -1290,9 +1308,11 @@ function buildPara(lines: Line[], r: Region, blockEdge: number, ctx: Ctx): Para 
   const cMean = centers.reduce((a, b) => a + b, 0) / Math.max(1, centers.length);
   const centeredBlock = lines.length >= 2 && centers.every((c) => Math.abs(c - cMean) <= 2) &&
     Math.max(...lines.map((l) => l.x0)) - Math.min(...lines.map((l) => l.x0)) > 3;
-  if ((lines.every((l) => isCentered(l, r)) || centeredBlock) && !lines.some((l) => hasBigGap(l))) align = "center";
+  // 带填写线的段落按左对齐排：填写线写成制表符，制表位按原横坐标，居中 / 右对齐时制表符的位置不可靠
+  const blanks = lines.some((l) => l.spans.some((s) => s.blank));
+  if (!blanks && (lines.every((l) => isCentered(l, r)) || centeredBlock) && !lines.some((l) => hasBigGap(l))) align = "center";
   else if (lines.length >= 2 && isJustified(lines, paraRight)) align = "both";
-  else if (lines.every((l) => isRight(l, r)) && !lines.some((l) => hasBigGap(l)) && (lines.length === 1 || leftSpread > 3)) align = "right";
+  else if (!blanks && lines.every((l) => isRight(l, r)) && !lines.some((l) => hasBigGap(l)) && (lines.length === 1 || leftSpread > 3)) align = "right";
 
   let indLeft = 0, firstLine = 0, indRight = 0;
   const tabs: TabStop[] = [];
@@ -1353,6 +1373,21 @@ function buildPara(lines: Line[], r: Region, blockEdge: number, ctx: Ctx): Para 
     }
     const lineStart = runs.length;
     l.spans.forEach((s, si) => {
+      if (s.blank) {
+        // 填写线：带下划线的制表符一直画到线的右端（制表位）；线与前面的文字之间隔开一段的，先用不带下划线的制表符跳到线的起点
+        const last = runs[runs.length - 1];
+        if (last && !last.tab) last.text = last.text.replace(/\s+$/, "");
+        const fmt = plainFmt(spanFormat(s, l.size, l.baseline));
+        const stop = (x: number) => {
+          const pos = Math.round((Math.min(x, r.x1) - r.x0) * 20) / 20;
+          if (!tabs.some((t) => Math.abs(t.pos - pos) < 1)) tabs.push({ pos, align: "left" });
+        };
+        const from = si > 0 ? l.spans[si - 1].x1 : r.x0 + indLeft + (li === 0 ? firstLine : 0);
+        if (s.x0 - from > 0.4 * l.size) { stop(s.x0); runs.push({ text: "", tab: true, ...fmt, underline: undefined, strike: undefined, shade: undefined }); }
+        stop(s.x1);
+        runs.push({ text: "", tab: true, ...fmt, underline: true, strike: undefined, shade: undefined });
+        return;
+      }
       const fmt = spanFormat(s, l.size, l.baseline);
       if (s.img) Object.assign(fmt, fitInline(s.img, l, lineHeight, ctx.mode));
       let text = li === 0 && si === 0 ? s.text.replace(/^\s+/, "") : s.text;
@@ -1620,6 +1655,35 @@ function rotatedBox(l: RotLine): NonNullable<Para["textBoxes"]>[number] {
   return { x: cx - w / 2, y: cy - h / 2, w, h, para, rot: deg };
 }
 
+/** 表格里的全部文字（含套在格子里的小表格） */
+const allSpans = (t: TableDraft): Span[] => [...t.spans, ...(t.nested ?? []).flatMap(allSpans)];
+
+/**
+ * 格子里套的小表格（字符方格、照片框）：按原位置的上下次序插进格内的段落之间，
+ * 前面空出原来的距离（一个占位的空段），后面一段的段前距从小表格的底边算起；缩进由小表格自己的 indent 还原
+ */
+function placeCellTables(cell: Cell, subs: TableDraft[], box: { x0: number; y0: number; x1: number; y1: number }, fills: FillRect[], ctx: Ctx) {
+  const nested = (cell.nested ??= []);
+  const bottoms = new Map<Table, number>();
+  for (const n of [...subs].sort((a, b) => a.y0 - b.y0)) {
+    const table = buildTable(n, fills, box.x0 + CELL_MARGIN, ctx);
+    let at = cell.blocks.findIndex((b) => b.srcTop !== undefined && b.srcTop > n.y0);
+    if (at === -1) at = cell.blocks.length;
+    const prevBottom = Math.max(box.y0 + (cell.borders.top?.width ?? 0), cell.blocks[at - 1]?.srcBottom ?? -Infinity,
+      ...nested.filter((x) => x.at <= at).map((x) => bottoms.get(x.table) ?? -Infinity));
+    const gap = n.y0 - prevBottom;
+    if (gap > 1) {
+      cell.blocks.splice(at, 0, { ...spacer(gap), srcTop: prevBottom, srcBottom: n.y0 });
+      for (const x of nested) if (x.at > at) x.at++;
+      at++;
+    }
+    nested.push({ at, table });
+    bottoms.set(table, n.y1);
+    const next = cell.blocks[at];
+    if (next?.srcTop !== undefined) next.spaceBefore = Math.max(0, next.srcTop - n.y1);
+  }
+}
+
 /**
  * 单元格里的图：按原位置的上下次序插进格内的段落之间，独占一段的行内图片，左缩进 / 居中还原横向位置；
  * 比格子宽的按格宽等比缩小。逐页保留时行高固定：旁边（同一高度）还有格内文字的图排进去会把文字挤出格子，
@@ -1651,6 +1715,55 @@ function placeCellImages(cell: Cell, ims: ImageBox[], box: { x0: number; y0: num
 }
 
 /**
+ * 填写线：与某一行文字同一基线（线在基线上下各小半个字高以内）、不压在字上的横线
+ * （"人民币（大写）______ ¥______"、"其他：______"）。作为一个没有文字的片段并进这一行，
+ * 排版时写成带下划线的制表符，线随文字移动、可以在线上填写。返回用掉的线
+ */
+function attachBlanks(lines: Line[], rules: HSeg[]): HSeg[] {
+  const used: HSeg[] = [];
+  for (const h of rules) {
+    const cands = lines.filter((l) => h.y >= l.baseline - 0.35 * l.size && h.y <= l.baseline + 0.5 * l.size &&
+      !l.spans.some((sp) => Math.min(sp.x1, h.x1) - Math.max(sp.x0, h.x0) > 1));
+    const l = cands.sort((a, b) => Math.abs(a.baseline - h.y) - Math.abs(b.baseline - h.y))[0];
+    const ref = l?.spans.find((sp) => !sp.blank && !sp.img && sp.text.trim());
+    if (!l || !ref) continue;
+    l.spans.push({ text: "", x0: h.x0, x1: h.x1, top: l.top, bottom: l.bottom, baseline: l.baseline, size: ref.size, font: ref.font,
+      bold: false, italic: false, color: /^[0-9A-F]{6}$/i.test(h.color) ? h.color.toUpperCase() : ref.color, blank: true });
+    l.spans.sort((a, b) => a.x0 - b.x0);
+    l.x0 = Math.min(l.x0, h.x0);
+    l.x1 = Math.max(l.x1, h.x1);
+    used.push(h);
+  }
+  return used;
+}
+
+/**
+ * 格内单独的一条横线（不挨着文字的书写线、签字线、分隔线）：按原高度插一个带下边框的极小段落，左右缩进还原线的两端。
+ * 调用方按从上到下的次序逐条放
+ */
+function placeCellRule(cell: Cell, h: HSeg, box: { x0: number; y0: number; x1: number; y1: number }) {
+  const p = tinyPara({ borderBottom: { width: h.w, color: h.color } });
+  p.indLeft = Math.max(0, h.x0 - (box.x0 + CELL_MARGIN));
+  p.indRight = Math.max(0, box.x1 - CELL_MARGIN - h.x1);
+  let at = cell.blocks.findIndex((b) => b.srcTop !== undefined && b.srcTop > h.y);
+  if (at === -1) at = cell.blocks.length;
+  const prev = cell.blocks[at - 1];
+  const prevBottom = prev?.srcBottom ?? box.y0 + (cell.borders.top?.width ?? 0);
+  const gap = Math.max(0, h.y - TINY - prevBottom);
+  p.srcTop = h.y - TINY; p.srcBottom = h.y;
+  // 相邻两段的下边框、缩进都相同时，Word / LibreOffice 把它们并成一组、只在组末画一条线（两条书写线只剩一条）：
+  // 中间隔一个没有边框的空段，空段的高度就是两条线的间距
+  const grouped = !!prev?.borderBottom && Math.abs(prev.indLeft - p.indLeft) < 0.05 && Math.abs(prev.indRight - p.indRight) < 0.05;
+  const add = grouped ? [{ ...spacer(gap), srcTop: prevBottom, srcBottom: h.y - TINY }, p] : [p];
+  if (!grouped) p.spaceBefore = gap;
+  cell.blocks.splice(at, 0, ...add);
+  for (const x of cell.nested ?? []) if (x.at > at) x.at += add.length;
+  const next = cell.blocks[at + add.length];
+  if (next?.srcTop !== undefined) next.spaceBefore = Math.max(0, next.srcTop - h.y);
+  if (cell.vAlign !== "top") cell.blocks[0].spaceBefore = 0;
+}
+
+/**
  * 单元格里的旋转文字。只有竖排文字（±90°）、没有横排文字的格（竖排表头）写成竖排单元格：
  * 文字随表格移动、可以直接编辑。每行一段：沿阅读方向的位置用段落对齐 / 缩进还原，各行之间的距离用固定行高 + 段前距还原
  * （竖排格里段落从字顶一侧往字底一侧排：btLr 从左往右、tbRl 从右往左）。
@@ -1673,17 +1786,19 @@ function placeRotated(cell: Cell, rots: RotLine[], box: { x0: number; y0: number
     const lh = gaps.length ? Math.max(Math.min(...gaps), 1.05 * big) : 1.2 * big;
     cell.textDirection = sign < 0 ? "btLr" : "tbRl";
     cell.vAlign = "top";
-    cell.blocks = lines.map((l, i) => {
+    cell.blocks = lines.flatMap((l, i) => {
       const lead = l.s - s0, trail = s1 - (l.s + l.len);
       const centered = Math.abs(lead - trail) <= Math.max(3, 0.15 * (s1 - s0));
       const p: Para = {
         kind: "p", runs: rotatedRuns(l), align: centered ? "center" : lead < trail ? "left" : "right", indLeft: 0, indRight: 0, firstLine: 0,
-        // 第一行：字顶到格子边（加单元格边距）的距离；其余：与上一行的基线间距多出行高的部分
-        spaceBefore: i === 0 ? Math.max(0, l.d - (lh - 0.22 * l.size) - (d0 + CELL_MARGIN)) : Math.max(0, gaps[i - 1] - lh),
-        lineHeight: lh, tabs: [], size: l.size,
+        spaceBefore: 0, lineHeight: lh, tabs: [], size: l.size,
       };
       if (!centered && fits) { if (lead < trail) p.indLeft = Math.max(0, lead - 0.5); else p.indRight = Math.max(0, trail - 0.5); }
-      return p;
+      // 第一行：字顶到格子边（加单元格边距）的距离；其余：与上一行的基线间距多出行高的部分。
+      // 这段距离写成前面一个固定行高的空段，不写成段前距：LibreOffice 把 btLr 格里的段前距放到了这一段的另一侧（右边），
+      // 竖排表头的字贴在格子左边。空段的行高在 Word、LibreOffice 里都占在它自己的位置上
+      const gap = i === 0 ? l.d - (lh - 0.22 * l.size) - (d0 + CELL_MARGIN) : gaps[i - 1] - lh;
+      return gap > 0.5 ? [spacer(gap), p] : [p];
     });
     // 竖排格里段落的宽度就是行高：放不下时返回需要的行高（可编辑排版的行高是"最小值"，把这一行加高，字就不会折断）
     return fits ? 0 : Math.max(...lines.map((l) => l.len)) + 0.6 * big;
@@ -1711,10 +1826,18 @@ function imagePara(imgs: ImageBox[], r: Region, cursor: number): Para {
     p.indLeft = lead;
     p.leadImage = true;
     p.tabs = sorted.slice(1).map((i) => ({ pos: Math.round((i.x0 - r.x0) * 20) / 20, align: "left" as const }));
-  } else p.tabs = sorted.map((i) => ({ pos: Math.max(0, Math.round((i.x0 - r.x0) * 20) / 20), align: "left" as const }));
-  // 右边超出版心和可伸出部分的：段落右缩进为负，这一行放得下整张图（否则会折行、被挤到下一页）
+  } else {
+    const pos = sorted.map((i) => Math.max(0, Math.round((i.x0 - r.x0) * 20) / 20));
+    // 第一张图从版心左边开始（制表位在 0 处）：它前面不写制表符。Word、LibreOffice 都跳过正好在当前位置上的制表位，
+    // 一排图依次错后一个制表位，最后一张折到下一行，下面的文字跟着下移（表单里一排六个图形）
+    if (pos[0] < 1) { p.leadImage = true; p.indLeft = pos[0]; pos.shift(); }
+    p.tabs = pos.map((x) => ({ pos: x, align: "left" as const }));
+  }
+  // 右边超出版心的：段落右缩进为负，这一行放得下整张图（否则会折行、被挤到下一页）。
+  // 只伸进右边距几磅的也要：可伸出部分只对文字段落起作用，图片段落没有负的右缩进，这一行就放不下它
+  // （幻灯片页角的小徽标伸出版心 5pt，LibreOffice 把它挤到下一页，后面各页整体错后一页）
   const x1 = Math.max(...sorted.map((i) => i.x1));
-  if (x1 > r.x1 + oh + 1) p.indRight = r.x1 - x1 - 1;
+  if (x1 > r.x1 + 0.5) p.indRight = r.x1 - x1 - 1;
   return p;
 }
 
@@ -1772,10 +1895,14 @@ function buildTable(t: TableDraft, fills: FillRect[], originX: number, ctx: Ctx)
   const rows: Table["rows"] = [];
   const placed = new Set<RotLine>();
   const placedImg = new Set<ImageBox>();
+  const placedSub = new Set<TableDraft>();
+  const usedRules = new Set<HSeg>();
+  const onRowEdge = (h: HSeg) => ys.some((y, i) => i > 0 && i < ys.length - 1 && Math.abs(y - h.y) <= 2);
+  const stretched: Array<{ r: number; top: number; bottom: number }> = [];
   const cellInfo: Array<{ cell: Cell; box: { x0: number; x1: number; y0: number; y1: number }; r: number }> = [];
   for (let r = 0; r < nR; r++) {
     const cells: Cell[] = [];
-    let rowNeed = 0;
+    let rowNeed = 0, textTop = Infinity, textBottom = -Infinity;
     for (const g of rowGroups[r]) {
       const vm = vmerge[r].get(g.c0);
       const box = cellBox(r, g);
@@ -1805,6 +1932,9 @@ function buildTable(t: TableDraft, fills: FillRect[], originX: number, ctx: Ctx)
         });
         if (spans.length) {
           const lines = buildLines(spans);
+          // 可编辑排版：与格内某一行文字同一基线的横线是填写线，写进这一行（带下划线的制表符）
+          const cellRules = (t.rules ?? []).filter((h) => !usedRules.has(h) && !onRowEdge(h) && h.y > box.y0 + 1 && h.y < box.y1 - 1 && h.x0 >= box.x0 - 3 && h.x1 <= box.x1 + 3);
+          for (const h of attachBlanks(lines, cellRules)) usedRules.add(h);
           const region: Region = { x0: box.x0 + CELL_MARGIN, x1: box.x1 - CELL_MARGIN, overhang: CELL_MARGIN - 0.3, cell: true };
           const contentTop = lines[0].top, contentBottom = lines[lines.length - 1].bottom;
           const topGap = contentTop - box.y0, bottomGap = box.y1 - contentBottom;
@@ -1822,29 +1952,57 @@ function buildTable(t: TableDraft, fills: FillRect[], originX: number, ctx: Ctx)
         });
         for (const l of rots) placed.add(l);
         const need = rots.length ? placeRotated(cell, rots, box, spans.length > 0, ctx) : 0;
-        if (need && !vm) rowNeed = Math.max(rowNeed, need);
+        if (need && !vm) {
+          rowNeed = Math.max(rowNeed, need);
+          textTop = Math.min(textTop, ...rots.map((l) => l.y0));
+          textBottom = Math.max(textBottom, ...rots.map((l) => l.y1));
+        }
         const ims = (t.imgs ?? []).filter((im) => {
           const cx = (im.x0 + im.x1) / 2, cy = (im.y0 + im.y1) / 2;
           return !placedImg.has(im) && cx >= box.x0 && cx < box.x1 && cy >= box.y0 && cy < box.y1;
         });
         for (const im of ims) placedImg.add(im);
         if (ims.length) placeCellImages(cell, ims, box, ctx);
+        const subs = (t.nested ?? []).filter((n) => {
+          const cx = (n.x0 + n.x1) / 2, cy = (n.y0 + n.y1) / 2;
+          return !placedSub.has(n) && cx >= box.x0 && cx < box.x1 && cy >= box.y0 && cy < box.y1;
+        });
+        for (const n of subs) placedSub.add(n);
+        if (subs.length) placeCellTables(cell, subs, box, fills, ctx);
       }
       cells.push(cell);
       cellInfo.push({ cell, box, r });
     }
     rows.push({ height: Math.max(ys[r + 1] - ys[r], rowNeed), cells });
+    if (rowNeed > ys[r + 1] - ys[r] && !ctx.boxes) stretched.push({ r, top: textTop, bottom: textBottom });
+  }
+  // 竖排文字跨了几行（无框表格按文字行切表，把原文跨几行的合并格切开了）：竖排文字所在的那一行按文字的长度加高，
+  // 它伸进的其他几行各自扣掉被它占去的那一段（可编辑排版的行高是"最小值"，这些行按自己的内容收矮），整张表的高度与原文相近。
+  // 以前多出的一截把页面末尾挤到下一页
+  for (const { r, top, bottom } of stretched) {
+    let budget = rows[r].height - (ys[r + 1] - ys[r]);
+    for (let k = 0; k < nR && budget > 0; k++) {
+      const overlap = Math.min(ys[k + 1], bottom) - Math.max(ys[k], top);
+      if (k === r || overlap <= 0) continue;
+      const take = Math.min(budget, overlap);
+      rows[k].height = Math.max(4, rows[k].height - take);
+      budget -= take;
+    }
   }
   // 可编辑排版：表格里不是格线的横线（格内标题下的分隔线）。落在两行的分界上的，写成上面那几格的下边框；
   // 在格子中间的，挂在它正上方那一段的下边框上
-  for (const h of t.rules ?? []) {
+  // 其余在某一格以内的（格内单独的签字线、离文字较远的分隔线）：在那一格里按原高度插一个带下边框的极小段落
+  for (const h of [...(t.rules ?? [])].sort((a, b) => a.y - b.y)) {
+    if (usedRules.has(h)) continue;
     const cx = (h.x0 + h.x1) / 2;
     const k = ys.findIndex((y, i) => i > 0 && i < ys.length - 1 && Math.abs(y - h.y) <= 2);
     const over = k > 0 ? cellInfo.filter((c) => c.r === k - 1 && c.box.x0 >= h.x0 - 3 && c.box.x1 <= h.x1 + 3) : [];
     if (over.length) { for (const c of over) c.cell.borders.bottom ??= { width: h.w, color: h.color }; continue; }
     const paras = cellInfo.filter((c) => cx > c.box.x0 && cx < c.box.x1).flatMap((c) => c.cell.blocks);
     const above = paras.filter((p) => p.srcBottom !== undefined && p.srcBottom <= h.y + 2).sort((a, b) => b.srcBottom! - a.srcBottom!)[0];
-    if (above && !above.borderBottom && h.y - above.srcBottom! <= 2.5 * above.size) above.borderBottom = { width: h.w, color: h.color };
+    if (above && !above.borderBottom && h.y - above.srcBottom! <= 2.5 * above.size) { above.borderBottom = { width: h.w, color: h.color }; continue; }
+    const host = cellInfo.find((c) => c.cell.vMerge !== "continue" && h.y > c.box.y0 + 1 && h.y < c.box.y1 - 1 && h.x0 >= c.box.x0 - 3 && h.x1 <= c.box.x1 + 3);
+    if (host) placeCellRule(host.cell, h, host.box);
   }
   // 没归进任何一格的图（落在合并格的续行里等）：逐页保留时按页面坐标放，可编辑排版时接在最后一格里
   for (const im of t.imgs ?? []) {
@@ -2300,7 +2458,7 @@ function buildDocModelGroup(pages0: PageModel[], opts: BuildOpts = {}): DocModel
     if (opts.raster) {
       const t0 = detectTables(pg);
       const tb: Box[] = t0.tables.map((t) => ({ x0: t.x0, y0: t.y0, x1: t.x1, y1: t.y1 }));
-      tb.push(...detectRuledTables(pg, t0.used, new Set(t0.tables.flatMap((t) => t.spans))).map((t) => ({ x0: t.x0, y0: t.y0, x1: t.x1, y1: t.y1 })));
+      tb.push(...detectRuledTables(pg, t0.used, new Set(t0.tables.flatMap(allSpans))).map((t) => ({ x0: t.x0, y0: t.y0, x1: t.x1, y1: t.y1 })));
       figures = detectFigures(pg, mathCtx.bodySize, tb);
       figures.push(...detectImageGrids(pg, mathCtx.bodySize));
       // 带文字标注的位图（子图编号 (a)(b)…、坐标轴文字压在图片上）：连同标注整体渲染成一张图，
@@ -2337,7 +2495,7 @@ function buildDocModelGroup(pages0: PageModel[], opts: BuildOpts = {}): DocModel
     }
     iconCount += inlineIcons(pg);
     const { tables, used } = detectTables(pg);
-    const inTable = new Set(tables.flatMap((t) => t.spans));
+    const inTable = new Set(tables.flatMap(allSpans));
     tables.push(...detectRuledTables(pg, used, inTable));
     tables.push(...detectSideBySide(pg, used, inTable));
     // 可编辑排版：带文字的色块（横幅、指标卡片、提示框）写成一格的带底纹表格，文字随表格移动、底色跟着文字走。
@@ -2413,7 +2571,10 @@ function buildDocModelGroup(pages0: PageModel[], opts: BuildOpts = {}): DocModel
     return TINY;
   };
 
-  // 页眉 / 页脚：页面最上 / 最下 10% 内、与正文之间有明显空白的行，改为绝对定位，不参与文字流
+  // 页眉 / 页脚：页面最上 / 最下 10% 内、与正文之间有明显空白的行，改为绝对定位，不参与文字流。
+  // 只有一页的文档没有"每页重复"可以佐证：只收比正文小的行（页码、页角的文件名）；正文字号或更大的（页首的标题、
+  // 页底的签名行）留在正文里。以前单页申请表的标题进了页眉，可编辑排版下它不是正文，标题下面的一排图也被当成页眉的装饰
+  const single = pages.length === 1;
   const pageLines = pre.map((x) => buildLines(x.free));
   const floating = pageLines.map((ls, i) => {
     const H = pre[i].pg.height;
@@ -2421,7 +2582,7 @@ function buildDocModelGroup(pages0: PageModel[], opts: BuildOpts = {}): DocModel
     // 页脚：从下往上
     for (let k = ls.length - 1; k >= 0; k--) {
       const l = ls[k], prev = ls[k - 1];
-      if (l.top < H * 0.9) break;
+      if (l.top < H * 0.9 || (single && l.size >= 0.95 * mathCtx.bodySize)) break;
       // 页脚可以有好几行（期刊首页的 doi、收稿日期、版权行），但都与第一行页脚同样字号、且比正文小；
       // 遇到正文字号的行就停：页码上方紧挨着的正文末行、栏底的公式不能被卷进页脚
       const footLike = out.length > 0 && Math.abs(l.size - out[0].size) < 0.6 && l.size < 0.95 * mathCtx.bodySize;
@@ -2431,7 +2592,7 @@ function buildDocModelGroup(pages0: PageModel[], opts: BuildOpts = {}): DocModel
     // 页眉：从上往下
     for (let k = 0; k < ls.length; k++) {
       const l = ls[k], next = ls[k + 1];
-      if (l.bottom > H * 0.1) break;
+      if (l.bottom > H * 0.1 || (single && l.size >= 0.95 * mathCtx.bodySize)) break;
       if (!next || next.top - l.bottom > 1.2 * l.size) out.push(l);
       else break;
     }
@@ -2571,6 +2732,12 @@ function buildDocModelGroup(pages0: PageModel[], opts: BuildOpts = {}): DocModel
     });
   }
 
+  // 全文正文的上下界（按页统计会被"整页大图 + 一行图注"的页面误导）。之外（页眉页脚区域）的图形、图片属于页面装饰
+  const allBody = pageLines.flat();
+  const bodyTop = allBody.length ? Math.min(...allBody.map((l) => l.top)) : 0;
+  const bodyBottom = allBody.length ? Math.max(...allBody.map((l) => l.bottom)) : pageH;
+  const inMarginZone = (y0: number, y1: number) => y1 <= bodyTop + 1 || y0 >= bodyBottom - 1;
+
   // 流式模式：上下边距按正文（不含页眉页脚）计算，页眉页脚写进真正的页眉页脚部件
   let mTop = marginTop, mBottom = marginBottom;
   let headerDist: number | undefined, footerDist: number | undefined;
@@ -2579,9 +2746,12 @@ function buildDocModelGroup(pages0: PageModel[], opts: BuildOpts = {}): DocModel
     pre.forEach(({ pg, tables, figures }, i) => {
       const ls = pageLines[i];
       // 页眉页脚区域里的图（徽标）不算正文；伸进正文区域的大图（幻灯片、绘本的插图上下几乎顶到页边）算；
-      // 从页顶通到页底的（简历的侧边栏色块、整页底图）是页面装饰，不算
+      // 从页顶通到页底的（简历的侧边栏色块、整页底图）是页面装饰，不算。
+      // 不在页眉页脚区域、会排进正文的也算：全文没有正文行时（字都在色块里）整页都是正文区域，页角的小徽标排在正文里，
+      // 版心不包括它的话放不下，被挤到下一页
       const pics = [...pg.images.filter((im) => !im.behind && (im.y0 > pg.height * 0.1 && im.y1 < pg.height * 0.9 ||
-        im.y1 > pg.height * 0.1 && im.y0 < pg.height * 0.9 && im.y1 - im.y0 > 0.3 * pg.height && im.y1 - im.y0 < 0.92 * pg.height)), ...figures];
+        im.y1 > pg.height * 0.1 && im.y0 < pg.height * 0.9 && im.y1 - im.y0 > 0.3 * pg.height && im.y1 - im.y0 < 0.92 * pg.height ||
+        !inMarginZone(im.y0, im.y1) && im.y1 - im.y0 < 0.92 * pg.height)), ...figures];
       const ys = [...ls.map((l) => l.top), ...tables.map((t) => t.y0), ...pics.map((f) => f.y0)];
       const ye = [...ls.map((l) => l.bottom), ...tables.map((t) => t.y1), ...pics.map((f) => f.y1)];
       if (ys.length) bt.push(Math.min(...ys));
@@ -2605,10 +2775,6 @@ function buildDocModelGroup(pages0: PageModel[], opts: BuildOpts = {}): DocModel
     if (ht.length) headerDist = Math.max(4, Math.min(...ht) - 1);
     if (fb.length) footerDist = Math.max(4, pageH - Math.max(...fb) - 1);
   }
-  // 全文正文的上下界（按页统计会被"整页大图 + 一行图注"的页面误导）
-  const allBody = pageLines.flat();
-  const bodyTop = allBody.length ? Math.min(...allBody.map((l) => l.top)) : 0;
-  const bodyBottom = allBody.length ? Math.max(...allBody.map((l) => l.bottom)) : pageH;
   // 流式模式：原文提前换页的地方（这一页下方大片空着、最后一段已经结束就换页，如"签字见下页"）保留分页符，
   // 否则下一页的内容会接着排上来。自然换页最多空出几行（孤行控制、放不下的图表），远不到版心的两成；
   // 最后一行排满到栏的右边界的，段落多半接到下一页，也不是主动换页
@@ -2647,8 +2813,6 @@ function buildDocModelGroup(pages0: PageModel[], opts: BuildOpts = {}): DocModel
 
     const lines = pageLines[pi];
     const gutter = gutters[pi];
-    // 正文的上下界：之外（页眉页脚区域）的图形、图片属于页面装饰，以页面绝对坐标定位
-    const inMarginZone = (y0: number, y1: number) => y1 <= bodyTop + 1 || y0 >= bodyBottom - 1;
 
     // 页首锚点段落：承载本页的浮动图片与页眉页脚文本框，并负责分页（逐页一致模式）
     // 表格之外的线条与色块：作为绝对定位的图形放在页首锚点段落上（不占文字流，位置与原文完全一致）
@@ -2667,7 +2831,14 @@ function buildDocModelGroup(pages0: PageModel[], opts: BuildOpts = {}): DocModel
         t.xs.some((x) => Math.abs(x - h.x0) <= 3) && t.xs.some((x) => Math.abs(x - h.x1) <= 3);
       const underText = (t: TableDraft) => t.xs.some((x, k) => k + 1 < t.xs.length && h.x0 >= x - 2 && h.x1 <= t.xs[k + 1] + 2 &&
         t.spans.some((sp) => (sp.x0 + sp.x1) / 2 > x && (sp.x0 + sp.x1) / 2 < t.xs[k + 1] && sp.bottom <= h.y + 2 && h.y - sp.bottom <= 1.5 * sp.size));
-      const inT = flow ? tables.find((t) => h.y > t.y0 + 1 && h.y < t.y1 - 1 && (onGrid(t) || underText(t))) : undefined;
+      // 整条线在（合并后的）某一格以内的（表单格子里"人民币（大写）______"的填写线、格内单独的签字线）：同样交给表格，写进那一格。
+      // 以前它们作为正文的横线排在整张表格后面，格子里只剩文字，线跑到表格下方
+      const inCell = (t: TableDraft) => {
+        if (h.x0 < t.x0 - 2 || h.x1 > t.x1 + 2) return false;
+        const r = t.ys.findIndex((y, i) => i + 1 < t.ys.length && h.y > y + 1 && h.y < t.ys[i + 1] - 1);
+        return r >= 0 && !t.xs.some((x) => x > h.x0 + 2 && x < h.x1 - 2 && coverageV(t.vs, x, t.ys[r], t.ys[r + 1]));
+      };
+      const inT = flow ? tables.find((t) => h.y > t.y0 + 1 && h.y < t.y1 - 1 && (onGrid(t) || underText(t) || inCell(t))) : undefined;
       if (inT) (inT.rules ??= []).push(h);
       else if (flow && !inMarginZone(h.y, h.y)) ruleSegs.push(h);
       else if (keepShape(h.y, h.y)) shapes.push({ kind: "line", x0: h.x0, y0: h.y, x1: h.x1, y1: h.y, width: h.w, color: h.color, behind: false });
@@ -2721,8 +2892,12 @@ function buildDocModelGroup(pages0: PageModel[], opts: BuildOpts = {}): DocModel
     const flowRot: Array<{ l: RotLine; box: NonNullable<Para["textBoxes"]>[number] }> = [];
     for (const l of rotatedLines((pg.rotated ?? []).filter((r) => !r.raster))) {
       const cx = (l.x0 + l.x1) / 2, cy = (l.y0 + l.y1) / 2;
-      // 只有竖排的才是表格内容（竖排表头）；斜放的压在表格上的是印章、水印，不属于哪一格
-      const t = Math.abs(Math.abs(l.angle) - 90) <= 2 ? tables.find((t) => cx > t.x0 && cx < t.x1 && cy > t.y0 && cy < t.y1) : undefined;
+      // 只有竖排的才是表格内容（竖排表头）；斜放的压在表格上的是印章、水印，不属于哪一格。
+      // 伸出表格、或穿过表格里画出来的横线的竖排文字（从表头上方一直竖到表格中间的标签：表格只认出了下面几行）也不属于哪一格：
+      // 放进一格的话可编辑排版只能把它横着接在格内文字后面，那一行多出两行字高
+      const inOneCell = (t: TableDraft) => l.y0 >= t.y0 - 3 && l.y1 <= t.y1 + 3 && l.x0 >= t.x0 - 3 && l.x1 <= t.x1 + 3 &&
+        !t.hs.some((h) => h.color !== "none" && h.y > l.y0 + 2 && h.y < l.y1 - 2 && h.x0 < cx && h.x1 > cx);
+      const t = Math.abs(Math.abs(l.angle) - 90) <= 2 ? tables.find((t) => cx > t.x0 && cx < t.x1 && cy > t.y0 && cy < t.y1 && inOneCell(t)) : undefined;
       if (t) (t.rotated ??= []).push(l);
       else {
         // 压在正文上的（斜放的水印、印章）放在文字下方：正文照常可读、可选中
@@ -3510,7 +3685,7 @@ function collectParas(blocks: Block[]): Para[] {
   const out: Para[] = [];
   for (const b of blocks) {
     if (b.kind === "p") { out.push(b); for (const t of b.textBoxes ?? []) out.push(t.para); }
-    else for (const r of b.rows) for (const c of r.cells) out.push(...c.blocks);
+    else for (const r of b.rows) for (const c of r.cells) { out.push(...c.blocks); out.push(...collectParas((c.nested ?? []).map((n) => n.table))); }
   }
   return out;
 }
