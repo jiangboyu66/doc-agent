@@ -33,7 +33,7 @@ import { fileURLToPath } from "node:url";
  * pdf2word 自己的版本号（与 doc-agent 的版本号无关）：主版本对应契约 v1；契约有任何变化，次版本号加一；
  * 只有引擎更新时修订号加一。发版标签为 pdf2word-v<版本>，CI 会核对标签与这里一致。
  */
-const VERSION = "1.1.5";
+const VERSION = "1.2.0";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const dist = path.join(root, "dist");
@@ -300,6 +300,19 @@ check("scan-letter.pdf（扫描件）：转换成功，textTotal < 20 × 页数"
   assert(r.status === 0 && j.ok, `失败：${r.stdout}`);
   assert(j.report.textTotal < 20 * j.report.pages, `textTotal=${j.report.textTotal} pages=${j.report.pages}`);
   return `textTotal=${j.report.textTotal}，pages=${j.report.pages}，images=${j.report.images}`;
+});
+
+check("scan-turned.pdf --scan-blocks（没有文字层的扫描专利）：附图页整页成图，文字页分成 15 个带版面信息的原位文本框，与开发环境一致", () => {
+  const { r, j, out } = convert("scan-turned.pdf", ["--mode", "flow", "--scan-blocks"]);
+  assert(r.status === 0 && j.ok, `失败：${r.stdout}`);
+  assert(JSON.stringify(j.report.scanPages) === JSON.stringify({ text: [], picture: [2, 3, 4], unread: [1], blocks: [1] }), `scanPages：${JSON.stringify(j.report.scanPages)}`);
+  const xml = documentXml(out);
+  const boxes = (xml.match(/name="pdf2word-block 1\.\d+" descr="/g) ?? []).length;
+  assert(boxes === 15, `原位文本框 ${boxes} 个`);
+  const dev = path.join(work, "scan-turned-dev.docx");
+  const d = spawnSync(process.execPath, ["--import", "tsx", path.join(root, "cli/pdf2word.ts"), "convert", path.join(fixtures, "scan-turned.pdf"), dev, "--mode", "flow", "--scan-blocks"], { cwd: root, encoding: "utf8", timeout: 180_000 });
+  assert(d.status === 0 && documentXml(dev) === xml, "与开发环境的结果不一致");
+  return `${boxes} 个文本框，${j.report.ms} ms`;
 });
 
 check("--pages 1：只转第 1 页，报告写明页码范围与总页数", () => {

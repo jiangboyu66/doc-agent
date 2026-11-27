@@ -4,7 +4,7 @@
  * 以及把矢量图、轮廓文字绘制的表格、行间公式渲染成图片的 @napi-rs/canvas（只带 linux-x64 glibc 的原生模块）。
  *
  *   node pdf2word.mjs --version
- *   node pdf2word.mjs convert <in.pdf> <out.docx> [--mode flow|exact] [--pages 1-20,25] [--max-pages N]
+ *   node pdf2word.mjs convert <in.pdf> <out.docx> [--mode flow|exact] [--pages 1-20,25] [--max-pages N] [--scan-blocks]
  *
  * 契约 v1（有任何变化，次版本号加一，调用方的适配器测试同步修改）：
  *   - stdout 恰好一行 JSON（UTF-8，以 \n 结尾），除此之外没有任何输出；告警、诊断一律写 stderr。
@@ -20,12 +20,27 @@
  *       text     文字画在整页黑白扫描图上面的页（含表单页）：扫描图已拆开，正文是 PDF 里已有的识别文字
  *       picture  没有文字层的附图页：整页保留成一张图片，内容没有丢
  *       unread   没有文字层、图里看得出是成行文字（或无法判断）的页：按整页图片保留，文字没有转成正文
+ *       unknown  （1.2.0 起，没有时省略）unread 里无法判断的页（拆不开的彩色、灰阶照片式、拼条扫描图）：也可能是附图
+ *       blocks   （1.2.0 起，--scan-blocks 且有这类页时）unread 里按原位置分了块的页（见下面的图片名）
  *     调用方据此判断没有文字层的页是否都已如实成图（unread 非空说明还有文字没读出来）。
+ *   - --scan-blocks（1.2.0 起，只用于 flow）：unread 里能拆开的页不再整页保留成图——整页图换成抹掉了字的底图，
+ *     每块文字（按栏、按段）一个按原位置定位的文本框，框里放这块的原图。调用方识别后换成文字，图留在原处、文字留在原位。
+ *   - 转了 90° 的倍数放置的图片（1.2.0 起）按页面方向转正写进 Word；页上只有一张扫描图、图框与页面框横竖互换时，
+ *     这一页按扫描图的大小和方向转换（PDF 阅读器里这样的页显示不全），report.notes 里写明。
  *   - Word 里给调用方的图片名（1.1.0 起，wp:docPr 的 name）：
  *       pdf2word-glyph <id>  句子里只以图片存在的字（行内图片，在原来的位置）
  *       pdf2word-page <n>    第 n 页（unread）的整页图
  *       pdf2word-form <n>    第 n 页表单垫在原位文本框下面的格线图
- *     调用方可以把前两种识别成文字后替换掉；其余图片照旧叫"图片 <id>"。
+ *       pdf2word-scan <n>    （1.2.0）第 n 页（blocks）抹掉了字的底图：附图、条码、表格线、附图框里的标注留着
+ *       pdf2word-text <n>.<k>（1.2.0）第 n 页第 k 块文字的原图，在名为 pdf2word-block <n>.<k> 的原位文本框里
+ *     调用方可以把 glyph、page、text 识别成文字后替换掉；其余图片照旧叫"图片 <id>"。
+ *   - pdf2word-block <n>.<k> 的 wp:docPr descr（1.2.0）是一行 JSON：{"col","band","furniture"?,"lines","size","pitch","align"}。
+ *       k 是阅读顺序（页眉一行，然后每段版面里先左栏从上到下、再右栏；同一行的格从左到右）。
+ *       col      "L" 左栏 / "R" 右栏 / "X" 通栏（不分栏的页、跨栏的块、栏间距里的页码）
+ *       band     第几段版面（横贯全页的大段空白、通栏的块把页面分成上下几段，从 0 起）
+ *       furniture 页眉页脚（页顶、页底只有单行块的那一段：公开号、日期、页码），不属于正文的段落流；不是时省略
+ *       lines、size、pitch、align  行数、估计的字号与行距（pt）、"both" 两端对齐 / "left"
+ *     调用方据此把一栏末尾没说完的段落接到下一栏、下一页的开头，并按原来的字号、行距回填译文。
  */
 
 import fs from "node:fs";
@@ -69,7 +84,7 @@ class CliError extends Error {
 const USAGE = [
   "用法：",
   "  pdf2word --version",
-  "  pdf2word convert <in.pdf> <out.docx> [--mode flow|exact] [--pages 1-20,25] [--max-pages N]",
+  "  pdf2word convert <in.pdf> <out.docx> [--mode flow|exact] [--pages 1-20,25] [--max-pages N] [--scan-blocks]",
 ].join("\n");
 
 function writeStdout(text: string) {
@@ -103,6 +118,7 @@ interface Args {
   mode: "flow" | "exact";
   pages?: string;
   maxPages?: number;
+  scanBlocks?: boolean;
 }
 
 function parseArgs(argv: string[]): Args {
@@ -125,6 +141,8 @@ function parseArgs(argv: string[]): Args {
         if (!/^[1-9]\d{0,5}$/.test(v)) throw new CliError("usage", `--max-pages 必须是正整数：${v}`);
         args.maxPages = Number(v);
       }
+    } else if (a === "--scan-blocks") {
+      args.scanBlocks = true;
     } else if (a.startsWith("-")) {
       throw new CliError("usage", `未知选项：${a}`);
     } else {
@@ -218,7 +236,7 @@ async function convert(args: Args) {
   const { pdfToDocx } = await import("../src/services/pdfConvert/index.js");
   let result: Awaited<ReturnType<typeof pdfToDocx>>;
   try {
-    result = await pdfToDocx(buf, { engine: "builtin", mode: args.mode, pages: args.pages, maxPages: args.maxPages });
+    result = await pdfToDocx(buf, { engine: "builtin", mode: args.mode, pages: args.pages, maxPages: args.maxPages, scanBlocks: args.scanBlocks });
   } catch (e: any) {
     if (isPasswordError(e)) throw new CliError("encrypted", "PDF 有密码保护");
     // 页码范围写法无法识别，或不在这份 PDF 的页码内：调用方的参数问题，引擎的原话说得清楚

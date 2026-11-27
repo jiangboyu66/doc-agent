@@ -169,7 +169,7 @@ Markdown 和 HTML 采用同样的思路：直接在源文本上按位置拼接�
 
 ```
 node pdf2word/pdf2word.mjs --version
-node pdf2word/pdf2word.mjs convert in.pdf out.docx [--mode flow|exact] [--pages 1-20,25] [--max-pages N]
+node pdf2word/pdf2word.mjs convert in.pdf out.docx [--mode flow|exact] [--pages 1-20,25] [--max-pages N] [--scan-blocks]
 ```
 
 **契约 v1**（入口 `cli/pdf2word.ts`；契约有任何变化，次版本号加一，调用方的适配器测试同步修改）：
@@ -196,6 +196,8 @@ node pdf2word/pdf2word.mjs convert in.pdf out.docx [--mode flow|exact] [--pages 
 - 只写 `out.docx` 这一个文件。
 - 不带 `@napi-rs/canvas`，相当于 `PDF_RASTER=0`：矢量图、公式区域按文字处理或不输出；PDF 里嵌入的位图（包括扫描件的整页图片）照常保留。
 - 判断有没有文字层看 `report.textTotal`（扫描件、文字转成曲线的 PDF 是 0 或很少），不能看 `textCoverage`：没有文字时它也是 1。
+- 没有文字层的扫描页（1.2.0）：转了 90° 放的附图转正；页面框与扫描图横竖互换的页按扫描图的大小和方向转（PDF 阅读器里这样的页显示不全）。`report.scanPages` 把页分成 `text`、`picture`（附图，整页成图）、`unread`（看得出是文字、没读出来）与 `unknown`（`unread` 里无法判断的）。
+- `--scan-blocks`（1.2.0，只用于 flow）：`unread` 里能拆开的页按栏、按段、按表格单元格分块（`report.scanPages.blocks`）。整页图换成抹掉了这些字的底图 `pdf2word-scan <页>`（附图、条码、表格线、附图框里的标注留着），每块一个原位文本框 `pdf2word-block <页>.<块>`，框里是这块的原图 `pdf2word-text <页>.<块>`；底图与各块的图拼回去与原扫描图逐像素一致。框的 `descr` 是一行 JSON：栏（`L` / `R` / `X`）、第几段版面、是否页眉页脚、行数、字号、行距、对齐，块号就是阅读顺序。调用方识别出文字后换掉框里的图，把一栏末尾没说完的段落接到下一栏、下一页开头的框里，翻译后文字落回原来的位置。
 
 **发布包** `pdf2word-<版本>.tgz`（约 2 MB，解压后约 3.9 MB、190 个文件），纯 JS，一个包同时适用于 x64 与 arm64：
 

@@ -88,9 +88,11 @@ export interface ImageBox {
    * page 是第 N 页没有文字层、看得出是成行文字的整页图（调用方可以把它们识别成文字后替换掉）；
    * form 是第 N 页表单垫在文本框下面的格线图（格里的字已是文字，图不必再翻译）
    */
-  role?: "glyph" | "page" | "form";
-  /** role 为 page、form 时的页码（从 1 起） */
+  role?: "glyph" | "page" | "form" | "scan" | "text";
+  /** role 为 page、form、scan 时的页码（从 1 起）；role 为 text 时是"页码.块号"里的页码 */
   pageNo?: number;
+  /** role 为 text（没有文字层的文字页上的一块文字，pdf2word-text 页.块）时的块号（从 1 起） */
+  blockNo?: number;
 }
 
 /** 一条已绘制的路径（用于识别矢量图） */
@@ -129,6 +131,10 @@ export interface PageModel {
   rotated?: Array<{ x0: number; y0: number; x1: number; y1: number; size: number; text: string; inFigure?: boolean }>;
   /** 铺满页面的黑白扫描图拆开后的结果（见 scanLayer.ts）；image 是 images 里的那张整页图 */
   scan?: ScanSplit & { image: ImageBox };
+  /** 转了 90° 的倍数、或镜像放置、已按页面方向转正的图片张数 */
+  turnedImages?: number;
+  /** 页面框与唯一的整页扫描图横竖互换：按扫描图的大小和方向取了这一页（宽高与 PDF 的页面框不同） */
+  reoriented?: boolean;
 }
 
 type M = [number, number, number, number, number, number];
@@ -192,6 +198,31 @@ export function encodePng(width: number, height: number, rgba: Uint8Array | Uint
   ]);
 }
 
+/**
+ * 灰度位图编码成 PNG：只有纯黑、纯白两种值时（黑白扫描）用 1 位深度，体积约为 8 位的八分之一；否则 8 位灰度。
+ * 没有文字层的文字页一页要放一张底图和几十块文字小图，按 8 位存，25 页的专利转出来就有二三十 MB
+ */
+export function encodePngBits(width: number, height: number, gray: Uint8Array | Uint8ClampedArray): Buffer {
+  for (let k = 0; k < gray.length; k++) if (gray[k] !== 0 && gray[k] !== 255) return encodePng(width, height, gray, 1);
+  const stride = Math.ceil(width / 8);
+  const raw = Buffer.alloc((stride + 1) * height);
+  for (let y = 0; y < height; y++) {
+    const at = y * (stride + 1), row = y * width;
+    for (let x = 0; x < width; x++) if (gray[row + x]) raw[at + 1 + (x >> 3)] |= 0x80 >> (x & 7);
+  }
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(width, 0);
+  ihdr.writeUInt32BE(height, 4);
+  ihdr[8] = 1;
+  ihdr[9] = 0;
+  return Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    pngChunk("IHDR", ihdr),
+    pngChunk("IDAT", zlib.deflateSync(raw, { level: 6 })),
+    pngChunk("IEND", Buffer.alloc(0)),
+  ]);
+}
+
 /** 位图解码为逐像素数据（1 / 3 / 4 通道）；1 位灰度展开成每像素 1 字节 */
 function decodeImage(img: any): { data: Uint8Array | Uint8ClampedArray; w: number; h: number; ch: 1 | 3 | 4 } | null {
   if (!img || !img.width || !img.height || !img.data) return null;
@@ -206,6 +237,37 @@ function decodeImage(img: any): { data: Uint8Array | Uint8ClampedArray; w: numbe
     return { data: out, w, h, ch: 1 };
   }
   return null;
+}
+
+/**
+ * 按页面方向转正的像素。图片的单位方块：u 轴是像素列的方向，v 轴向上（像素行从上到下）。u、v 在页面上一横一竖、但不是"u 向右、
+ * v 向上"（转了 90°、180°、270°，或镜像）时，按页面上从左到右、从上到下重新排列像素，返回转正后的位图；本来就正放的、
+ * 斜放的（不是 90° 的倍数）返回 null。
+ * 扫描件常这样放：横幅的附图页扫成竖幅位图、再转 90° 画到横向页面上（US20040163766A1 的 incoPat 文本，2026-11-27）。
+ * 原样写进 Word 是横躺的图；扫描页的拆分也只能按看到的方向做。
+ */
+function uprightPixels(d: { data: Uint8Array | Uint8ClampedArray; w: number; h: number; ch: 1 | 3 | 4 }, corners: Array<[number, number]>): { data: Uint8Array; w: number; h: number; ch: 1 | 3 | 4 } | null {
+  const [o, a, b] = corners;
+  const U = [a[0] - o[0], a[1] - o[1]], V = [b[0] - o[0], b[1] - o[1]];
+  const lu = Math.hypot(U[0], U[1]), lv = Math.hypot(V[0], V[1]);
+  if (lu < 1e-6 || lv < 1e-6) return null;
+  const flat = Math.abs(U[1]) <= 0.01 * lu && Math.abs(V[0]) <= 0.01 * lv;
+  const swap = Math.abs(U[0]) <= 0.01 * lu && Math.abs(V[1]) <= 0.01 * lv;
+  if (!flat && !swap) return null;
+  if (flat && U[0] > 0 && V[1] < 0) return null;
+  const { w, h, ch, data } = d;
+  const ow = flat ? w : h, oh = flat ? h : w;
+  const out = new Uint8Array(ow * oh * ch);
+  for (let oy = 0; oy < oh; oy++) {
+    for (let ox = 0; ox < ow; ox++) {
+      // 页面横坐标跟着 u（flat）或 v（swap）走；v 向上而像素行向下，所以沿 v 增大的方向行号减小
+      const c = flat ? (U[0] > 0 ? ox : w - 1 - ox) : (U[1] > 0 ? oy : w - 1 - oy);
+      const r = flat ? (V[1] < 0 ? oy : h - 1 - oy) : (V[0] > 0 ? h - 1 - ox : ox);
+      const s = (r * w + c) * ch, t = (oy * ow + ox) * ch;
+      for (let k = 0; k < ch; k++) out[t + k] = data[s + k];
+    }
+  }
+  return { data: out, w: ow, h: oh, ch };
 }
 
 /** 取像素区域 [c0,c1) × [r0,r1)（图像行从上到下） */
@@ -273,7 +335,7 @@ export function formatPageRange(pages: number[]): string {
  * pages：只提取这些页（页码范围或从 1 开始的页码列表）；省略时从第 1 页起。单次最多 maxPages 页（默认 MAX_PDF_PAGES），
  * 超出的不提取——info 里记下 PDF 总页数、实际提取的页码、是否因上限被截断，由调用方如实告诉用户
  */
-export async function extractPdf(buf: Buffer, opts: { maxPages?: number; pages?: string | number[]; info?: { total: number; pages: number[]; truncated: boolean } } = {}): Promise<PageModel[]> {
+export async function extractPdf(buf: Buffer, opts: { maxPages?: number; pages?: string | number[]; info?: { total: number; pages: number[]; truncated: boolean }; scanBlocks?: boolean } = {}): Promise<PageModel[]> {
   const pdfjs = await loadPdfjs();
   const { OPS, Util } = pdfjs;
   const doc = await pdfjs.getDocument({ data: new Uint8Array(buf), isOffscreenCanvasSupported: false, disableFontFace: true, useSystemFonts: false, verbosity: 0, ...pdfjsDataOptions() }).promise;
@@ -284,14 +346,14 @@ export async function extractPdf(buf: Buffer, opts: { maxPages?: number; pages?:
       : Array.from({ length: doc.numPages }, (_, i) => i + 1);
     const list = all.slice(0, opts.maxPages ?? MAX_PDF_PAGES);
     if (opts.info) Object.assign(opts.info, { total: doc.numPages, pages: list, truncated: list.length < all.length });
-    for (const p of list) pages.push(await extractPage(await doc.getPage(p), p - 1, OPS, Util));
+    for (const p of list) pages.push(await extractPage(await doc.getPage(p), p - 1, OPS, Util, { scanBlocks: opts.scanBlocks }));
   } finally {
     await doc.destroy().catch(() => {});
   }
   return pages;
 }
 
-async function extractPage(page: any, index: number, OPS: any, Util: any): Promise<PageModel> {
+async function extractPage(page: any, index: number, OPS: any, Util: any, opts: { scanBlocks?: boolean } = {}): Promise<PageModel> {
   let vp = page.getViewport({ scale: 1 });
   let rotation: number | undefined;
   // 页面带 /Rotate 90 / 270、内容却按未旋转的版面排（合并、扫描时转了页面方向）：显示出来整页文字都横躺着，
@@ -316,6 +378,7 @@ async function extractPage(page: any, index: number, OPS: any, Util: any): Promi
   // 铺满页面的黑白扫描图（只有一张时）：像素留到文字读完
   let scanned: { gray: { data: Uint8Array | Uint8ClampedArray; w: number; h: number }; box: { x0: number; y0: number; x1: number; y1: number }; image: ImageBox } | null = null;
   let scanPages = 0;
+  let lone: { gray: { data: Uint8Array | Uint8ClampedArray; w: number; h: number }; image: ImageBox } | null = null;
 
   // ---------- 操作符遍历：图形、图片、文字颜色 ----------
   interface GState { ctm: M; fill: string; stroke: string; lw: number; trm: number; clip?: { x0: number; y0: number; x1: number; y1: number } }
@@ -548,9 +611,18 @@ async function extractPage(page: any, index: number, OPS: any, Util: any): Promi
       case OPS.paintInlineImageXObject: {
         const img = fn === OPS.paintInlineImageXObject ? args[0] : await getObj(String(args[0]).startsWith("g_") ? page.commonObjs : page.objs, args[0]);
         let dec = decodeImage(img);
-        const corners = [toPage(0, 0), toPage(1, 0), toPage(0, 1), toPage(1, 1)];
+        let corners: Array<[number, number]> = [toPage(0, 0), toPage(1, 0), toPage(0, 1), toPage(1, 1)];
         const xs = corners.map((c) => c[0]), ys = corners.map((c) => c[1]);
         let box = { x0: Math.min(...xs), y0: Math.min(...ys), x1: Math.max(...xs), y1: Math.max(...ys) };
+        // 转了 90° 的倍数、或镜像放置的图：像素按页面方向转正（见 uprightPixels），之后与正放的图一样处理
+        if (dec) {
+          const turned = uprightPixels(dec, corners);
+          if (turned) {
+            dec = turned;
+            corners = [[box.x0, box.y1], [box.x1, box.y1], [box.x0, box.y0], [box.x1, box.y0]];
+            model.turnedImages = (model.turnedImages ?? 0) + 1;
+          }
+        }
         // 照片常以更大的尺寸放置、再用取景框裁剪（IEEE 作者照片：方形原图裁成 1 × 1.25 英寸的竖幅）。
         // 只取取景框内可见的部分，否则图片比实际显示的大，会盖住旁边的文字、与相邻照片被误并
         const cl = gs.clip;
@@ -581,6 +653,9 @@ async function extractPage(page: any, index: number, OPS: any, Util: any): Promi
           if (dec!.ch === 1 && straight && box.x1 - box.x0 >= 0.85 * model.width && box.y1 - box.y0 >= 0.85 * model.height) {
             scanPages++;
             scanned = scanPages === 1 ? { gray: { data: dec!.data, w: dec!.w, h: dec!.h }, box, image: im } : null;
+          } else if (dec!.ch === 1 && straight && box.x1 - box.x0 >= 0.85 * model.height && box.y1 - box.y0 >= 0.85 * model.width) {
+            // 铺满"横竖互换的页面"的扫描图：页面框可能弄反了，读完整页再看（见页末）
+            lone = { gray: { data: dec!.data, w: dec!.w, h: dec!.h }, image: im };
           }
         } else if (!png) model.vectorShapes++;
         break;
@@ -808,8 +883,22 @@ async function extractPage(page: any, index: number, OPS: any, Util: any): Promi
     }
   }
   model.spans = mergeLetterSpaced(model.spans);
+  // 页上只有一张扫描图、图框正好是页面框横竖互换（PDF 工具换了页面的宽高、没转图）：阅读器里这页只显示一部分，
+  // 一边空着、另一边被裁掉（US20040163766A1 的第 2、6、9、11、12、16 页，2026-11-27）。这一页按扫描图的大小和方向取，
+  // 图完整保留，也能像别的扫描页一样拆开
+  if (!scanned && lone && model.images.length === 1 && !model.spans.some((sp) => sp.text.trim()) && !model.paths.length && !model.segs.length && !model.fills.length && !model.masks.length) {
+    const im = lone.image, bw = im.x1 - im.x0, bh = im.y1 - im.y0;
+    if (Math.abs(model.width - model.height) > 0.1 * Math.max(model.width, model.height) && Math.abs(bw - model.height) <= 0.03 * model.height && Math.abs(bh - model.width) <= 0.03 * model.width) {
+      const dx = im.x0, dy = im.y0;
+      im.x0 -= dx; im.x1 -= dx; im.y0 -= dy; im.y1 -= dy;
+      model.width = bw;
+      model.height = bh;
+      model.reoriented = true;
+      scanned = { gray: lone.gray, box: { x0: im.x0, y0: im.y0, x1: im.x1, y1: im.y1 }, image: im };
+    }
+  }
   if (scanned) {
-    const split = splitScan(scanned.gray, scanned.box, model.spans.map((sp) => ({ x0: sp.x0, y0: sp.top, x1: sp.x1, y1: sp.bottom, text: sp.text, baseline: sp.baseline, size: sp.size })));
+    const split = splitScan(scanned.gray, scanned.box, model.spans.map((sp) => ({ x0: sp.x0, y0: sp.top, x1: sp.x1, y1: sp.bottom, text: sp.text, baseline: sp.baseline, size: sp.size })), { blocks: opts.scanBlocks });
     if (split) model.scan = { ...split, image: scanned.image };
   }
   return model;

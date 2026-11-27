@@ -31,6 +31,19 @@ const HIGHLIGHT: Record<string, string> = {
   "808000": "darkYellow", "808080": "darkGray", C0C0C0: "lightGray", "000000": "black",
 };
 
+
+/**
+ * 写进 Word 的图片名（wp:docPr 的 name）：给调用方的标记（见 cli/pdf2word.ts 的契约）——pdf2word-glyph <id>、
+ * pdf2word-page <页>、pdf2word-form <页>、pdf2word-scan <页>（没有文字层的文字页抹掉了字的底图）、
+ * pdf2word-text <页>.<块>（这一页上一块文字的原图，在它的原位文本框里）；其余图片叫"图片 <id>"
+ */
+function pictureName(img: ImageBox, id: number): string {
+  if (img.role === "glyph") return `pdf2word-glyph ${id}`;
+  if (img.role === "page" || img.role === "form" || img.role === "scan") return `pdf2word-${img.role} ${img.pageNo}`;
+  if (img.role === "text") return `pdf2word-text ${img.pageNo}.${img.blockNo}`;
+  return `图片 ${id}`;
+}
+
 class Writer {
   private media: Array<{ name: string; data: Buffer; rid: string; part: string }> = [];
   /** 当前正在生成的部件（图片关系写进该部件的 .rels） */
@@ -90,8 +103,10 @@ class Writer {
       // 只以图片存在的字（pdf2word-glyph）：带上这一行的字体、字号。调用方把它识别成文字、换成文字 run 时沿用这些格式；
       // 独占一个文本框的词（表单格里的词）旁边没有别的文字可以照着排
       const f = esc(r.font), hp = Math.max(2, Math.round(r.size * 2));
-      const own = r.img.role === "glyph" && r.font ? `<w:rFonts w:ascii="${f}" w:hAnsi="${f}" w:eastAsia="${f}" w:cs="${f}"/>` : "";
-      const sz = r.img.role === "glyph" && r.size ? `<w:sz w:val="${hp}"/><w:szCs w:val="${hp}"/>` : "";
+      // 没有文字层的页上的一块文字（pdf2word-text）同样：识别出的文字沿用框里这段的字体、字号
+      const marked = r.img.role === "glyph" || r.img.role === "text";
+      const own = marked && r.font ? `<w:rFonts w:ascii="${f}" w:hAnsi="${f}" w:eastAsia="${f}" w:cs="${f}"/>` : "";
+      const sz = marked && r.size ? `<w:sz w:val="${hp}"/><w:szCs w:val="${hp}"/>` : "";
       return (
         `<w:r><w:rPr>${own}<w:noProof/>${lower ? `<w:position w:val="${-lower}"/>` : ""}${sz}</w:rPr><w:drawing><wp:inline distT="0" distB="0" distL="0" distR="0">` +
         `<wp:extent cx="${cx}" cy="${cy}"/><wp:effectExtent l="0" t="0" r="0" b="0"/>${xml}</wp:inline></w:drawing></w:r>`
@@ -122,7 +137,7 @@ class Writer {
     const id = this.drawingId++;
     const cx = emu(img.x1 - img.x0), cy = emu(img.y1 - img.y0);
     const xml =
-      `<wp:docPr id="${id}" name="${img.role === "glyph" ? `pdf2word-glyph ${id}` : img.role === "page" || img.role === "form" ? `pdf2word-${img.role} ${img.pageNo}` : `图片 ${id}`}"${img.alt ? ` descr="${escAttr(img.alt)}"` : ""}/><wp:cNvGraphicFramePr><a:graphicFrameLocks noChangeAspect="1"/></wp:cNvGraphicFramePr>` +
+      `<wp:docPr id="${id}" name="${pictureName(img, id)}"${img.alt ? ` descr="${escAttr(img.alt)}"` : ""}/><wp:cNvGraphicFramePr><a:graphicFrameLocks noChangeAspect="1"/></wp:cNvGraphicFramePr>` +
       `<a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic>` +
       `<pic:nvPicPr><pic:cNvPr id="${id}" name="${name}"/><pic:cNvPicPr/></pic:nvPicPr>` +
       `<pic:blipFill><a:blip r:embed="${rid}"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill>` +
@@ -198,8 +213,11 @@ class Writer {
     );
   }
 
-  /** 绝对定位的文本框（页眉页脚等）：无边框、无填充、零内边距、不参与文字环绕 */
-  private textBox(tb: { x: number; y: number; w: number; h: number; para: Para }): string {
+  /**
+   * 绝对定位的文本框（页眉页脚等）：无边框、无填充、零内边距、不参与文字环绕。wrap：框里的文字按框宽折行、框随文字长高
+   * （没有文字层的页上的文字块：换成文字、译文比原文长时不被裁掉）
+   */
+  private textBox(tb: NonNullable<Para["textBoxes"]>[number]): string {
     const id = this.drawingId++;
     const cx = emu(tb.w), cy = emu(tb.h);
     return (
@@ -207,11 +225,11 @@ class Writer {
       `<wp:simplePos x="0" y="0"/><wp:positionH relativeFrom="page"><wp:posOffset>${emu(tb.x)}</wp:posOffset></wp:positionH>` +
       `<wp:positionV relativeFrom="page"><wp:posOffset>${emu(tb.y)}</wp:posOffset></wp:positionV>` +
       `<wp:extent cx="${cx}" cy="${cy}"/><wp:effectExtent l="0" t="0" r="0" b="0"/><wp:wrapNone/>` +
-      `<wp:docPr id="${id}" name="文本框 ${id}"/><wp:cNvGraphicFramePr/>` +
+      `<wp:docPr id="${id}" name="${tb.name ? esc(tb.name) : `文本框 ${id}`}"${tb.descr ? ` descr="${escAttr(tb.descr)}"` : ""}/><wp:cNvGraphicFramePr/>` +
       `<a:graphic><a:graphicData uri="http://schemas.microsoft.com/office/word/2010/wordprocessingShape"><wps:wsp><wps:cNvSpPr txBox="1"/>` +
       `<wps:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="${cx}" cy="${cy}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom><a:noFill/><a:ln><a:noFill/></a:ln></wps:spPr>` +
       `<wps:txbx><w:txbxContent>${this.para(tb.para)}</w:txbxContent></wps:txbx>` +
-      `<wps:bodyPr rot="0" vert="horz" wrap="none" lIns="0" tIns="0" rIns="0" bIns="0" anchor="t" anchorCtr="0"><a:noAutofit/></wps:bodyPr>` +
+      `<wps:bodyPr rot="0" vert="horz" wrap="${tb.wrap ? "square" : "none"}" lIns="0" tIns="0" rIns="0" bIns="0" anchor="t" anchorCtr="0">${tb.wrap ? "<a:spAutoFit/>" : "<a:noAutofit/>"}</wps:bodyPr>` +
       `</wps:wsp></a:graphicData></a:graphic></wp:anchor></w:drawing></w:r>`
     );
   }
@@ -238,7 +256,7 @@ class Writer {
       : '<w:cols w:space="425"/>';
     return (
       `<w:sectPr>${refs}${continuous ? '<w:type w:val="continuous"/>' : ""}` +
-      `<w:pgSz w:w="${tw(m.pageW)}" w:h="${tw(m.pageH)}"${m.pageW > m.pageH ? ' w:orient="landscape"' : ""}/>` +
+      `<w:pgSz w:w="${tw(s.pageW ?? m.pageW)}" w:h="${tw(s.pageH ?? m.pageH)}"${(s.pageW ?? m.pageW) > (s.pageH ?? m.pageH) ? ' w:orient="landscape"' : ""}/>` +
       `<w:pgMar w:top="${tw(m.margins.top)}" w:right="${tw(m.margins.right)}" w:bottom="${tw(m.margins.bottom)}" w:left="${tw(m.margins.left)}" w:header="${tw(m.headerDist ?? 0)}" w:footer="${tw(m.footerDist ?? 0)}" w:gutter="0"/>` +
       `${pgNum}${cols}${titlePg}</w:sectPr>`
     );
@@ -258,7 +276,8 @@ class Writer {
     ppr.push('<w:autoSpaceDE w:val="0"/><w:autoSpaceDN w:val="0"/><w:adjustRightInd w:val="0"/><w:snapToGrid w:val="0"/>');
     // 图片段落：单倍行距（行高自动等于图片高度；不用"最小值"——浏览器预览会把它当成行高，图片上方多出一大块空白），其余为固定行距
     // 固定行距会裁掉比行高更高的内容（首字母、行内公式图片）：这种段落改用"最小值"，行高不变、内容不被裁
-    const tall = !p.tiny && p.runs.some((r) => (r.img ? (r.img.y1 - r.img.y0) * (r.imgScale ?? 1) > p.lineHeight : !r.tab && !r.br && !!r.text.trim() && r.size > 1.08 * p.lineHeight));
+    // 文字块的原图（pdf2word-text）一律按"最小值"：单行块的图与行距差不多高，按固定行距会被裁掉（表格里的数值、页眉整块不见了）
+    const tall = !p.tiny && p.runs.some((r) => (r.img ? r.img.role === "text" || (r.img.y1 - r.img.y0) * (r.imgScale ?? 1) > p.lineHeight : !r.tab && !r.br && !!r.text.trim() && r.size > 1.08 * p.lineHeight));
     ppr.push(p.inlineImages?.length
       ? `<w:spacing w:before="${tw(p.spaceBefore)}" w:after="0" w:line="240" w:lineRule="auto"/>`
       : `<w:spacing w:before="${tw(p.spaceBefore)}" w:after="0" w:line="${Math.max(20, tw(p.lineHeight))}" w:lineRule="${tall ? "atLeast" : "exact"}"/>`);
@@ -270,7 +289,7 @@ class Writer {
     if (ind.length) ppr.push(`<w:ind ${ind.join(" ")}/>`);
     if (p.align !== "left") ppr.push(`<w:jc w:val="${p.align}"/>`);
     if (p.tiny) ppr.push('<w:rPr><w:sz w:val="2"/><w:szCs w:val="2"/></w:rPr>');
-    if (p.sectionEnd) ppr.push(this.sectPr(p.sectionEnd, !p.sectionEnd.restart && !p.sectionEnd.frontStart));
+    if (p.sectionEnd) ppr.push(this.sectPr(p.sectionEnd, !p.sectionEnd.restart && !p.sectionEnd.frontStart && !p.sectionEnd.newPage));
 
     const body: string[] = [];
     if (p.columnBreakBefore) body.push('<w:r><w:br w:type="column"/></w:r>');
@@ -327,7 +346,7 @@ class Writer {
     });
     // 表格不能作为 body 的最后一个元素之前的节尾；Word 要求 body 以段落或 sectPr 结束
     if (this.m.blocks[this.m.blocks.length - 1]?.kind === "table") out.push(this.para({ kind: "p", runs: [], align: "left", indLeft: 0, indRight: 0, firstLine: 0, spaceBefore: 0, lineHeight: 1, tabs: [], tiny: true, size: 1 }));
-    return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<w:document ${NS}><w:body>${out.join("")}${this.sectPr(this.m.finalSection, this.m.blocks.some((b) => b.kind === "p" && !!b.sectionEnd) && !this.m.finalSection.restart && !this.m.finalSection.frontStart)}</w:body></w:document>`;
+    return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<w:document ${NS}><w:body>${out.join("")}${this.sectPr(this.m.finalSection, this.m.blocks.some((b) => b.kind === "p" && !!b.sectionEnd) && !this.m.finalSection.restart && !this.m.finalSection.frontStart && !this.m.finalSection.newPage)}</w:body></w:document>`;
   }
 
   styles(): string {

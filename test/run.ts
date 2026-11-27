@@ -64,11 +64,11 @@ function eq<T>(a: T, b: T, msg: string) {
 const count = (s: string, sub: string | RegExp) => (typeof sub === "string" ? s.split(sub).length - 1 : (s.match(new RegExp(sub, "g")) ?? []).length);
 const docText = (buf: Buffer) => new DocxDocument(buf).listBlocks().map((b) => b.text).join("\n");
 const docXml = (buf: Buffer) => new ZipPackage(buf).readText("word/document.xml");
-/** 8 位灰度、无隔行的 PNG（引擎的 encodePng 写的：每行滤波方式 0）解成像素 */
+/** 灰度、无隔行的 PNG（引擎的 encodePng / encodePngBits 写的：8 位或 1 位，每行滤波方式 0）解成每像素一个字节 */
 const decodeGrayPng = (png: Buffer) => {
   const { inflateSync } = zlibSync;
-  const w = png.readUInt32BE(16), h = png.readUInt32BE(20);
-  assert(png[24] === 8 && png[25] === 0, "只解 8 位灰度 PNG");
+  const w = png.readUInt32BE(16), h = png.readUInt32BE(20), depth = png[24];
+  assert((depth === 8 || depth === 1) && png[25] === 0, "只解 8 位、1 位灰度 PNG");
   const parts: Buffer[] = [];
   for (let at = 8; at < png.length;) {
     const len = png.readUInt32BE(at), type = png.toString("ascii", at + 4, at + 8);
@@ -76,10 +76,13 @@ const decodeGrayPng = (png: Buffer) => {
     at += 12 + len;
   }
   const raw = inflateSync(Buffer.concat(parts));
+  const stride = depth === 8 ? w : Math.ceil(w / 8);
   const data = new Uint8Array(w * h);
   for (let y = 0; y < h; y++) {
-    assert(raw[y * (w + 1)] === 0, "只解滤波方式 0 的行");
-    data.set(raw.subarray(y * (w + 1) + 1, y * (w + 1) + 1 + w), y * w);
+    const at = y * (stride + 1);
+    assert(raw[at] === 0, "只解滤波方式 0 的行");
+    if (depth === 8) data.set(raw.subarray(at + 1, at + 1 + w), y * w);
+    else for (let x = 0; x < w; x++) data[y * w + x] = raw[at + 1 + (x >> 3)] & (0x80 >> (x & 7)) ? 255 : 0;
   }
   return { w, h, data };
 };
@@ -1208,7 +1211,7 @@ await test("所有夹具 PDF：两种排版方式都不报错、文字完整；L
   const run = promisify(execFile);
   const soffice = process.env.SOFFICE_PATH || "soffice";
   const hasSoffice = await run(soffice, ["--version"]).then(() => true, () => false);
-  const names = ["columns", "journal", "figures", "math", "journal-front", "journal-eq", "journal-fig", "bios", "colstart", "signature", "citecolor", "texpaper", "contract-cn", "scan-letter", "furniture-cn", "bates", "agreement-front"];
+  const names = ["columns", "journal", "figures", "math", "journal-front", "journal-eq", "journal-fig", "bios", "colstart", "signature", "citecolor", "texpaper", "contract-cn", "scan-letter", "furniture-cn", "bates", "agreement-front", "scan-turned"];
   const dir = await fs.mkdtemp(path.join(tmp, "pages-"));
   const bad: string[] = [];
   for (const name of names) {
@@ -1910,6 +1913,114 @@ await test("扫描件首页（scan-front.pdf，WIPO 小册子首页的版式）�
   assert(!paras.slice(0, figure).some((t) => t.includes("Abstract")), "摘要的开头不排在附图上面");
   const last = xml.slice(xml.lastIndexOf("<w:sectPr"));
   assert(/<w:cols w:num="2"/.test(last), "附图与摘要在两栏的一节里");
+});
+
+await test("没有文字层的扫描专利（scan-turned.pdf，US20040163766A1 的 incoPat 文本）：转 90° 放的附图页转正、整页保留；页面框与扫描图横竖互换的页按扫描图的大小和方向转；文字页（scanBlocks）按栏、按段分成原位文本框——块图只有本块的字、底图抹掉这些字、附图留在底图上，两者拼回去就是原扫描图", async () => {
+  const { pdfToDocx } = await import("../src/services/pdfConvert/index.js");
+  const { extractPdf } = await import("../src/services/pdfConvert/extract.js");
+  const pdf = await fixture("scan-turned.pdf");
+  const names = (xml: string) => [...xml.matchAll(/<wp:docPr id="\d+" name="([^"]+)"/g)].map((m) => m[1]);
+  const sizes = (xml: string) => [...xml.matchAll(/<w:pgSz w:w="(\d+)" w:h="(\d+)"/g)].map((m) => `${m[1]}x${m[2]}`).join(" ");
+
+  // 引擎：第 2 页转 90° 放的附图转正；第 3 页的页面框按扫描图改成横向
+  const pages = await extractPdf(pdf, { scanBlocks: true });
+  eq(pages.map((p) => `${p.width}x${p.height}`).join(" "), "612x792 792x612 792x612 612x792", "页面大小（第 3 页按扫描图横过来）");
+  eq(pages[1].turnedImages, 1, "第 2 页的附图是转 90° 放的");
+  eq(pages[2].reoriented, true, "第 3 页的页面框与扫描图横竖互换");
+  for (const k of [1, 2]) {
+    // 转正后附图外框的左上角在 (120, 120) pt，上沿、左沿是粗线；转反了、镜像了，这两段线都不在这里
+    const img = pages[k].scan!.image, g = decodeGrayPng(img.png), K = g.w / (img.x1 - img.x0);
+    eq(`${img.x0},${img.y0},${img.x1},${img.y1}`, "0,0,792,612", `第 ${k + 1} 页：附图铺满横向页面`);
+    const share = (x0: number, y0: number, x1: number, y1: number) => {
+      let n = 0, all = 0;
+      for (let y = Math.round(y0 * K); y <= Math.round(y1 * K); y++) for (let x = Math.round(x0 * K); x <= Math.round(x1 * K); x++) { all++; if (g.data[y * g.w + x] < 128) n++; }
+      return n / all;
+    };
+    assert(share(125, 120.6, 155, 121.2) > 0.9 && share(120.6, 125, 121.2, 155) > 0.9, `第 ${k + 1} 页的附图应转正`);
+  }
+
+  // 文字页：块图（只有本块的字）与底图（抹掉了这些字）拼回去，与原扫描图逐像素一致
+  const scan = pages[0].scan!, tb = scan.textBlocks!;
+  eq(tb.blocks.length, 15, "第 1 页分成 15 块：页眉左右两块、页码、左栏 6 段 + 小标题、右栏 2 段、附图号 3 个");
+  {
+    const img = scan.image, src = decodeGrayPng(img.png), bg = decodeGrayPng(tb.background);
+    const kx = src.w / (img.x1 - img.x0), ky = src.h / (img.y1 - img.y0);
+    const out = Uint8Array.from(bg.data), seen = new Uint8Array(src.w * src.h);
+    let twice = 0, hidden = 0;
+    for (const b of tb.blocks) {
+      const c0 = Math.floor((b.x0 - img.x0) * kx), r0 = Math.floor((b.y0 - img.y0) * ky), crop = decodeGrayPng(b.png);
+      eq(`${crop.w}x${crop.h}`, `${b.pxW}x${b.pxH}`, "块图大小");
+      for (let y = 0; y < crop.h; y++) for (let x = 0; x < crop.w; x++) {
+        const at = (r0 + y) * src.w + c0 + x;
+        if (bg.data[at] < 128) hidden++;
+        if (crop.data[y * crop.w + x] < 128) { if (seen[at]) twice++; seen[at] = 1; out[at] = 0; }
+      }
+    }
+    let diff = 0;
+    for (let k = 0; k < out.length; k++) if ((out[k] < 128) !== (src.data[k] < 128)) diff++;
+    eq(diff, 0, "块图 + 底图 = 原扫描图");
+    eq(twice, 0, "一个像素只归一块");
+    // 块图是白底的：框里留在底图上的墨迹会被盖住，换成译文后又露出来
+    eq(hidden, 0, "块图框里没有留在底图上的墨迹（i 上的点都归进了块里）");
+    const inkIn = (g: { w: number; data: Uint8Array }, x0: number, y0: number, x1: number, y1: number) => {
+      let n = 0;
+      for (let y = Math.round(y0 * ky); y < Math.round(y1 * ky); y++) for (let x = Math.round(x0 * kx); x < Math.round(x1 * kx); x++) if (g.data[y * g.w + x] < 128) n++;
+      return n;
+    };
+    assert(inkIn(src, 338, 428, 522, 562) > 1000, "原图上有附图");
+    eq(inkIn(bg, 338, 428, 522, 562), inkIn(src, 338, 428, 522, 562), "附图（含框里的 MATCHING）原样留在底图上");
+    eq(inkIn(bg, 60, 40, 300, 545) + inkIn(bg, 300, 40, 552, 270), 0, "页眉、两栏正文从底图上抹干净了（没有剩下 i 上的点）");
+  }
+  // 阅读顺序：页眉一行、页码，然后左栏从上到下，再右栏，最后附图号
+  const zone = (b: { x0: number; y0: number }) => (b.y0 < 80 ? "H" : b.y0 > 580 ? "F" : b.x0 < 300 ? "L" : "R");
+  eq(tb.blocks.map(zone).join(""), "HHHLLLLLLLRRFFF", "块的先后：页眉一行与页码、左栏、右栏、附图号");
+  for (const z of ["L", "R"]) {
+    const ys = tb.blocks.filter((b) => zone(b) === z).map((b) => b.y0);
+    assert(ys.every((y, k) => k === 0 || y > ys[k - 1]), `${z} 栏从上到下：${ys.join(" ")}`);
+  }
+  assert(tb.blocks[0].x0 < tb.blocks[1].x0 && tb.blocks[12].x0 < tb.blocks[13].x0, "同一行的两块从左到右");
+  // 字号按字高推：页眉、附图号这样的单行全大写、数字与正文同一个量法（不再大四成）；正文行距 10.2 pt
+  const size = (k: number) => tb.blocks[k].size;
+  assert(size(0) >= 9.5 && size(0) <= 11, `页眉 10 pt：${size(0)}`);
+  assert(size(3) >= 8.5 && size(3) <= 10, `正文 8.5 pt：${size(3)}`);
+  assert(size(6) >= 8.5 && size(6) <= 10, `小标题 9 pt：${size(6)}`);
+  assert(size(14) >= 10.5 && size(14) <= 12, `"FIG. 1" 11 pt：${size(14)}`);
+  eq(tb.blocks.slice(3, 6).map((b) => `${b.lines}/${b.align}`).join(" "), "6/both 6/both 6/both", "左栏前三段：6 行、两端对齐");
+
+  // Word：文字页垫底的是抹掉了字的底图（pdf2word-scan 1），每块一个原位文本框（pdf2word-block 1.k，框里是块图 pdf2word-text 1.k）；
+  // 附图页整页成图；第 2、3 页横向单独成节
+  const blocks = await pdfToDocx(pdf, { mode: "flow", scanBlocks: true });
+  eq(JSON.stringify(blocks.report.scanPages), JSON.stringify({ text: [], picture: [2, 3, 4], unread: [1], blocks: [1] }), "各页的归类");
+  {
+    const xml = new ZipPackage(blocks.data).readText("word/document.xml"), n = names(xml);
+    eq(n.filter((v) => v === "pdf2word-scan 1").length, 1, "文字页的底图");
+    eq(n.filter((v) => v.startsWith("pdf2word-block 1.")).join(","), Array.from({ length: 15 }, (_, k) => `pdf2word-block 1.${k + 1}`).join(","), "15 个原位文本框，按阅读顺序编号");
+    eq(n.filter((v) => v.startsWith("pdf2word-text 1.")).length, 15, "每个文本框里一张块图");
+    assert(!n.some((v) => v.startsWith("pdf2word-page")), "文字页不再整页成图");
+    eq(sizes(xml), "12240x15840 15840x12240 12240x15840", "纵向 / 横向（第 2–3 页）/ 纵向");
+    // 每个框的 descr：版面位置（栏、第几段、页眉页脚）与行数、字号、行距，调用方据此接续跨栏的段落、回填译文
+    const descr = [...xml.matchAll(/name="pdf2word-block 1\.(\d+)" descr="([^"]*)"/g)].map((m) => JSON.parse(m[2].replace(/&quot;/g, '"')));
+    eq(descr.map((d) => `${d.col}${d.band}${d.furniture ? "F" : ""}`).join(" "), "L0F R0F X0F L1 L1 L1 L1 L1 L1 L1 R1 R1 R2 R2 R2", "版面位置：页眉一行与页码是页眉页脚，正文左栏、右栏，附图号另成一段");
+    eq(descr.slice(3, 6).map((d) => `${d.lines}/${d.align}`).join(" "), "6/both 6/both 6/both", "descr 里的行数、对齐");
+    assert(descr.every((d) => d.size > 0 && d.pitch > 0), "descr 里有字号、行距");
+    const box = xml.slice(xml.indexOf('name="pdf2word-block 1.4"'));
+    assert(/wrap="square"/.test(box.slice(0, box.indexOf("</wps:wsp>"))) && /<a:spAutoFit\/>/.test(box.slice(0, box.indexOf("</wps:wsp>"))), "文本框换行、随文字长高");
+    const notes = blocks.report.notes.join("\n");
+    assert(/第 1 页的文字按原位置分成 15 块放进文本框/.test(notes), `应说明分块：${notes}`);
+    assert(/第 2–4 页是附图/.test(notes), `应说明附图页：${notes}`);
+    assert(/第 3 页的扫描图与页面横竖不一致/.test(notes), `应说明页面框横竖互换：${notes}`);
+  }
+  // 不要求分块时照旧：文字页整页成图、标成 pdf2word-page 1（附图页不再被当成没读出来的文字页）
+  const plain = await pdfToDocx(pdf, { mode: "flow" });
+  eq(JSON.stringify(plain.report.scanPages), JSON.stringify({ text: [], picture: [2, 3, 4], unread: [1] }), "不分块：各页的归类");
+  {
+    const xml = new ZipPackage(plain.data).readText("word/document.xml"), n = names(xml);
+    eq(n.filter((v) => v.startsWith("pdf2word-")).join(","), "pdf2word-page 1", "不分块：只有第 1 页标成没读出来的整页图");
+    eq(sizes(xml), "12240x15840 15840x12240 12240x15840", "不分块：横向页同样单独成节");
+  }
+  // 逐行一致模式不分块
+  const exact = await pdfToDocx(pdf, { mode: "exact", scanBlocks: true });
+  eq(JSON.stringify(exact.report.scanPages), JSON.stringify({ text: [], picture: [2, 3, 4], unread: [1] }), "exact：不分块");
 });
 
 await test("扫描页印成图的页码：按位数变化推出编号，写成页码域；两位数的数字粘成一块时按宽度算位数；推不出来时不写", async () => {

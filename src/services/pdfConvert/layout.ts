@@ -15,7 +15,7 @@ import { collectHyphenated, collectWords, isSoftHyphen, wordCounts } from "../..
 import { romanPage, settleFurniture, toRoman, type FrontMatter, type Furniture, type FurniturePick } from "./furniture.js";
 import { measureWord } from "./fonts.js";
 import { detectDropCaps, detectEquations, detectIconPaths, detectFigures, detectImageGrids, detectMaskInk, rawBase, rasterBox, removeInside, spansText, textHighlights, type Box, type MathCtx } from "./raster.js";
-import type { ScanPiece } from "./scanLayer.js";
+import type { ScanPiece, ScanTextBlock } from "./scanLayer.js";
 
 export interface Run {
   text: string;
@@ -84,7 +84,7 @@ export interface Para {
   /** 分隔线、竖线、色块等图形：页面绝对坐标，不参与文字流 */
   shapes?: Array<{ kind: "line" | "rect"; x0: number; y0: number; x1: number; y1: number; width: number; color: string; behind: boolean }>;
   /** 页眉页脚等：以页面绝对坐标定位的文本框（挂在页首锚点段落上，不参与文字流，不会被挤动） */
-  textBoxes?: Array<{ x: number; y: number; w: number; h: number; para: Para }>;
+  textBoxes?: Array<{ x: number; y: number; w: number; h: number; para: Para; /** 框里的文字按框宽折行、框随文字长高（没有文字层的页上的文字块） */ wrap?: boolean; /** 给调用方的框名（pdf2word-block 页.块） */ name?: string; /** 给调用方的说明（wp:docPr 的 descr：文字块的版面位置、行数、字号、行距的 JSON） */ descr?: string }>;
   /** 逐行一致模式：每一行的 run 范围、自然宽度与可用宽度，用于最终的"不折行"校验 */
   lineFits?: Array<{ start: number; end: number; natural: number; chars: number; avail: number }>;
   /** 独占一段的行内图片（行间公式、图）：随文字流移动，前后文字增减时不会与文字重叠 */
@@ -137,6 +137,11 @@ export interface SectionProps {
   restart?: boolean;
   /** 前置部分的第一节（前面有封面）：从下一页开始，按罗马数字从前置部分第一页印的数编起 */
   frontStart?: boolean;
+  /** 本节的纸张大小（与全文不同时：横向的附图页夹在纵向的页中间）；省略时用全文的 */
+  pageW?: number;
+  pageH?: number;
+  /** 本节从新的一页开始（纸张大小变了的节：分节符本身换页） */
+  newPage?: boolean;
 }
 
 /** 页眉 / 页脚（流式模式）：首页、奇数页（默认）、偶数页 */
@@ -156,7 +161,7 @@ export interface DocModel {
      * 扫描页的位图层（可编辑排版）：拆开的文字页、格线垫底 + 文字放进文本框的表单页（页码从 1 起）；作为行内图片插回的漏认字、
      * 没保留的页眉页脚块与零散墨迹的个数，换成页码文字的页数
      */
-    scan?: { textPages: number[]; formPages: number[]; blocks: number; inline: number; formWords: number; furniture: number; stray: number; pageNumbers: number; header: number };
+    scan?: { textPages: number[]; formPages: number[]; blocks: number; inline: number; formWords: number; furniture: number; stray: number; pageNumbers: number; header: number; blockPages?: number[]; textBlocks?: number };
   };
   /** 渲染为图片的区域中的文字（计入完整性校验） */
   rasterText: string;
@@ -2047,7 +2052,7 @@ function checkBoxes(pg: PageModel): Seg[] {
 }
 
 /** unread：没有文字层、看得出是成行文字的页（页序号，从 0 起）；它们的整页图在 Word 里标上 pdf2word-page N */
-export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; raster?: boolean; unread?: ReadonlySet<number> } = {}): DocModel {
+export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; raster?: boolean; unread?: ReadonlySet<number>; scanBlocks?: boolean } = {}): DocModel {
   // 识别渲染区域时会从页面中移除元素：在副本上进行，原始提取结果保持不变（用于完整性校验、失败时回退）
   // 识别时会从页面中移除元素、插入行内公式：总在副本上进行，失败回退时原始结果不受影响
   const pages = pages0.map((p) => ({ ...p }));
@@ -2073,7 +2078,7 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
 
   // 扫描页的位图层（见 scanLayer.ts）：可编辑排版下，文字画在位图上面的页不把整页位图垫在文字下面
   const scanPlan = flow ? planScanPages(pages) : new Map<PageModel, ScanPlan>();
-  const scanStats = { textPages: [] as number[], formPages: [] as number[], blocks: 0, inline: 0, formWords: 0, furniture: 0, stray: 0, pageNumbers: 0, header: 0 };
+  const scanStats = { textPages: [] as number[], formPages: [] as number[], blocks: 0, inline: 0, formWords: 0, furniture: 0, stray: 0, pageNumbers: 0, header: 0, blockPages: [] as number[], textBlocks: 0 };
 
   // 全文共识的栏间距（与下面分栏时的共识同一做法：≥ 20% 的文字页测得出栏间距时取其中位数），释义清单检测用：
   // 本页自己测不出栏间距、却会按共识被切成两栏的释义页（LTB-07 第 7 页）
@@ -2093,6 +2098,17 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
     // 整页的扫描图 / 底图：作为页面背景单独处理，不参与图片、组图、版心的识别
     let bgs = pageBackgrounds(pg);
     if (bgs.length) { const b = new Set(bgs); pg.images = pg.images.filter((im) => !b.has(im)); }
+    // 没有文字层、看得出是成行文字的扫描页，可编辑排版下要求分块时（opts.scanBlocks）：整页图换成抹掉了字的底图
+    // （pdf2word-scan N，附图、条码、表格线留着），每块文字一个原位文本框，框里先放这块的原图（pdf2word-text N.K），
+    // 调用方识别后换成文字，翻译后文字仍在原来的位置
+    const blocks = flow && opts.scanBlocks && opts.unread?.has(pg.index) && pg.scan?.textBlocks?.blocks.length ? pg.scan.textBlocks : undefined;
+    if (blocks && bgs.includes(pg.scan!.image)) {
+      const whole = pg.scan!.image;
+      const bg: ImageBox = { ...whole, png: blocks.background, role: "scan", pageNo: pg.index + 1 };
+      scanStats.blockPages.push(pg.index + 1);
+      scanStats.textBlocks += blocks.blocks.length;
+      return { pg, tables: [], free: [], rules: [], figures: [], frames: [], bgs: bgs.map((im) => (im === whole ? bg : im)), formLines: undefined as Line[] | undefined, scanBlocks: blocks.blocks.map((b, k) => scanBlockBox(b, pg.index + 1, k + 1)) };
+    }
     // 没有文字层、看得出是成行文字的扫描页：整页图标上页码，调用方识别出文字后可以替换
     if (opts.unread?.has(pg.index)) for (const im of bgs) { im.role = "page"; im.pageNo = pg.index + 1; }
     const plan = scanPlan.get(pg);
@@ -2132,7 +2148,7 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
           pg.spans = [...pg.spans, ...added];
           scanStats.formWords += added.length;
         }
-        return { pg, tables: [], free: [], rules: [], figures: [], frames: [], bgs: [bg], formLines: buildLines(pg.spans.filter((sp) => sp.text.trim())) };
+        return { pg, tables: [], free: [], rules: [], figures: [], frames: [], bgs: [bg], formLines: buildLines(pg.spans.filter((sp) => sp.text.trim())), scanBlocks: undefined as NonNullable<Para["textBoxes"]> | undefined };
       } else {
         scanStats.textPages.push(pg.index + 1);
         const real = pg.spans.filter((sp) => sp.text.trim());
@@ -2237,7 +2253,7 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
     // 删除线 / 下划线也标在表格单元格里的文字上（2026-11-26 LTB-03 附件一：表内整行删除线丢失，原来只看表格外的文字）；
     // 没对上任何文字的线照旧
     const rules = applyTextDecorations(pg.spans, pg.segs, used);
-    return { pg, tables, free, rules, figures, frames, bgs, formLines: undefined as Line[] | undefined };
+    return { pg, tables, free, rules, figures, frames, bgs, formLines: undefined as Line[] | undefined, scanBlocks: undefined as NonNullable<Para["textBoxes"]> | undefined };
   });
 
   // 版心：全部页面的内容边界
@@ -2286,7 +2302,8 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
     freshPage = false;
     if (!force && sectKey(next) === sectKey(curSection)) return 0;
     blocks.push(tinyPara({ sectionEnd: curSection }));
-    curSection = { ...next, titlePg: flow && curPage === 0, ...(front && curPage >= front.first && curPage <= front.last ? { front: true } : {}) };
+    // 分栏节沿用本页的纸张大小（横向页面上的分栏仍是横向）；它接着上一节排，不另起一页
+    curSection = { ...next, pageW: curSection.pageW, pageH: curSection.pageH, titlePg: flow && curPage === 0, ...(front && curPage >= front.first && curPage <= front.last ? { front: true } : {}) };
     return TINY;
   };
 
@@ -2590,7 +2607,20 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
     // 页顶的窄条（公开号、条码）落在正文区域里的扫描页：同样从新的一页开始，窄条才在页顶（见 ScanPlan.topStrip）。
     // 落在页眉区域的（其他页的正文都排在它下面）写进这一页的页眉，不占正文，不必换页
     const stripBreak = flow && pi > 0 && [...(scanPlan.get(pg)?.topStrip ?? [])].some((im) => !inMarginZone(im.y0, im.y1));
-    const anchor = tinyPara({ pageBreakBefore: !frontStart && !bodyStart && ((!flow && pi > 0) || brokeEarly(pi) || bgBreak || stripBreak), images: [...bgs, ...pg.images.filter((im) => im.behind)], textBoxes: [], shapes });
+    // 可编辑排版：纸张大小与全文不同的整页图页（横向的附图页夹在纵向的页中间）单独成节，用自己的纸张；
+    // 回到全文纸张的下一页同样另起一节。分节符本身换页，不再另加分页
+    let sized = false;
+    if (flow && pi > 0 && !frontStart && !bodyStart) {
+      const own = bgs.length > 0 && Math.abs(pg.width - pageW) + Math.abs(pg.height - pageH) > 0.05 * (pageW + pageH);
+      const want = own ? `${pg.width}x${pg.height}` : "";
+      const have = curSection.pageW !== undefined ? `${curSection.pageW}x${curSection.pageH}` : "";
+      if (want !== have) {
+        blocks.push(tinyPara({ sectionEnd: { ...curSection } }));
+        curSection = { ...curSection, pageW: own ? pg.width : undefined, pageH: own ? pg.height : undefined, newPage: true, titlePg: false, restart: undefined, frontStart: undefined };
+        sized = true;
+      }
+    }
+    const anchor = tinyPara({ pageBreakBefore: !frontStart && !bodyStart && !sized && ((!flow && pi > 0) || brokeEarly(pi) || bgBreak || stripBreak), images: [...bgs, ...pg.images.filter((im) => im.behind)], textBoxes: [], shapes });
     freshPage = true;
     const anchorAt = blocks.length;
     blocks.push(anchor);
@@ -2604,6 +2634,8 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
     ctx.boxes = flow ? undefined : anchor.textBoxes;
     // 表单页：每行文字一个按原位置定位的文本框，压在垫底的格线图上
     for (const l of pre[pi].formLines ?? []) anchor.textBoxes!.push(...lineBoxes(l, ctx));
+    // 没有文字层的文字页：每块文字一个按原位置定位的文本框，压在抹掉了字的底图上
+    for (const tb of pre[pi].scanBlocks ?? []) anchor.textBoxes!.push(tb);
 
     // 条目：行 / 表格 / 分隔线 / 图片，按纵向位置排序后切成"通栏带"与"分栏带"
     type Item = PageItem;
@@ -3079,7 +3111,7 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
     bodyFont, bodySize,
     stats: {
       ...stats, images: stats.images + iconCount, figures: figureCount, equations: equationCount, inlineMath: inlineMathCount,
-      ...(scanStats.textPages.length || scanStats.formPages.length ? { scan: scanStats } : {}),
+      ...(scanStats.textPages.length || scanStats.formPages.length || scanStats.blockPages.length ? { scan: scanStats } : {}),
     },
     rasterText: rasterText.join("\n"),
     mode: ctx.mode,
@@ -3405,6 +3437,23 @@ function collectParas(blocks: Block[]): Para[] {
     else for (const r of b.rows) for (const c of r.cells) out.push(...c.blocks);
   }
   return out;
+}
+
+/**
+ * 没有文字层的文字页上的一块文字（ScanTextBlock）：按原位置定位的文本框，框里一段，段里先放这块的原图（pdf2word-text 页.块，
+ * 带上估计的字体、字号）。调用方把它识别成文字、换成文字 run 时沿用这些格式；段落的行距是原文的行距（图在时按"最小值"，
+ * 不裁图），两端对齐与否按原文。框按框宽折行、随文字长高，译文比原文长时不会被裁掉
+ */
+function scanBlockBox(b: ScanTextBlock, page: number, no: number): NonNullable<Para["textBoxes"]>[number] {
+  const img: ImageBox = { x0: b.x0, y0: b.y0, x1: b.x1, y1: b.y1, png: b.png, pxW: b.pxW, pxH: b.pxH, role: "text", pageNo: page, blockNo: no };
+  const run: Run = { text: "\uFFFC", font: "Times New Roman", size: b.size, bold: false, italic: false, color: "000000", img };
+  // 单行块：行距不超过块本身的高度。行比图高时图落在基线上、整块往下沉（页眉、表格里的数值下沉 2.5–6 pt）；
+  // 多行块的图比行距高得多，行高就是图高，不受影响
+  const lineHeight = b.lines > 1 ? b.pitch : Math.min(b.pitch, b.y1 - b.y0);
+  const para: Para = { kind: "p", runs: [run], align: b.align, indLeft: 0, indRight: 0, firstLine: 0, spaceBefore: 0, lineHeight, tabs: [], size: b.size };
+  // 调用方回填译文、接续跨栏的段落时要用的版面信息（见 cli/pdf2word.ts 的契约）
+  const descr = JSON.stringify({ col: b.col, band: b.band, ...(b.furniture ? { furniture: true } : {}), lines: b.lines, size: b.size, pitch: Math.round(b.pitch * 100) / 100, align: b.align });
+  return { x: b.x0, y: b.y0, w: b.x1 - b.x0, h: b.y1 - b.y0, para, wrap: true, name: `pdf2word-block ${page}.${no}`, descr };
 }
 
 const TINY = 1;
