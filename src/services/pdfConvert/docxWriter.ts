@@ -315,7 +315,7 @@ class Writer {
       `<w:tblLayout w:type="fixed"/><w:tblCellMar><w:top w:w="0" w:type="dxa"/><w:left w:w="57" w:type="dxa"/><w:bottom w:w="0" w:type="dxa"/><w:right w:w="57" w:type="dxa"/></w:tblCellMar>` +
       `<w:tblLook w:val="0000" w:firstRow="0" w:lastRow="0" w:firstColumn="0" w:lastColumn="0" w:noHBand="1" w:noVBand="1"/></w:tblPr>`;
     const grid = `<w:tblGrid>${t.colWidths.map((w) => `<w:gridCol w:w="${tw(w)}"/>`).join("")}</w:tblGrid>`;
-    const rows = t.rows.map((r) => `<w:tr><w:trPr><w:cantSplit/><w:trHeight w:val="${tw(r.height)}" w:hRule="${t.exactRows ? "exact" : "atLeast"}"/></w:trPr>${r.cells.map((c) => this.cell(c)).join("")}</w:tr>`).join("");
+    const rows = t.rows.map((r) => `<w:tr><w:trPr>${r.split ? "" : "<w:cantSplit/>"}<w:trHeight w:val="${tw(r.height)}" w:hRule="${t.exactRows ? "exact" : "atLeast"}"/></w:trPr>${r.cells.map((c) => this.cell(c)).join("")}</w:tr>`).join("");
     return `<w:tbl>${tblPr}${grid}${rows}</w:tbl>`;
   }
 

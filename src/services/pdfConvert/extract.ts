@@ -997,7 +997,7 @@ async function extractPage(page: any, index: number, OPS: any, Util: any): Promi
       });
     }
   }
-  model.spans = mergeLetterSpaced(model.spans);
+  model.spans = mergeOverprinted(mergeLetterSpaced(model.spans));
   // 裁剪框（CropBox）之外的东西看不见：整个落在页面外的文字、图片、线条、色块不转换。
   // 视口已按裁剪框换算，页面就是 [0, 宽] × [0, 高]；以前它们按负坐标排进版面，把页面上的内容整块往下挤，一页变三页
   {
@@ -1020,6 +1020,38 @@ async function extractPage(page: any, index: number, OPS: any, Util: any): Promi
     if (split) model.scan = { ...split, image: scanned.image };
   }
   return model;
+}
+
+/**
+ * 叠印加粗：同一段文字在几乎同一位置画了好几遍（每遍错开零点几磅，没有粗体字形的字体常这样"加粗"）。
+ * 只留最后画的一份（最上面那层的颜色），记为粗体。以前每一遍都是一段独立的文字：逐页保留时叠在一起看不出来，
+ * 可编辑排版的格子里同一个词排成四遍（韩文保险条款的表头"구분 구분 구분 구분"），整行撑高，表格挤到下一页
+ */
+function mergeOverprinted(spans: Span[]): Span[] {
+  const byText = new Map<string, number[]>();
+  spans.forEach((s, i) => {
+    if (!s.text.trim() || s.img) return;
+    const k = `${s.text}|${s.size}`;
+    const list = byText.get(k);
+    if (list) list.push(i); else byText.set(k, [i]);
+  });
+  const drop = new Set<number>();
+  for (const list of byText.values()) {
+    if (list.length < 2) continue;
+    for (let a = 0; a < list.length; a++) {
+      if (drop.has(list[a])) continue;
+      const s = spans[list[a]], tol = Math.min(0.8, 0.1 * s.size);
+      for (let b = a + 1; b < list.length; b++) {
+        const t = spans[list[b]];
+        if (drop.has(list[b]) || Math.abs(t.x0 - s.x0) > tol || Math.abs(t.baseline - s.baseline) > tol) continue;
+        // 后画的盖住先画的：留后画的那份
+        drop.add(list[a]);
+        t.bold = true;
+        break;
+      }
+    }
+  }
+  return drop.size ? spans.filter((_, i) => !drop.has(i)) : spans;
 }
 
 /**

@@ -688,6 +688,36 @@ await test("只有一行大字的绘本式幻灯片：默认字号不超过 14pt
   }
 });
 
+await test("叠印加粗（同一段文字在几乎同一位置画了四遍）只留一份、记为粗体（两种模式）", async () => {
+  const { pdfToDocx } = await import("../src/services/pdfConvert/index.js");
+  const pdf = await fixture("overprint.pdf");
+  const textOf = (x: string) => (x.match(/<w:t[^>]*>([^<]*)<\/w:t>/g) ?? []).map((t) => t.replace(/<[^>]+>/g, "")).join("");
+  for (const mode of ["exact", "flow"] as const) {
+    const { data, report } = await pdfToDocx(pdf, { mode });
+    eq(report.textCoverage, 1, `${mode}：文字完整性`);
+    const xml = new ZipPackage(data).readText("word/document.xml");
+    const text = textOf(xml);
+    for (const w of ["Insurance plan summary", "Plan", "Term", "Entry age"]) eq(text.split(w).length - 1, 1, `${mode}："${w}"只出现一次`);
+    const run = xml.slice(xml.lastIndexOf("<w:r>", xml.indexOf(">Entry age<")), xml.indexOf(">Entry age<"));
+    assert(run.includes("<w:b/>"), `${mode}：叠印的表头记为粗体`);
+  }
+});
+
+await test("密排表格（选区公报）：格子里贴着右框线的票数不折行（可编辑排版的段落右缩进为负）；很高的行允许跨页，不整行挤到下一页", async () => {
+  const { pdfToDocx } = await import("../src/services/pdfConvert/index.js");
+  const pdf = await fixture("dense-cells.pdf");
+  const { data } = await pdfToDocx(pdf, { mode: "flow" });
+  const xml = new ZipPackage(data).readText("word/document.xml");
+  const rows = xml.match(/<w:tr>[\s\S]*?<\/w:tr>/g) ?? [];
+  eq(rows.length, 3, "flow：表头两行 + 一行三栏");
+  const [head = "", , tall = ""] = rows;
+  assert(head.includes("<w:cantSplit/>") && !tall.includes("<w:cantSplit/>"), "flow：只有很高的那一行允许跨页");
+  // 每个"候选人⇥党派⇥票数"段落的右缩进为负，票数这一行放得下
+  const paras = (tall.match(/<w:p\b[^>]*>[\s\S]*?<\/w:p>/g) ?? []).filter((p) => /SMITH/.test(p));
+  eq(paras.length, 120, "flow：三栏共 120 行候选人");
+  assert(paras.every((p) => /<w:ind [^>]*w:right="-\d+"/.test(p)), "flow：候选人段落的右缩进为负");
+});
+
 await test("竖排文字与表格：伸出表格、穿过格线的竖排标签不放进哪一格；三线表里跨几行的竖排文字所在的一行加高、它伸进的几行相应收矮；竖排格里的位置用空段还原（两种模式）", async () => {
   const { pdfToDocx } = await import("../src/services/pdfConvert/index.js");
   const pdf = await fixture("rotated-table.pdf");
@@ -1451,7 +1481,7 @@ await test("所有夹具 PDF：两种排版方式都不报错、文字完整；L
   const run = promisify(execFile);
   const soffice = process.env.SOFFICE_PATH || "soffice";
   const hasSoffice = await run(soffice, ["--version"]).then(() => true, () => false);
-  const names = ["columns", "journal", "figures", "math", "journal-front", "journal-eq", "journal-fig", "bios", "colstart", "signature", "citecolor", "texpaper", "contract-cn", "scan-letter", "furniture-cn", "bates", "rotated-text", "mixed-pages", "image-slides", "open-table", "color-blocks", "form-boxes", "image-rows", "logo-corner"];
+  const names = ["columns", "journal", "figures", "math", "journal-front", "journal-eq", "journal-fig", "bios", "colstart", "signature", "citecolor", "texpaper", "contract-cn", "scan-letter", "furniture-cn", "bates", "rotated-text", "mixed-pages", "image-slides", "open-table", "color-blocks", "form-boxes", "image-rows", "logo-corner", "overprint", "dense-cells"];
   const dir = await fs.mkdtemp(path.join(tmp, "pages-"));
   const bad: string[] = [];
   for (const name of names) {

@@ -132,7 +132,8 @@ export interface Table {
   exactRows?: boolean;
   indent: number;
   colWidths: number[];
-  rows: Array<{ height: number; cells: Cell[] }>;
+  /** split：可编辑排版里很高的行（一格装着一整栏文字）允许跨页，否则整行挤到下一页、上一页只剩表头 */
+  rows: Array<{ height: number; cells: Cell[]; split?: boolean }>;
   /** 浮动表格（页面绝对坐标，pt）：旁边并排有文字时使用，不占文字流 */
   float?: { x: number; y: number };
 }
@@ -1241,6 +1242,8 @@ interface Ctx {
   pins?: ImageBox[];
   /** 逐行一致模式：文字流能排到的最低处（页高减下边距）；伸到这下面的图排进文字流会被挤到下一页 */
   flowBottom?: number;
+  /** 页高（pt）：可编辑排版里高过页面四分之一的表格行允许跨页 */
+  pageH?: number;
 }
 
 const pitchKey = (size: number) => Math.round(size * 2) / 2;
@@ -1335,6 +1338,12 @@ function buildPara(lines: Line[], r: Region, blockEdge: number, ctx: Ctx): Para 
   }
   // 逐行一致模式：行尾已由换行符固定，左对齐段落向右留出越界余量不会改变排版，只会防止因字宽差异导致的意外折行
   if (ctx.mode === "exact" && align === "left" && r.overhang && indRight === 0) indRight = -r.overhang;
+  // 可编辑排版：行尾伸进右侧余量的左对齐段落（格子里贴着右框线的票数、伸进页边距的长行），右缩进为负，这一行原样放得下。
+  // 选区公报的格子里"候选人⇥党派⇥票数"，票数离右框线只有 2pt、比单元格边距还近：每个票数都折到下一行，整格高出一倍
+  if (ctx.mode === "flow" && align === "left" && r.overhang && indRight <= 0) {
+    const over = Math.max(...lines.map((l) => l.x1)) - r.x1;
+    if (over > 0) indRight = Math.min(indRight, Math.max(-r.overhang, -over - 0.5));
+  }
   // 悬挂缩进的条款（"1.2⇥正文…"，续行与正文对齐）：编号后写制表符，由悬挂缩进的位置对齐，
   // 不另设制表位（另设制表位的段落跨页时不能与下一页的续段合并）；改写编号、正文后对齐也不会乱
   const hangTab = (align === "left" || align === "both") && labelLead(first, 0.1 * size) && firstLine < -0.5 &&
@@ -1973,7 +1982,8 @@ function buildTable(t: TableDraft, fills: FillRect[], originX: number, ctx: Ctx)
       cells.push(cell);
       cellInfo.push({ cell, box, r });
     }
-    rows.push({ height: Math.max(ys[r + 1] - ys[r], rowNeed), cells });
+    const height = Math.max(ys[r + 1] - ys[r], rowNeed);
+    rows.push({ height, cells, ...(ctx.mode === "flow" && height > 0.25 * (ctx.pageH ?? 792) ? { split: true } : {}) });
     if (rowNeed > ys[r + 1] - ys[r] && !ctx.boxes) stretched.push({ r, top: textTop, bottom: textBottom });
   }
   // 竖排文字跨了几行（无框表格按文字行切表，把原文跨几行的合并格切开了）：竖排文字所在的那一行按文字的长度加高，
@@ -2354,7 +2364,7 @@ function buildDocModelGroup(pages0: PageModel[], opts: BuildOpts = {}): DocModel
   if (docBg) for (const pg of pages) pg.fills = pg.fills.filter((f) => !(f.color === docBg && isFull(f, pg)));
   const pageFill = pages.map(fullOf);
   const allText = pages0.map((p) => p.spans.map((s) => s.text).join(" ")).join("\n");
-  const ctx: Ctx = { mode: opts.mode ?? "exact", spacing: new Map(), words: collectWords(allText), hyphenated: new Set(), counts: wordCounts(allText), softHyphens: 0 };
+  const ctx: Ctx = { mode: opts.mode ?? "exact", spacing: new Map(), words: collectWords(allText), hyphenated: new Set(), counts: wordCounts(allText), softHyphens: 0, pageH: pages[0]?.height };
   // 行尾断开的写法不算"本身带连字符"：只收集行中间出现的
   ctx.hyphenated = collectHyphenated(pages0.map((p) => p.spans.map((s) => s.text.replace(/[A-Za-z]+-\s*$/, "")).join(" ")).join("\n"));
   const flow = ctx.mode === "flow";
