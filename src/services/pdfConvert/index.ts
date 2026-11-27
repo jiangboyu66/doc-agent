@@ -151,7 +151,7 @@ async function runBuiltin(buf: Buffer, title: string, pages: PageModel[], mode: 
     notes.push(`${model.stats.rotatedText} 行旋转文字（竖排表头、页边竖排说明、斜放的水印 / 印章等）已转换：表格里的竖排表头写成竖排单元格，其余放在按原方向摆放的文本框里` +
       (slanted ? `；其中 ${slanted} 行是斜放的，Word / WPS 里按原角度显示，LibreOffice 里显示为横排` : "") + "。");
   }
-  if (model.stats.columnPages) notes.push(`${model.stats.columnPages} 页检测到双栏排版，已用 Word 分栏还原。`);
+  if (model.stats.columnPages) notes.push(`${model.stats.columnPages} 页检测到分栏排版（两栏或三栏），已用 Word 分栏还原。`);
   if (model.notes) notes.push(...model.notes);
   return { data, stats: model.stats, notes, rasterText: model.rasterText };
 }

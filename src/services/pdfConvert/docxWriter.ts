@@ -225,7 +225,7 @@ class Writer {
     const pgNum = first && m.pageNumStart !== undefined ? `<w:pgNumType w:start="${Math.max(0, m.pageNumStart)}"/>` : "";
     const titlePg = s.titlePg && this.hfParts.some((h) => h.type === "first") ? "<w:titlePg/>" : "";
     const cols = s.cols > 1
-      ? `<w:cols w:num="${s.cols}" w:space="${tw(s.colGap)}" w:equalWidth="0">${s.colWidths.map((w, i) => `<w:col w:w="${tw(w)}"${i < s.colWidths.length - 1 ? ` w:space="${tw(s.colGap)}"` : ""}/>`).join("")}</w:cols>`
+      ? `<w:cols w:num="${s.cols}" w:space="${tw(s.colGap)}" w:equalWidth="0">${s.colWidths.map((w, i) => `<w:col w:w="${tw(w)}"${i < s.colWidths.length - 1 ? ` w:space="${tw(s.colGaps?.[i] ?? s.colGap)}"` : ""}/>`).join("")}</w:cols>`
       : '<w:cols w:space="425"/>';
     return (
       `<w:sectPr>${refs}${continuous ? '<w:type w:val="continuous"/>' : ""}` +

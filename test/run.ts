@@ -722,6 +722,23 @@ await test("带透明边的图（Office 图表导出）按不透明的部分裁�
   }
 });
 
+await test("三栏正文：写成三栏的分节，各栏按阅读顺序（第一栏 → 第二栏 → 第三栏），不把两栏的行配成一行（两种模式）", async () => {
+  const { pdfToDocx } = await import("../src/services/pdfConvert/index.js");
+  const pdf = await fixture("three-columns.pdf");
+  const textOf = (x: string) => (x.match(/<w:t[^>]*>([^<]*)<\/w:t>/g) ?? []).map((t) => t.replace(/<[^>]+>/g, "")).join("");
+  for (const mode of ["exact", "flow"] as const) {
+    const { data, report } = await pdfToDocx(pdf, { mode });
+    eq(report.textCoverage, 1, `${mode}：文字完整性`);
+    const xml = new ZipPackage(data).readText("word/document.xml");
+    assert(/<w:cols w:num="3"/.test(xml), `${mode}：应有三栏的分节`);
+    const text = textOf(xml);
+    const at = [1, 2].flatMap((p) => ["One", "Two", "Three"].map((n) => text.indexOf(`Column ${n} of page ${p} begins here.`)));
+    assert(!at.includes(-1) && at.every((v, i) => i === 0 || v > at[i - 1]), `${mode}：各栏的开头按阅读顺序出现：${at.join(", ")}`);
+    // 逐页保留：一段里不会同时有两栏的开头（左右两栏的行没有被配成一行）。可编辑排版会把被分栏切断的段落接起来，不在此列
+    if (mode === "exact") for (const p of xml.match(/<w:p\b[^>]*>[\s\S]*?<\/w:p>/g) ?? []) assert((textOf(p).match(/Column \w+ of page/g) ?? []).length <= 1, `${mode}：两栏的行被并进了同一段`);
+  }
+});
+
 await test("叠印加粗（同一段文字在几乎同一位置画了四遍）只留一份、记为粗体（两种模式）", async () => {
   const { pdfToDocx } = await import("../src/services/pdfConvert/index.js");
   const pdf = await fixture("overprint.pdf");
@@ -1515,7 +1532,7 @@ await test("所有夹具 PDF：两种排版方式都不报错、文字完整；L
   const run = promisify(execFile);
   const soffice = process.env.SOFFICE_PATH || "soffice";
   const hasSoffice = await run(soffice, ["--version"]).then(() => true, () => false);
-  const names = ["columns", "journal", "figures", "math", "journal-front", "journal-eq", "journal-fig", "bios", "colstart", "signature", "citecolor", "texpaper", "contract-cn", "scan-letter", "furniture-cn", "bates", "rotated-text", "mixed-pages", "image-slides", "open-table", "color-blocks", "form-boxes", "image-rows", "logo-corner", "overprint", "dense-cells", "rtl-list", "transparent-figure"];
+  const names = ["columns", "journal", "figures", "math", "journal-front", "journal-eq", "journal-fig", "bios", "colstart", "signature", "citecolor", "texpaper", "contract-cn", "scan-letter", "furniture-cn", "bates", "rotated-text", "mixed-pages", "image-slides", "open-table", "color-blocks", "form-boxes", "image-rows", "logo-corner", "overprint", "dense-cells", "rtl-list", "transparent-figure", "three-columns"];
   const dir = await fs.mkdtemp(path.join(tmp, "pages-"));
   const bad: string[] = [];
   for (const name of names) {

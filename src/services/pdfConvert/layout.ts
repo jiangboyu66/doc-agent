@@ -5,7 +5,7 @@
  *   - 表格：由边框线段构成的网格还原（含合并单元格、每条边框的有无/粗细/颜色、底纹、垂直对齐）；
  *   - 段落：按基线聚成行、按行距/缩进/是否折行聚成段，推断对齐方式、首行/悬挂缩进、制表位；
  *   - 位置：每段采用"固定行距 = PDF 实测行距"，段前距 = 与上一块的实测间距，使每一行的基线都落在原位置；
- *   - 分栏：检测贯穿版心的空白栏间距，用连续分节 + 分栏还原双栏排版；
+ *   - 分栏：检测贯穿版心的空白栏间距（两栏一条、三栏两条），用连续分节 + 分栏还原；
  *   - 图片：以页面绝对坐标浮动定位（不参与文字流），位置与原 PDF 一致；
  *   - 每一页以分页开始，页与页之间不会互相推挤。
  */
@@ -146,6 +146,8 @@ export type Block = Para | Table;
 
 export interface SectionProps {
   cols: number; colWidths: number[]; colGap: number;
+  /** 三栏以上、各栏间距不同时：每两栏之间的间距（pt）；不写时都用 colGap */
+  colGaps?: number[];
   /** 本节从第一页开始（流式模式）：首页使用"首页"页眉页脚 */
   titlePg?: boolean;
   /** 本节的纸张大小与页边距（原 PDF 中页面尺寸 / 方向不同的那几页）；不写时用文档的 */
@@ -2102,7 +2104,7 @@ function applyTextDecorations(spans: Span[], segs: Seg[], used: Set<Seg>): HSeg[
 // 分栏检测
 // ---------------------------------------------------------------------------
 
-type LineSide = "cross" | "two" | "L" | "R";
+type LineSide = "cross" | "two" | "L" | "M" | "R";
 
 function classify(l: Line, x: number): LineSide {
   if (l.spans.some((s) => s.x0 < x - 1 && s.x1 > x + 1)) return "cross";
@@ -2609,7 +2611,7 @@ function buildDocModelGroup(pages0: PageModel[], opts: BuildOpts = {}): DocModel
   const stats = { pages: pages.length, paragraphs: 0, tables: 0, images: 0, vectorShapes: 0, rotatedText: 0, rotatedSlanted: 0, columnPages: 0, figures: 0, equations: 0 };
   let curSection: SectionProps = { cols: 1, colWidths: [right - left], colGap: 0, titlePg: flow };
   let curPage = 0;
-  const sectKey = (x: SectionProps) => JSON.stringify([x.cols, x.colWidths, x.colGap]);
+  const sectKey = (x: SectionProps) => JSON.stringify([x.cols, x.colWidths, x.colGap, x.colGaps ?? null]);
 
   // 分节：以一个极小段落承载上一节的属性；返回占用的高度，计入纵向位置
   let freshPage = false;
@@ -2791,6 +2793,24 @@ function buildDocModelGroup(pages0: PageModel[], opts: BuildOpts = {}): DocModel
   const bodyBottom = allBody.length ? Math.max(...allBody.map((l) => l.bottom)) : pageH;
   const inMarginZone = (y0: number, y1: number) => y1 <= bodyTop + 1 || y0 >= bodyBottom - 1;
 
+  // 三栏：主栏间距的某一侧里还能再找到一条栏间距、三栏宽度相近（联邦公报、杂志）。以前只找一条栏间距，
+  // 三栏的页被当成两栏：其中一"栏"里并排着两栏的文字，左右两栏的行被配成一行，交错重叠、挤成细条，页数翻倍
+  const gutters2 = pageLines.map((ls, i) => {
+    const g = gutters[i];
+    if (!g) return null;
+    const keep = ls.filter((l) => classify(l, g.x) !== "cross");
+    const sideLines = (onLeft: boolean) => buildLines(keep.flatMap((l) => l.spans.filter((sp) => ((sp.x0 + sp.x1) / 2 < g.x) === onLeft)));
+    const W = right - left;
+    const balanced = (ws: number[]) => ws.every((w) => w >= 0.18 * W) && Math.max(...ws) <= 1.6 * Math.min(...ws);
+    const R = sideLines(false);
+    const subR = R.length >= 8 ? detectGutter(R, { x0: g.g1, x1: right }) : null;
+    if (subR && balanced([g.g0 - left, subR.g0 - g.g1, right - subR.g1])) return subR;
+    const L = sideLines(true);
+    const subL = L.length >= 8 ? detectGutter(L, { x0: left, x1: g.g0 }) : null;
+    if (subL && balanced([subL.g0 - left, g.g0 - subL.g1, right - g.g1])) return subL;
+    return null;
+  });
+
   // 流式模式：上下边距按正文（不含页眉页脚）计算，页眉页脚写进真正的页眉页脚部件
   let mTop = marginTop, mBottom = marginBottom;
   let headerDist: number | undefined, footerDist: number | undefined;
@@ -2866,6 +2886,33 @@ function buildDocModelGroup(pages0: PageModel[], opts: BuildOpts = {}): DocModel
 
     const lines = pageLines[pi];
     const gutter = gutters[pi];
+    // 栏间距从左到右：两栏一条，三栏两条（中间一栏记作 M）
+    const gx = gutter ? [gutter, ...(gutters2[pi] ? [gutters2[pi]!] : [])].sort((a, b) => a.x - b.x) : [];
+    const tri = gx.length === 2;
+    type Side = "full" | "L" | "M" | "R";
+    const sideAtX = (x: number): "L" | "M" | "R" => (x < gx[0].x ? "L" : tri && x < gx[1].x ? "M" : "R");
+    /** 行的类型：跨栏 / 跨两栏以上都有字 / 只在某一栏 */
+    const classifyCols = (l: Line): LineSide => {
+      if (!tri) return classify(l, gutter!.x);
+      if (gx.some((g) => l.spans.some((sp) => sp.x0 < g.x - 1 && sp.x1 > g.x + 1))) return "cross";
+      const by = new Map<"L" | "M" | "R", Span[]>();
+      for (const sp of l.spans) { const k = sideAtX((sp.x0 + sp.x1) / 2); by.set(k, [...(by.get(k) ?? []), sp]); }
+      if (by.size === 1) return [...by.keys()][0];
+      const order = (["L", "M", "R"] as const).filter((k) => by.has(k));
+      for (let k = 1; k < order.length; k++) {
+        const gap = Math.min(...by.get(order[k])!.map((sp) => sp.x0)) - Math.max(...by.get(order[k - 1])!.map((sp) => sp.x1));
+        if (gap < 0.8 * l.size) return "cross";
+      }
+      return "two";
+    };
+    /** 完全落在某一栏里的东西归入那一栏，否则通栏 */
+    const colOf = (x0: number, x1: number): Side => {
+      if (!gx.length) return "full";
+      if (x1 <= gx[0].x + 2) return "L";
+      if (tri && x0 >= gx[0].x - 2 && x1 <= gx[1].x + 2) return "M";
+      if (x0 >= gx[gx.length - 1].x - 2) return "R";
+      return "full";
+    };
 
     // 页首锚点段落：承载本页的浮动图片与页眉页脚文本框，并负责分页（逐页一致模式）
     // 表格之外的线条与色块：作为绝对定位的图形放在页首锚点段落上（不占文字流，位置与原文完全一致）
@@ -2971,7 +3018,7 @@ function buildDocModelGroup(pages0: PageModel[], opts: BuildOpts = {}): DocModel
     type Item = PageItem;
     const items: Array<Item & { top: number }> = [];
     // 行的类型：跨栏 / 两侧 / 仅左 / 仅右；连续的非跨栏行里至少有 2 行"两侧"才算分栏带
-    const kinds = lines.map((l) => (gutter ? classify(l, gutter.x) : "cross"));
+    const kinds = lines.map((l) => (gutter ? classifyCols(l) : "cross"));
     // 通栏段落的末行（图题、摘要的最后一行很短，只落在左半边）：与上一行行距相同、左端对齐或同样居中 → 仍属通栏
     for (let i = 1; i < lines.length; i++) {
       if (kinds[i] === "cross" || kinds[i] === "two" || kinds[i - 1] !== "cross") continue;
@@ -2987,7 +3034,7 @@ function buildDocModelGroup(pages0: PageModel[], opts: BuildOpts = {}): DocModel
     // 通栏的标题、摘要末行等短行不会被误切进分栏节里，段落也不会被拆散。
     const colLine = new Array(lines.length).fill(false);
     if (gutter) {
-      const atColEdge = (l: Line, k: LineSide) => (k === "L" ? Math.abs(l.x1 - gutter.g0) <= 2 : k === "R" ? Math.abs(l.x1 - right) <= 2 : false);
+      const atColEdge = (l: Line, k: LineSide) => (k === "L" ? Math.abs(l.x1 - gx[0].g0) <= 2 : k === "M" ? Math.abs(l.x1 - gx[1].g0) <= 2 : k === "R" ? Math.abs(l.x1 - right) <= 2 : false);
       for (let i = 0; i < lines.length; ) {
         if (kinds[i] === "cross") { i++; continue; }
         let j = i + 1;
@@ -2995,13 +3042,13 @@ function buildDocModelGroup(pages0: PageModel[], opts: BuildOpts = {}): DocModel
         const seg = lines.slice(i, j), ks = kinds.slice(i, j);
         const two = ks.filter((k) => k === "two").length;
         const edge = seg.filter((l, k) => atColEdge(l, ks[k])).length;
-        const both = ks.filter((k) => k === "L").length >= 2 && ks.filter((k) => k === "R").length >= 2;
+        const both = (["L", "M", "R"] as const).filter((sd) => ks.filter((k) => k === sd).length >= 2).length >= 2;
         // 只有一栏有文字、另一栏并排的是表格或图：同样属于分栏区域（例如左栏的表题紧挨右栏的表格）
         const segTop = Math.min(...seg.map((l) => l.top)), segBottom = Math.max(...seg.map((l) => l.bottom));
         // 或者紧挨着栏内的表格/图（两栏表题并排、表题与表格之间没有跨栏内容）
-        const onlySide = ks.every((k) => k === "L") ? "L" : ks.every((k) => k === "R") ? "R" : null;
+        const onlySide = ks.every((k) => k === "L") ? "L" : ks.every((k) => k === "R") ? "R" : ks.every((k) => k === "M") ? "M" : null;
         const facing = [...tables, ...figures, ...pg.images.filter((im) => !im.render)].some((t) => {
-          const side = t.x1 <= gutter.x + 2 ? "L" : t.x0 >= gutter.x - 2 ? "R" : "full";
+          const side = colOf(t.x0, t.x1);
           if (side === "full") return false;
           if (onlySide && side !== onlySide) return t.y0 < segBottom + 6 && t.y1 > segTop - 6;
           // 栏内图表紧挨着的题注（在图下方或表上方）：属于这一栏
@@ -3009,7 +3056,7 @@ function buildDocModelGroup(pages0: PageModel[], opts: BuildOpts = {}): DocModel
           return !onlySide && t.y0 < segBottom + 12 && t.y1 > segTop - 12;
         });
         // 只有一栏有文字、且像栏内正文（有接近整栏宽的行）：例如最后一页左栏剩下的几行
-        const colW = (gutter.g0 - left);
+        const colW = !tri ? gutter.g0 - left : onlySide === "M" ? gx[1].g0 - gx[0].g1 : onlySide === "R" ? right - gx[1].g1 : gx[0].g0 - left;
         const sideBody = !!onlySide && seg.length >= 3 && seg.every((l) => l.size <= mathCtx.bodySize * 1.15) &&
           seg.filter((l) => l.x1 - l.x0 > 0.85 * colW).length >= 2 && seg.every((l) => l.x1 - l.x0 < 1.05 * colW);
         if (two >= 2 || edge >= 2 || both || facing || sideBody) for (let k = i; k < j; k++) colLine[k] = true;
@@ -3017,35 +3064,35 @@ function buildDocModelGroup(pages0: PageModel[], opts: BuildOpts = {}): DocModel
       }
     }
     // 分栏行：把每一栏的文字片段收集起来，在栏内重新成行（整页成行时，左右栏基线相近的片段可能被错误地配对）
-    const leftSpans: Span[] = [], rightSpans: Span[] = [];
+    const colSpans = { L: [] as Span[], M: [] as Span[], R: [] as Span[] };
     lines.forEach((l, i) => {
       if (!gutter || !colLine[i]) { items.push({ kind: "line", line: l, side: "full", top: l.top }); return; }
-      for (const sp of l.spans) ((sp.x0 + sp.x1) / 2 < gutter.x ? leftSpans : rightSpans).push(sp);
+      for (const sp of l.spans) colSpans[sideAtX((sp.x0 + sp.x1) / 2)].push(sp);
     });
-    for (const l of buildLines(leftSpans)) items.push({ kind: "line", line: l, side: "L", top: l.top });
-    for (const l of buildLines(rightSpans)) items.push({ kind: "line", line: l, side: "R", top: l.top });
+    for (const sd of ["L", "M", "R"] as const) for (const l of buildLines(colSpans[sd])) items.push({ kind: "line", line: l, side: sd, top: l.top });
     // 表格、分隔线、图片：完全落在某一栏内的归入该栏，否则为通栏
-    const sideOf = (x0: number, x1: number): "full" | "L" | "R" =>
-      !gutter ? "full" : x1 <= gutter.x + 2 ? "L" : x0 >= gutter.x - 2 ? "R" : "full";
+    const sideOf = colOf;
     // 本页分栏正文实际的左 / 右边界（奇偶页版心左右互换，全文最左 / 最右的值对本页偏出几个点）：
     // 判断"右端带编号的行间公式"、居中、缩进都以栏的实际边界为准
     const colEdge = (() => {
       if (!gutter) return { l: left, r: right };
-      const rs = lines.filter((l) => l.x0 >= gutter.g1 - 1 && l.x1 - l.x0 > 0.5 * (right - gutter.g1)).map((l) => l.x1);
-      const ls = lines.filter((l) => l.x1 <= gutter.g0 + 1 && l.x1 - l.x0 > 0.5 * (gutter.g0 - left)).map((l) => l.x0);
+      const gL = gx[0], gR = gx[gx.length - 1];
+      const rs = lines.filter((l) => l.x0 >= gR.g1 - 1 && l.x1 - l.x0 > 0.5 * (right - gR.g1)).map((l) => l.x1);
+      const ls = lines.filter((l) => l.x1 <= gL.g0 + 1 && l.x1 - l.x0 > 0.5 * (gL.g0 - left)).map((l) => l.x0);
       return { l: ls.length >= 4 ? Math.max(left, edgeOf(ls, "min")) : left, r: rs.length >= 4 ? Math.min(right, edgeOf(rs, "max")) : right };
     })();
     // 比第一页窄的页（横向文件里夹着的纵向页、按文字方向读的 /Rotate 页）：右边界按同样的右边距从本页右边缘量起，
     // 否则整页的行都比"版心"短得多，每行都被当成段落结束
     const pageRight = pg.width < pageW - 1 ? Math.max(left + 0.3 * (pg.width - left), Math.min(right, pg.width - (pageW - right))) : right;
-    const regionOf = (side: "full" | "L" | "R"): Region =>
-      side === "full" || !gutter ? { x0: left, x1: pageRight } : side === "L" ? { x0: colEdge.l, x1: gutter.g0 } : { x0: gutter.g1, x1: colEdge.r };
+    const regionOf = (side: Side): Region =>
+      side === "full" || !gutter ? { x0: left, x1: pageRight } : side === "L" ? { x0: colEdge.l, x1: gx[0].g0 }
+        : side === "M" ? { x0: gx[0].g1, x1: gx[1].g0 } : { x0: gx[gx.length - 1].g1, x1: colEdge.r };
     for (const t of tables) items.push({ kind: "table", t, side: sideOf(t.x0, t.x1), top: t.y0 });
 
     // 旁边有文字的图片（流式模式）：挂在段落上、文字环绕；旁边那几行的缩进由环绕产生，行本身改为从栏边界起排
     const floatedLines = new Map<Extract<Item, { kind: "line" }> & { top: number }, { line: Line; reg: Region }>();
     const floatedImgs: ImageBox[] = [];
-    const floatBeside = (img: ImageBox, side0: "full" | "L" | "R", besideLines: Array<Extract<Item, { kind: "line" }> & { top: number }>) => {
+    const floatBeside = (img: ImageBox, side0: Side, besideLines: Array<Extract<Item, { kind: "line" }> & { top: number }>) => {
       // 旁边是通栏文字（期刊页眉：左徽标、右封面、中间刊名）：图片随通栏文字排，否则它单独落进分栏带，找不到可挂的段落
       const side = besideLines.length && besideLines.every((it) => it.side === "full") ? "full" : side0;
       const reg = regionOf(side);
@@ -3073,7 +3120,7 @@ function buildDocModelGroup(pages0: PageModel[], opts: BuildOpts = {}): DocModel
       floatedImgs.push(img);
       items.push({ kind: "float", img, side, top: img.y0 - 0.01 });
     };
-    const besideOf = (img: { x0: number; y0: number; x1: number; y1: number }, side: "full" | "L" | "R") =>
+    const besideOf = (img: { x0: number; y0: number; x1: number; y1: number }, side: Side) =>
       items.filter((it): it is Extract<Item, { kind: "line" }> & { top: number } =>
         it.kind === "line" && (side === "full" || it.side === side || it.side === "full") &&
         it.line.bottom > img.y0 + 2 && it.line.top < img.y1 - 2 && (it.line.x0 >= img.x1 - 6 || it.line.x1 <= img.x0 + 6));
@@ -3084,7 +3131,7 @@ function buildDocModelGroup(pages0: PageModel[], opts: BuildOpts = {}): DocModel
     const rasters: Box[] = [];
     if (opts.raster) {
       const extra: Box[] = [...pg.segs, ...pg.fills, ...pg.paths];
-      for (const side of ["full", "L", "R"] as const) {
+      for (const side of (tri ? ["full", "L", "M", "R"] : ["full", "L", "R"]) as Side[]) {
         const reg = regionOf(side);
         const sideLines = items.filter((it): it is Extract<typeof it, { kind: "line" }> & { top: number } => it.kind === "line" && it.side === side).map((it) => it.line);
         if (!sideLines.length) continue;
@@ -3139,7 +3186,7 @@ function buildDocModelGroup(pages0: PageModel[], opts: BuildOpts = {}): DocModel
       const inT = tables.find((t) => img.x0 >= t.x0 - 2 && img.x1 <= t.x1 + 2 && img.y0 >= t.y0 - 2 && img.y1 <= t.y1 + 2);
       if (inT) { (inT.imgs ??= []).push(img); continue; }
       // 从扫描图上裁下来的块：外接框含留白和线框，略微越过栏间距的中线不算通栏；没碰到另一栏的文字就属于这一栏
-      const side = img.scan && gutter ? (img.x1 <= gutter.g1 - 1 ? "L" : img.x0 >= gutter.g0 + 1 ? "R" : "full") : sideOf(img.x0, img.x1);
+      const side = img.scan && gutter && !tri ? (img.x1 <= gutter.g1 - 1 ? "L" : img.x0 >= gutter.g0 + 1 ? "R" : "full") : sideOf(img.x0, img.x1);
       // 流式模式：页眉页脚区域的图片（徽标）写进页眉页脚，每页都在原位置，不随正文移动
       if (inMarginZone(img.y0, img.y1)) { (flow ? hf[pi].imgs : anchor.images!).push(img); continue; }
       const beside = besideOf(img, side);
@@ -3254,6 +3301,45 @@ function buildDocModelGroup(pages0: PageModel[], opts: BuildOpts = {}): DocModel
         if (flow) markRegion(out.blocks);
         blocks.push(...out.blocks);
         cursor = out.cursor;
+      } else if (tri) {
+        // 三栏：栏宽算到下一条栏间距的起点，各栏间距按原文；每栏从本带顶部排起（逐页保留时栏与栏之间是分栏符）
+        const [ga, gb] = gx;
+        const ws = [ga.g0 - left + 0.3, gb.g0 - ga.g1 + 0.6, right - gb.g1 + 0.3].map((w) => Math.round(w * 2) / 2);
+        const gaps = [ga.g1 - ga.g0 - 0.6, gb.g1 - gb.g0 - 0.6].map((w) => Math.round(w * 2) / 2);
+        if (flow) {
+          const gap = Math.min(...band.items.map((i) => i.top)) - cursor - 3;
+          if (gap > 2) { blocks.push(spacer(gap)); cursor += gap; }
+        }
+        cursor += endSection({ cols: 3, colWidths: ws, colGap: gaps[0], colGaps: gaps });
+        const start = cursor;
+        const bandTop = flow ? Math.min(...band.items.map((i) => i.top)) : start;
+        const regs: Region[] = [
+          { x0: left, x1: left + ws[0], overhang: Math.max(0, gaps[0] - 4) },
+          { x0: ga.g1 - 0.3, x1: ga.g1 - 0.3 + ws[1], overhang: Math.max(0, gaps[1] - 4) },
+          { x0: gb.g1 - 0.3, x1: right, overhang: body.overhang },
+        ];
+        const outs = (["L", "M", "R"] as const).map((sd, k) => layoutItems(band.items.filter((i) => i.side === sd), regs[k], k === 0 ? start : bandTop, pg.fills, ctx));
+        if (flow) {
+          for (const o of outs) markRegion(o.blocks);
+          blocks.push(...outs.flatMap((o) => o.blocks));
+          cursor = Math.max(...outs.map((o) => o.cursor));
+          continue;
+        }
+        const hoistable = (f: Block | undefined): f is Para => f?.kind === "p" && (!f.tiny || !!f.inlineImages) && f.spaceBefore > 0.5;
+        const hoist = (bs: Block[], lead: Para[]) => {
+          const f = bs[0];
+          if (hoistable(f)) { lead.push(spacer(f.spaceBefore - (lead.length ? TINY : 0))); f.spaceBefore = 0; }
+          return [...lead, ...bs];
+        };
+        blocks.push(...hoist(outs[0].blocks, []));
+        // 后面的栏各从一个承载分栏符的极小段落起排；中间一栏空着、右栏有字时，中间一栏也要有分栏符
+        const last = outs.map((o) => o.blocks.length > 0).lastIndexOf(true);
+        for (let k = 1; k <= last; k++) {
+          const lead = [tinyPara({ columnBreakBefore: true })];
+          blocks.push(...(hoistable(outs[k].blocks[0]) ? hoist(outs[k].blocks, lead) : [...lead, ...outs[k].blocks]));
+          outs[k].cursor += TINY;
+        }
+        cursor = Math.max(...outs.map((o) => o.cursor));
       } else {
         const g = gutter!;
         const lw = g.g0 - left + 0.3, rw = right - g.g1 + 0.3;
@@ -3632,7 +3718,7 @@ function buildHeaders(hf: Array<{ head: Line[]; foot: Line[]; imgs: ImageBox[]; 
   return { headers, footers, pageNumStart: pageNumStart !== undefined && pageNumStart !== 1 ? pageNumStart : undefined, start: pageNumStart ?? 1 };
 }
 
-type PageItem = { side: "full" | "L" | "R" } & (
+type PageItem = { side: "full" | "L" | "M" | "R" } & (
   | { kind: "line"; line: Line }
   | { kind: "table"; t: TableDraft }
   | { kind: "rule"; h: HSeg }
