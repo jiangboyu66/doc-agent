@@ -195,7 +195,7 @@ class Writer {
    * 绝对定位的文本框（页眉页脚等）：无边框、无填充、零内边距、不参与文字环绕。
    * 旋转文字：vert / vert270 是竖排文本框（框不转）；rot 是整个框绕中心顺时针旋转，位置和大小是旋转前的框
    */
-  private textBox(tb: { x: number; y: number; w: number; h: number; para: Para; rot?: number; vert?: "vert" | "vert270"; behind?: boolean; inPara?: boolean }): string {
+  private textBox(tb: { x: number; y: number; w: number; h: number; para: Para; rot?: number; vert?: "vert" | "vert270" | "eaVert"; behind?: boolean; inPara?: boolean }): string {
     const id = this.drawingId++;
     const cx = emu(tb.w), cy = emu(tb.h);
     const rot = tb.rot ? Math.round(tb.rot * 60000) % 21600000 : 0;
@@ -216,7 +216,9 @@ class Writer {
   private sectPr(s: SectionProps, continuous: boolean): string {
     const m = this.m;
     // 纸张大小 / 方向不同的节（原 PDF 的横向页等）写自己的尺寸和页边距
-    const pw = s.page?.w ?? m.pageW, ph = s.page?.h ?? m.pageH, mg = s.page?.margins ?? m.margins;
+    let pw = s.page?.w ?? m.pageW, ph = s.page?.h ?? m.pageH, mg = s.page?.margins ?? m.margins;
+    // 竖排的节：版面按转成横排的坐标排（宽高对调，横排坐标的左 / 右 / 上 / 下边距是纸上的上 / 下 / 右 / 左边距），转回原来的方向
+    if (s.vertical) { [pw, ph] = [ph, pw]; mg = { top: mg.left, bottom: mg.right, right: mg.top, left: mg.bottom }; }
     // 每一节都显式引用页眉页脚（与继承等效；浏览器预览只认本节的引用）；起始页码只在第一节；
     // 从第一页开始的节标记"首页不同"
     const first = this.sectCount++ === 0;
@@ -231,7 +233,7 @@ class Writer {
       `<w:sectPr>${refs}${continuous ? '<w:type w:val="continuous"/>' : ""}` +
       `<w:pgSz w:w="${tw(pw)}" w:h="${tw(ph)}"${pw > ph ? ' w:orient="landscape"' : ""}/>` +
       `<w:pgMar w:top="${tw(mg.top)}" w:right="${tw(mg.right)}" w:bottom="${tw(mg.bottom)}" w:left="${tw(mg.left)}" w:header="${tw(m.headerDist ?? 0)}" w:footer="${tw(m.footerDist ?? 0)}" w:gutter="0"/>` +
-      `${pgNum}${cols}${titlePg}</w:sectPr>`
+      `${pgNum}${cols}${titlePg}${s.vertical ? '<w:textDirection w:val="tbRl"/>' : ""}</w:sectPr>`
     );
   }
 

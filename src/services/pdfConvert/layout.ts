@@ -88,9 +88,10 @@ export interface Para {
    * 页眉页脚等：以页面绝对坐标定位的文本框（挂在页首锚点段落上，不参与文字流，不会被挤动）。
    * 旋转文字（页边竖排说明、斜放的水印 / 印章）按原角度摆放：
    *   vert：竖排的文本框（框本身不转），vert 从上往下读、vert270 从下往上读——Word、LibreOffice 都能正确显示；
+   *     eaVert：东亚竖排（汉字、假名字头朝上一个个往下排，拉丁字母躺倒），竖排的中日韩文字用它；
    *   rot：其余角度，文本框绕中心顺时针旋转的度数，x / y / w / h 是旋转前的框（LibreOffice 不转框里的字，只有 Word / WPS 显示正确）
    */
-  textBoxes?: Array<{ x: number; y: number; w: number; h: number; para: Para; rot?: number; vert?: "vert" | "vert270"; behind?: boolean; inPara?: boolean }>;
+  textBoxes?: Array<{ x: number; y: number; w: number; h: number; para: Para; rot?: number; vert?: "vert" | "vert270" | "eaVert"; behind?: boolean; inPara?: boolean }>;
   /** 本段第一行的顶边在原页面上的纵坐标（流式模式下把旋转文字的文本框挂到段落上时定位用；inPara 的文本框 y 相对段落顶部） */
   srcTop?: number;
   /** 本段最后一行的底边在原页面上的纵坐标（表格里的分隔线挂到它上方的段落上时用） */
@@ -154,6 +155,11 @@ export interface SectionProps {
   page?: { w: number; h: number; margins: DocModel["margins"] };
   /** 本节从新的一页开始（纸张大小 / 方向变了的地方）；不写时是连续分节 */
   newPage?: boolean;
+  /**
+   * 竖排的节（縦書き的页，见 rotateVertical）：page 里是转成横排坐标的版面（宽高对调，页边距转了 90°），
+   * 写出时纸张、页边距转回原来的方向，文字方向"从上往下、从右往左"（tbRl）
+   */
+  vertical?: boolean;
 }
 
 /** 页眉 / 页脚（流式模式）：首页、奇数页（默认）、偶数页 */
@@ -171,6 +177,8 @@ export interface DocModel {
   bodySize: number;
   stats: {
     pages: number; paragraphs: number; tables: number; images: number; vectorShapes: number; rotatedText: number; columnPages: number; figures: number; equations: number; inlineMath?: number;
+    /** 竖排页（写成竖排的节）的页数 */
+    verticalPages?: number;
     /** 转换了的旋转文字中斜放的（不是竖排）行数：Word / WPS 按原角度显示，LibreOffice 不转文本框里的字 */
     rotatedSlanted?: number;
     /**
@@ -1028,6 +1036,12 @@ function hasBigGap(l: Line, skipLabel = false): boolean {
   return false;
 }
 
+/** 一行里中日韩字符占可见字符的比例 */
+function cjkShare(l: Line): number {
+  const cs = [...lineString(l).replace(/\s/g, "")];
+  return cs.length ? cs.filter((c) => CJK.test(c)).length / cs.length : 0;
+}
+
 /** 行首第一个"词"的宽度（中文按单字） */
 function firstWordWidth(l: Line): number {
   const s = l.spans[0];
@@ -1115,7 +1129,10 @@ function groupParagraphs(lines: Line[], r: Region, ctx?: Ctx): Array<{ lines: Li
       // 中文合同常用 1.5 倍 / 2 倍行距（基线间距是字号的 2.1–2.6 倍），按 1.75 倍判断会把每一行都切成一段。
       // 同字号的正文在全文中有一个占绝对多数的行距：不超过它（容差 6%）的都是段内换行
       const docPitch = ctx?.pitch?.get(pitchKey(a.size));
-      const maxGap = Math.max(1.75 * Math.max(a.size, l.size), docPitch ? 1.06 * docPitch + 0.6 : 0);
+      // 行数太少、统计不出全文行距时：中日文正文的行距常是字号的 1.75–2 倍（縦書き的行間、"1.5 倍行距"），两行都是中日文、
+      // 上一行排满时按 2.2 倍判断；正好 1.75 倍的行距（Chrome 打印的 line-height: 1.75）算出来常比上限多一点点，留 0.1pt 余量
+      const cjkPair = !docPitch && lineChars(a) >= 8 && cjkShare(a) >= 0.5 && cjkShare(l) >= 0.5;
+      const maxGap = Math.max((cjkPair ? 2.2 : 1.75) * Math.max(a.size, l.size) + 0.1, docPitch ? 1.06 * docPitch + 0.6 : 0);
       const gapOk = gap > 0.5 * a.size && gap <= maxGap && (!pitch || Math.abs(gap - pitch) <= 0.2 * pitch + 0.6);
       const firstText = l.spans[0].text.trim().split(/\s+/)[0] ?? "";
       // 新的条款 / 列表项（"1.2⇥…""(b)⇥…"）另起一段
@@ -1704,7 +1721,9 @@ function rotatedBox(l: RotLine): NonNullable<Para["textBoxes"]>[number] {
   const cx = l.ox + (ux * l.len) / 2 - nx * off, cy = l.oy + (uy * l.len) / 2 - ny * off;
   const para: Para = { kind: "p", runs: rotatedRuns(l), align: "center", indLeft: 0, indRight: 0, firstLine: 0, spaceBefore: 0, lineHeight: h, tabs: [], size: l.size };
   const deg = ((l.angle % 360) + 360) % 360;
-  if (Math.abs(deg - 90) <= 1 || Math.abs(deg - 270) <= 1) return { x: cx - h / 2, y: cy - w / 2, w: h, h: w, para, vert: deg < 180 ? "vert" : "vert270" };
+  // 竖排的中日韩文字（字头朝上）：东亚竖排，汉字不躺倒
+  const upright = l.parts.every((p) => p.t.upright);
+  if (Math.abs(deg - 90) <= 1 || Math.abs(deg - 270) <= 1) return { x: cx - h / 2, y: cy - w / 2, w: h, h: w, para, vert: deg < 180 ? (upright ? "eaVert" : "vert") : "vert270" };
   return { x: cx - w / 2, y: cy - h / 2, w, h, para, rot: deg };
 }
 
@@ -2327,7 +2346,81 @@ function checkBoxes(pg: PageModel): Seg[] {
   return frames;
 }
 
-type BuildOpts = { mode?: LayoutMode; raster?: boolean; unread?: ReadonlySet<number> };
+type BuildOpts = { mode?: LayoutMode; raster?: boolean; unread?: ReadonlySet<number>; vertical?: ReadonlyMap<number, VertExtras> };
+
+/** 竖排页上不参与排版、按原页面坐标挂在锚点上的东西（见 rotateVertical） */
+interface VertExtras { images: ImageBox[]; shapes: NonNullable<Para["shapes"]>; boxes: NonNullable<Para["textBoxes"]> }
+/** 已经是原页面坐标的图形 / 文本框（竖排的节转回原方向时不再转） */
+const PHYS = new WeakSet<object>();
+
+/**
+ * 竖排页（PageModel.vertical，见 extract.ts 的 verticalize）转成横排的坐标：x' = y，y' = W − x。
+ * 一列竖排文字成了一行横排文字，从右往左的各列成了从上往下的各行——之后照横排的规则分段、排版（首字下空一格成了首行缩进，
+ * 天头、地脚成了左右页边距，分上下几段排的"段组み"成了分栏），写成文字方向"从上往下、从右往左"（tbRl）的一节：
+ * Word / LibreOffice 把行再转回竖列，段前距成了列右边的空白，左缩进成了列顶的空格，分栏成了上下几段。
+ * 列里横躺着的拉丁字母、数字（转 90° 从上往下读的文字）成了这一行里的文字。
+ * 图片、色块、线条、横排的零星文字（页码）和其他角度的旋转文字不参与排版，按原页面坐标挂在这一页的锚点上
+ */
+function rotateVertical(p: PageModel): { page: PageModel; extras: VertExtras } {
+  const W = p.width;
+  const spans: Span[] = [];
+  const flat: RotatedText[] = [];
+  for (const s of p.spans) {
+    if (s.vertical) {
+      // 字身框以列中线为中心；基线在字身框顶边下 0.88 字号处（中日韩字体的字身框）
+      const b = W - (s.x0 + s.x1) / 2 + 0.38 * s.size;
+      spans.push({ ...s, vertical: undefined, x0: s.top, x1: s.bottom, baseline: b, top: b - 0.95 * s.size, bottom: b + 0.25 * s.size });
+    } else if (s.text.trim() && !s.img) {
+      flat.push({ x0: s.x0, y0: s.top, x1: s.x1, y1: s.bottom, size: s.size, text: s.text, angle: 0, ox: s.x0, oy: s.baseline, len: s.x1 - s.x0,
+        color: s.color, family: s.font, bold: s.bold, italic: s.italic });
+    }
+  }
+  // 各竖列的中线：列里横躺的拉丁字母、数字对齐到所在列的基线。它们的基线在各家排版软件里离列中线远近不一
+  // （LibreOffice 偏左 0.43 字号），按自己的基线算，含数字的一行基线被拉偏半磅，量出来的行距忽大忽小，逐页累积成几磅的错位
+  const cols = p.spans.filter((s) => s.vertical).map((s) => ({ x0: s.x0, x1: s.x1, size: s.size, top: s.top, bottom: s.bottom }));
+  for (const r of p.rotated ?? []) {
+    if (Math.abs(r.angle - 90) <= 3 && !r.upright && !r.raster) {
+      // 从上往下读的旋转文字：字头朝右，基线在 ox，字身向右伸出
+      const cx = (r.x0 + r.x1) / 2;
+      const col = cols.find((c) => cx > c.x0 && cx < c.x1 && Math.abs(c.size - r.size) <= 0.3 * c.size && r.y0 < c.bottom + 4 * c.size && r.y1 > c.top - 4 * c.size);
+      const b = col ? W - (col.x0 + col.x1) / 2 + 0.38 * col.size : W - r.ox;
+      spans.push({ text: r.text, x0: r.oy, x1: r.oy + r.len, baseline: b, top: b - 0.85 * r.size, bottom: b + 0.22 * r.size, size: Math.round(r.size * 2) / 2,
+        font: r.family, bold: r.bold, italic: r.italic, color: r.color, natural: r.len, spaceW: 0.25 * r.size, ...(r.tracking ? { tracking: r.tracking } : {}) });
+    } else if (!r.raster) flat.push(r);
+  }
+  const boxes = rotatedLines(flat).map(rotatedBox);
+  const shapes: NonNullable<Para["shapes"]> = [
+    ...p.fills.map((f) => ({ kind: "rect" as const, x0: f.x0, y0: f.y0, x1: f.x1, y1: f.y1, width: 0, color: f.color, behind: true })),
+    ...p.segs.map((g) => g.horizontal
+      ? { kind: "line" as const, x0: g.x0, y0: (g.y0 + g.y1) / 2, x1: g.x1, y1: (g.y0 + g.y1) / 2, width: g.width, color: g.color, behind: false }
+      : { kind: "line" as const, x0: (g.x0 + g.x1) / 2, y0: g.y0, x1: (g.x0 + g.x1) / 2, y1: g.y1, width: g.width, color: g.color, behind: false }),
+  ];
+  const images = p.images.filter((im) => im.png.length);
+  for (const o of [...boxes, ...shapes, ...images]) PHYS.add(o);
+  const page: PageModel = { ...p, width: p.height, height: W, spans, segs: [], fills: [], images: [], paths: [], masks: [], rotated: [], vertical: true };
+  return { page, extras: { images, shapes, boxes } };
+}
+
+/**
+ * 竖排的一组页排好之后：排版时按横排坐标放下的绝对定位文本框、图形（锚点上的）转回原页面坐标。
+ * 横排坐标里的一行文字在原页面上是一列：文本框宽高对调、写成东亚竖排
+ */
+function unrotateVertical(m: DocModel): void {
+  const W = m.pageH;
+  for (const b of m.blocks) {
+    if (b.kind !== "p") continue;
+    for (const t of b.textBoxes ?? []) {
+      if (PHYS.has(t) || t.inPara) continue;
+      const { x, y, w, h } = t;
+      Object.assign(t, { x: W - y - h, y: x, w: h, h: w, vert: t.vert ?? "eaVert" });
+    }
+    for (const sh of b.shapes ?? []) {
+      if (PHYS.has(sh)) continue;
+      const { x0, y0, x1, y1 } = sh;
+      Object.assign(sh, { x0: W - y1, y0: x0, x1: W - y0, y1: x1 });
+    }
+  }
+}
 
 /** 两页的纸张大小 / 方向是否算作相同（扫描件、拼合的文件各页常差零点几磅到几磅，不必分节） */
 const samePaper = (a: PageModel, b: PageModel) => Math.abs(a.width - b.width) <= 18 && Math.abs(a.height - b.height) <= 18;
@@ -2340,20 +2433,35 @@ const samePaper = (a: PageModel, b: PageModel) => Math.abs(a.width - b.width) <=
  * 新的一节从新的一页开始、写自己的纸张大小和方向。以前整篇都用第一页的尺寸，横向页上的宽表格最右一列被裁掉
  */
 export function buildDocModel(pages0: PageModel[], opts: BuildOpts = {}): DocModel {
+  // 竖排页（縦書き）转成横排坐标排版，写成竖排的节（见 rotateVertical）；与横排页分在不同的组
+  const extras = new Map<number, VertExtras>();
+  const pagesV = pages0.map((p) => {
+    if (!p.vertical) return p;
+    const r = rotateVertical(p);
+    extras.set(p.index, r.extras);
+    return r.page;
+  });
   const groups: PageModel[][] = [];
-  for (const p of pages0) {
+  for (const p of pagesV) {
     const g = groups[groups.length - 1];
-    if (g && samePaper(g[0], p)) g.push(p);
+    if (g && samePaper(g[0], p) && !!g[0].vertical === !!p.vertical) g.push(p);
     else groups.push([p]);
   }
-  if (groups.length <= 1) return buildDocModelGroup(pages0, opts);
-  const models = groups.map((g) => buildDocModelGroup(g, opts));
+  if (groups.length <= 1 && !extras.size) return buildDocModelGroup(pages0, opts);
+  const models = groups.map((g) => {
+    if (!g[0].vertical) return buildDocModelGroup(g, opts);
+    const m = buildDocModelGroup(g, { ...opts, vertical: extras });
+    unrotateVertical(m);
+    m.stats.verticalPages = g.length;
+    return m;
+  });
   const blocks: Block[] = [];
   models.forEach((m, gi) => {
     const page = { w: m.pageW, h: m.pageH, margins: m.margins };
     const sects = [...m.blocks.flatMap((b) => (b.kind === "p" && b.sectionEnd ? [b.sectionEnd] : [])), m.finalSection];
     for (const s of sects) {
       s.page = page;
+      if (groups[gi][0].vertical) s.vertical = true;
       // 首页不同的页眉页脚只用于整篇的第一页
       if (gi > 0) s.titlePg = false;
     }
@@ -2364,7 +2472,7 @@ export function buildDocModel(pages0: PageModel[], opts: BuildOpts = {}): DocMod
   const first = models[0], last = models[models.length - 1];
   // 正文字体 / 字号（样式表的默认值）：取页数最多的一组
   const main = models.reduce((a, b) => (b.stats.pages > a.stats.pages ? b : a));
-  const sum = (k: "pages" | "paragraphs" | "tables" | "images" | "vectorShapes" | "rotatedText" | "columnPages" | "figures" | "equations" | "inlineMath" | "rotatedSlanted") =>
+  const sum = (k: "pages" | "paragraphs" | "tables" | "images" | "vectorShapes" | "rotatedText" | "columnPages" | "figures" | "equations" | "inlineMath" | "rotatedSlanted" | "verticalPages") =>
     models.reduce((n, m) => n + (m.stats[k] ?? 0), 0);
   const scans = models.map((m) => m.stats.scan).filter((x): x is NonNullable<typeof x> => !!x);
   const scan = scans.length ? scans.reduce((a, b) => ({
@@ -2380,6 +2488,7 @@ export function buildDocModel(pages0: PageModel[], opts: BuildOpts = {}): DocMod
       pages: sum("pages"), paragraphs: sum("paragraphs"), tables: sum("tables"), images: sum("images"), vectorShapes: sum("vectorShapes"),
       rotatedText: sum("rotatedText"), rotatedSlanted: sum("rotatedSlanted"), columnPages: sum("columnPages"), figures: sum("figures"),
       equations: sum("equations"), inlineMath: sum("inlineMath"), ...(scan ? { scan } : {}),
+      ...(sum("verticalPages") ? { verticalPages: sum("verticalPages") } : {}),
     },
     rasterText: models.map((m) => m.rasterText).filter(Boolean).join("\n"),
     // 页面颜色是整篇文档的设置：各组一致时才写
@@ -2730,6 +2839,8 @@ function buildDocModelGroup(pages0: PageModel[], opts: BuildOpts = {}): DocModel
       for (let k = 0; k < byY.length && byY[k].bottom <= 0.2 * H && (repeated.has(byY[k]) || fl.has(byY[k])); k++) take(byY[k]);
     });
   }
+  // 竖排页：转成横排坐标后，"页面最上 / 最下"的行是原页面最右 / 最左的一列，不是页眉页脚（Word 的页眉页脚在纸的上下，是横排的）
+  if (opts.vertical) floating.forEach((_, i) => { floating[i] = []; });
   // 流式模式：只有 Word 页眉页脚能在该页原样再现的行才写进页眉页脚（数字逐位比较，只有页码位可以逐页不同）；
   // 只在一页出现的栏底标题、页首的条款标题、附件标题放回正文。见 furniture.ts
   let furniture: Furniture | undefined;
@@ -2977,6 +3088,9 @@ function buildDocModelGroup(pages0: PageModel[], opts: BuildOpts = {}): DocModel
     freshPage = true;
     const anchorAt = blocks.length;
     blocks.push(anchor);
+    // 竖排页（见 rotateVertical）：图片、色块、线条、横排的零星文字按原页面坐标挂在这一页的锚点上
+    const vx = opts.vertical?.get(pg.index);
+    if (vx) { anchor.images!.push(...vx.images); anchor.shapes!.push(...vx.shapes); anchor.textBoxes!.push(...vx.boxes); }
     let cursor = (flow ? mTop : marginTop) + TINY;
     if (flow) {
       hf.push({ head: floating[pi].filter((l) => l.top < pg.height / 2), foot: floating[pi].filter((l) => l.top >= pg.height / 2), imgs: [], mid: pg.height / 2 });

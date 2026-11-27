@@ -49,6 +49,11 @@ export interface Span {
   bg?: string;
   /** 填写线（表格里"人民币（大写）______"文字旁边、与文字同一基线的横线）：没有文字，写成带下划线的制表符 */
   blank?: boolean;
+  /**
+   * 竖排的一段文字（縦書き的一列或一列中的一段，从上往下读）：x0..x1 是这一列的字身宽，top..bottom 是文字在列里的范围，
+   * baseline 是列的中线。只出现在竖排页（PageModel.vertical）上，排版前整页转成横排的坐标（见 layout.ts 的 rotateVertical）
+   */
+  vertical?: boolean;
 }
 
 /**
@@ -124,6 +129,8 @@ export interface PageModel {
   /** 图像蒙版（Type 3 位图字形等） */
   masks: MaskBox[];
   rotatedText: number;
+  /** 竖排页（縦書き、竖排古籍）：正文是一列列从上往下、从右往左读的竖排文字（spans 里是 vertical 片段） */
+  vertical?: boolean;
   /** 压在扫描图上的不可见文字（OCR 识别层，文字渲染模式 3 / 7）的字符数：不转成正文 */
   ocrChars?: number;
   /**
@@ -326,6 +333,8 @@ export interface RotatedText {
   /** 字距加宽 / 紧缩（pt，每个字之后） */
   tracking?: number;
   raster?: boolean;
+  /** 竖排的中日韩文字（字头朝上、一个字一个字往下排，不是整行转 90°）：写成东亚竖排的文本框 / 单元格，汉字不躺倒 */
+  upright?: boolean;
 }
 
 type SubPath = { kind: "rect"; pts: Array<[number, number]> } | { kind: "poly"; pts: Array<[number, number]>; ctrl: Array<[number, number]>; curved: boolean; closed: boolean };
@@ -862,6 +871,28 @@ async function extractPage(page: any, index: number, OPS: any, Util: any): Promi
       continue;
     }
     const style = tc.styles[it.fontName] ?? {};
+    // 竖排字体（WMode 1：InDesign 等排的縦書き、Adobe-Japan1 的 -V 编码）：pdf.js 把一列文字给成一项，transform 是第一个字的
+    // 竖排原点（字身框顶边的中点），height 是沿列方向的总长。按横排处理时整列文字挤在第一个字的位置上，字与字叠成一团。
+    // 记成竖排片段：x0..x1 是这一列的字身宽，top..bottom 是这段文字在列里的范围（竖排页的版式见 verticalize）
+    if (style.vertical) {
+      const joined = [...it.str].filter((c) => c.trim()).join("");
+      const probe = joined.slice(0, Math.min(6, joined.length));
+      let at = opText.startsWith(probe, ci) ? ci : -1;
+      for (let d = 1; d <= 80 && at === -1; d++) if (opText.startsWith(probe, ci + d)) at = ci + d;
+      let matched = 0;
+      if (at !== -1) { while (matched < joined.length && opText[at + matched] === joined[matched]) matched++; ci = at + matched; }
+      if (matched && textColors.slice(at, at + matched).filter((g) => g.hidden).length > matched / 2) continue;
+      const g = at !== -1 ? textColors[at] : textColors[ci];
+      const fi = infoOf(it.fontName);
+      const len = (it.height || size * [...it.str].length) * (Math.hypot(VT[0], VT[1]) || 1);
+      const text = expandLigatures(it.str.replace(/\u00ad/g, ""));
+      model.spans.push({
+        text, x0: t[4] - size / 2, x1: t[4] + size / 2, top: t[5], bottom: t[5] + len, baseline: t[4], size: Math.round(size * 2) / 2,
+        font: fi.family, bold: fi.bold || !!g?.fakeBold, italic: fi.italic, color: g?.color ?? "000000", natural: len,
+        spaceW: size / 4, rawFont: rawNames.get(it.fontName), vertical: true,
+      });
+      continue;
+    }
     const ascent = typeof style.ascent === "number" && style.ascent > 0.5 ? Math.min(style.ascent, 1.05) : 0.85;
     const descent = typeof style.descent === "number" && style.descent < 0 ? Math.max(style.descent, -0.35) : -0.22;
     const baseline = t[5];
@@ -1027,7 +1058,18 @@ async function extractPage(page: any, index: number, OPS: any, Util: any): Promi
       });
     }
   }
-  model.spans = mergeOverprinted(mergeLetterSpaced(model.spans));
+  // 竖排页先认出来：逐字摆放的竖排字要在"加宽字距合并"之前按列连起来——同一高度上相邻几列的字间隔规则，
+  // 会被当成字距加宽的一个词横着合在一起（Chrome 打印的縦書き 一行里串进了六列的字）
+  verticalize(model);
+  model.spans = model.vertical
+    ? [...model.spans.filter((s) => s.vertical), ...mergeOverprinted(mergeLetterSpaced(model.spans.filter((s) => !s.vertical)))]
+    : mergeOverprinted(mergeLetterSpaced(model.spans));
+  // Chrome / Skia 打印的中日文：Noto CJK 里汉字与康熙部首共用字形，ToUnicode 常给成部首（⼭ U+2F2D、⽂ U+2F42），
+  // 转出来的字看着一样，却搜不到、复制出来是部首。页面上有正常的汉字时换回统一汉字
+  if (model.spans.some((s) => /[\u4E00-\u9FFF]/.test(s.text))) {
+    for (const s of model.spans) s.text = unifyRadicals(s.text);
+    for (const r of model.rotated ?? []) r.text = unifyRadicals(r.text);
+  }
   // 裁剪框（CropBox）之外的东西看不见：整个落在页面外的文字、图片、线条、色块不转换。
   // 视口已按裁剪框换算，页面就是 [0, 宽] × [0, 高]；以前它们按负坐标排进版面，把页面上的内容整块往下挤，一页变三页
   {
@@ -1050,6 +1092,142 @@ async function extractPage(page: any, index: number, OPS: any, Util: any): Promi
     if (split) model.scan = { ...split, image: scanned.image };
   }
   return model;
+}
+
+/** 康熙部首 / 部首补充（⼭ U+2F2D、⺟ U+2E9F）→ 统一汉字（山、母） */
+const unifyRadicals = (t: string) => t.replace(/[\u2E80-\u2EF3\u2F00-\u2FD5]/g, (c) => c.normalize("NFKC"));
+
+/**
+ * 竖排标点的表现形式（U+FE10–FE19、U+FE30–FE48，pdf.js 给没嵌入的竖排字体、Chrome 打印的縦書き 都会出现）→ 通常的全角标点：
+ * Word 的竖排节、竖排文本框自己会换成竖排字形；留着表现形式的话横着复制出来、搜索都对不上
+ */
+const VERT_FORMS: Record<string, string> = {
+  "\uFE10": "，", "\uFE11": "、", "\uFE12": "。", "\uFE13": "：", "\uFE14": "；", "\uFE15": "！", "\uFE16": "？", "\uFE17": "〖", "\uFE18": "〗", "\uFE19": "…",
+  "\uFE30": "‥", "\uFE31": "—", "\uFE32": "–", "\uFE33": "＿", "\uFE34": "＿", "\uFE35": "（", "\uFE36": "）", "\uFE37": "｛", "\uFE38": "｝",
+  "\uFE39": "〔", "\uFE3A": "〕", "\uFE3B": "【", "\uFE3C": "】", "\uFE3D": "《", "\uFE3E": "》", "\uFE3F": "〈", "\uFE40": "〉",
+  "\uFE41": "「", "\uFE42": "」", "\uFE43": "『", "\uFE44": "』", "\uFE47": "［", "\uFE48": "］",
+};
+const horizontalForms = (t: string) => t.replace(/[\uFE10-\uFE19\uFE30-\uFE48]/g, (c) => VERT_FORMS[c] ?? c);
+const CJK_CHAR = /[\u2E80-\u9FFF\uF900-\uFAFF\uFE10-\uFE19\uFE30-\uFE4F\uFF00-\uFFEF\uAC00-\uD7AF]/;
+
+/**
+ * 竖排页（日文縦書き、竖排的古籍 / 公告）：一列列从上往下、从右往左读。PDF 里有三种写法：
+ *  1. 竖排字体（WMode 1）：pdf.js 一列给一项，提取时已记成竖排片段；
+ *  2. 横排字体逐字摆放（LibreOffice、Chrome 打印的 writing-mode: vertical-rl）：每个字单独一项，同一列的字上下相接；
+ *  3. 列里的拉丁字母、数字横躺着排（整段转 90°，从上往下读），在 rotated 里。
+ * 以前逐字摆放的字按横排成行：同一高度上各列的字连成一"行"，正文顺序全乱，竖排页还被当成双栏，一页变两页。
+ *
+ * 竖排的字占全页的大半、逐字摆放的字在内容流里一个接一个往下排（而不是往右）时，整页按竖排处理：同一列上下相接的字
+ * 合成竖排片段（格式不同处分开，中间空出的整字宽补成全角空格），页面标成 vertical，排版时整页转成横排坐标再排（见 layout.ts）。
+ * 不是竖排页时：竖排字体的片段改记成竖排的旋转文字（东亚竖排的文本框 / 单元格），逐字摆放的字照旧
+ */
+function verticalize(model: PageModel): void {
+  const vis = (s: Span) => s.text.replace(/\s/g, "");
+  const count = (t: string) => [...t.replace(/\s/g, "")].length;
+  const spans = model.spans.filter((s) => vis(s) && !s.img);
+  const rots = (model.rotated ?? []).filter((r) => r.text.trim());
+  const total = spans.reduce((n, s) => n + count(s.text), 0) + rots.reduce((n, r) => n + count(r.text), 0);
+  // 竖排字体的片段：同一位置重画的（描边加粗）只留最后一份
+  const vSpans: Span[] = [];
+  for (const s of spans.filter((x) => x.vertical)) {
+    const tol = Math.min(0.8, 0.1 * s.size);
+    const k = vSpans.findIndex((o) => o.text === s.text && o.size === s.size && Math.abs(o.x0 - s.x0) <= tol && Math.abs(o.top - s.top) <= tol);
+    if (k !== -1) { s.bold = true; vSpans[k] = s; } else vSpans.push(s);
+  }
+  // 逐字摆放的字：只有一个字、不比一个字身宽
+  const glyph = (s: Span) => !s.vertical && count(s.text) === 1 && s.x1 - s.x0 <= 1.15 * s.size;
+  const sameCol = (a: Span, b: Span) => Math.abs((a.x0 + a.x1) / 2 - (b.x0 + b.x1) / 2) <= 0.3 * Math.max(a.size, b.size) &&
+    Math.abs(a.size - b.size) <= 0.2 * Math.max(a.size, b.size);
+  // 内容流的顺序：下一个字在正下方（竖排）还是紧挨在右边（横排）
+  let below = 0, beside = 0;
+  for (let i = 0; i + 1 < spans.length; i++) {
+    const a = spans[i], b = spans[i + 1];
+    if (!glyph(a) || !glyph(b)) continue;
+    const sz = Math.max(a.size, b.size), dy = b.top - a.top;
+    if (sameCol(a, b) && dy >= 0.6 * sz && dy <= 1.6 * sz) below++;
+    else if (Math.abs(a.baseline - b.baseline) <= 0.2 * sz && b.x0 >= a.x1 - 0.2 * sz && b.x0 - a.x1 <= 0.6 * sz) beside++;
+  }
+  const runs: Span[][] = [];
+  const dup = new Set<Span>();
+  if (below >= 6 && below >= 3 * beside) {
+    // 按列中线聚类（同一列的字中线几乎重合），列内从上往下；间隔超过 4.5 个字的是同一列里分开的两段
+    const cols: Span[][] = [];
+    for (const s of spans.filter(glyph).sort((a, b) => a.x0 + a.x1 - (b.x0 + b.x1))) {
+      const c = cols.slice(-4).find((c) => sameCol(c[0], s));
+      if (c) c.push(s); else cols.push([s]);
+    }
+    for (const c of cols) {
+      c.sort((a, b) => a.top - b.top);
+      let run: Span[] = [c[0]];
+      for (const q of c.slice(1)) {
+        const p = run[run.length - 1], sz = Math.max(p.size, q.size), dy = q.top - p.top;
+        // 同一个字在同一位置画了两遍（描边加粗）：留后画的
+        if (dy < 0.3 * sz && q.text === p.text) { dup.add(p); q.bold = true; run[run.length - 1] = q; continue; }
+        if (dy >= 0.5 * sz && dy <= 4.5 * sz) run.push(q);
+        else { runs.push(run); run = [q]; }
+      }
+      runs.push(run);
+    }
+  }
+  const stacked = runs.filter((r) => r.length >= 2);
+  const vChars = stacked.reduce((n, r) => n + r.length, 0) + vSpans.reduce((n, s) => n + count(s.text), 0);
+  const rot90 = rots.filter((r) => Math.abs(r.angle - 90) <= 3).reduce((n, r) => n + count(r.text), 0);
+  if (vChars >= 10 && vChars + rot90 >= 0.6 * total) {
+    // 竖排页：每一段（同一列上下相接、格式相同的字）合成一个竖排片段
+    const used = new Set<Span>(dup);
+    const out: Span[] = [];
+    const fmt = (s: Span) => `${s.font}|${s.size}|${s.bold ? 1 : 0}|${s.italic ? 1 : 0}|${s.color}|${s.underline ? 1 : 0}`;
+    for (const run of runs) {
+      // 一个字成一列的：中日韩字是竖排的（"第一章"下面隔开的单字、标点），单独的拉丁字母 / 数字（页码）留作横排
+      if (run.length === 1 && !CJK_CHAR.test(run[0].text)) continue;
+      let piece: Span[] = [];
+      const flush = () => {
+        if (!piece.length) return;
+        const f = piece[0], l = piece[piece.length - 1];
+        let text = "", natural = 0;
+        piece.forEach((g, k) => {
+          if (k > 0) {
+            const gap = g.top - piece[k - 1].top - piece[k - 1].size;
+            if (gap >= 0.5 * g.size) { const n = Math.max(1, Math.round(gap / g.size)); text += "\u3000".repeat(n); natural += n * g.size; }
+          }
+          text += g.text.trim();
+          natural += g.size;
+        });
+        out.push({
+          ...f, text, x0: Math.min(...piece.map((g) => g.x0)), x1: Math.max(...piece.map((g) => g.x1)),
+          top: f.baseline - 0.88 * f.size, bottom: l.baseline + 0.12 * l.size, baseline: (f.x0 + f.x1) / 2,
+          natural, wordW: undefined, tracking: undefined, vertical: true,
+        });
+        piece = [];
+      };
+      // 列里空出来的地方排着横躺的拉丁字母、数字（"PDF 2.0"、"2026"）时在这里分开，不补全角空格——
+      // 补上的空格与横躺的文字叠在同一行的同一位置，排版时被当成重叠的两行，数字成了单独的文本框
+      const occupied = (a: Span, b: Span) => rots.some((r) => Math.abs(r.angle - 90) <= 3 && r.x1 > Math.min(a.x0, b.x0) && r.x0 < Math.max(a.x1, b.x1) &&
+        r.y1 > a.top + 0.9 * a.size && r.y0 < b.top);
+      for (const g of run) {
+        const prev = piece[piece.length - 1];
+        if (prev && (fmt(g) !== fmt(piece[0]) || (g.top - prev.top >= 1.5 * g.size && occupied(prev, g)))) flush();
+        piece.push(g);
+        used.add(g);
+      }
+      flush();
+    }
+    for (const s of [...vSpans, ...out]) s.text = horizontalForms(s.text);
+    model.spans = [...model.spans.filter((s) => !used.has(s) && !s.vertical), ...vSpans, ...out];
+    model.vertical = true;
+    return;
+  }
+  // 不是竖排页：竖排字体的片段（横排页上的竖排标签、表头）记成竖排的旋转文字
+  if (!vSpans.length && !model.spans.some((s) => s.vertical)) return;
+  for (const s of vSpans) {
+    const cx = (s.x0 + s.x1) / 2;
+    (model.rotated ??= []).push({
+      x0: s.x0, y0: s.top, x1: s.x1, y1: s.bottom, size: s.size, text: horizontalForms(s.text), angle: 90, ox: cx - 0.38 * s.size, oy: s.top, len: s.bottom - s.top,
+      color: s.color, family: s.font, bold: s.bold, italic: s.italic, upright: true,
+    });
+    model.rotatedText++;
+  }
+  model.spans = model.spans.filter((s) => !s.vertical);
 }
 
 /**

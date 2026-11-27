@@ -260,7 +260,19 @@ await test("字体名解析：子集前缀、粗斜体、替代字体、GBK 编�
   assert(a.bold && a.italic, "应识别粗斜体");
   eq(parseFontName("BAAAAA+LiberationSerif").family, "Times New Roman", "度量兼容字体应映射回原字体");
   eq(parseFontName("CAAAAA+Carlito-Bold").family, "Calibri", "Carlito → Calibri");
-  eq(parseFontName("#CB#CE#CC#E5").family, "宋体", "GBK 编码字体名应解码");
+  eq(parseFontName("#CB#CE#CC#E5").family, "SimSun", "GBK 编码字体名应解码（宋体 → SimSun）");
+});
+
+await test("中日韩字体名：按语言与宋体 / 黑体归到 Word 里有的字体，不因\"等宽\"回退成 Courier New、不因名字里的 Sans 成了 Arial", () => {
+  const cases: Array<[string, string]> = [
+    ["CAAAAA+NotoSerifCJKjp-Regular", "MS Mincho"], ["Noto-Sans-CJK-SC-Bold", "Microsoft YaHei"], ["NotoSansJP-Regular", "MS Gothic"],
+    ["SourceHanSerifSC-Medium", "SimSun"], ["KozMinPr6N-Regular", "MS Mincho"], ["HeiseiKakuGo-W5", "MS Gothic"], ["MSung-Light", "PMingLiU"],
+    ["HYSMyeongJo-Medium", "Batang"], ["FZXBSJW--GB1-0", "SimSun"], ["AdobeHeitiStd-Regular", "SimHei"],
+    // 不是中日韩字体的不受影响
+    ["NotoSans-Regular", "Arial"], ["NotoSansTamil-Regular", "Arial"], ["CenturyGothic", "Century Gothic"],
+  ];
+  for (const [name, family] of cases) eq(parseFontName(name).family, family, name);
+  assert(parseFontName("Noto-Sans-CJK-SC-Bold").bold, "带连字符的名字也认出粗体");
 });
 
 for (const [name, expect] of [["form.pdf", { tables: 1, columns: false }], ["columns.pdf", { tables: 0, columns: true }], ["sample.pdf", { tables: 1, columns: false }]] as const) {
@@ -736,6 +748,37 @@ await test("三栏正文：写成三栏的分节，各栏按阅读顺序（第�
     assert(!at.includes(-1) && at.every((v, i) => i === 0 || v > at[i - 1]), `${mode}：各栏的开头按阅读顺序出现：${at.join(", ")}`);
     // 逐页保留：一段里不会同时有两栏的开头（左右两栏的行没有被配成一行）。可编辑排版会把被分栏切断的段落接起来，不在此列
     if (mode === "exact") for (const p of xml.match(/<w:p\b[^>]*>[\s\S]*?<\/w:p>/g) ?? []) assert((textOf(p).match(/Column \w+ of page/g) ?? []).length <= 1, `${mode}：两栏的行被并进了同一段`);
+  }
+});
+
+await test("日文縦書き：写成竖排的节（tbRl），各列按从右往左、从上往下连成段落；逐字摆放、竖排字体两种写法都认（两种模式）", async () => {
+  const { pdfToDocx } = await import("../src/services/pdfConvert/index.js");
+  const pdf = await fixture("vertical-ja.pdf");
+  const textOf = (x: string) => (x.match(/<w:t[^>]*>([^<]*)<\/w:t>/g) ?? []).map((t) => t.replace(/<[^>]+>/g, "")).join("");
+  for (const mode of ["exact", "flow"] as const) {
+    const { data, report } = await pdfToDocx(pdf, { mode });
+    eq(report.textCoverage, 1, `${mode}：文字完整性，缺失：${report.missing}`);
+    eq(report.verticalPages, 2, `${mode}：两页都是竖排`);
+    eq(report.columnPages, 0, `${mode}：竖排页不是分栏`);
+    const xml = new ZipPackage(data).readText("word/document.xml");
+    const sect = xml.slice(xml.lastIndexOf("<w:sectPr"));
+    assert(sect.includes('<w:textDirection w:val="tbRl"/>'), `${mode}：竖排的节`);
+    // 纸张转回原来的方向（A5 竖放：宽 420pt、高 595pt）
+    assert(/<w:pgSz w:w="8400" w:h="11900"\/>/.test(sect), `${mode}：纸张是原来的竖放 A5：${sect.match(/<w:pgSz[^>]*>/)?.[0]}`);
+    const paras = (xml.match(/<w:p\b[^>]*>[\s\S]*?<\/w:p>/g) ?? []).filter((p) => !p.includes("<w:txbxContent>")).map(textOf).filter(Boolean);
+    const body = [
+      "山あいの村の春",
+      "三月の終わりになると、村を囲む山の斜面から少しずつ雪が消えていく。朝の空気はまだ冷たいが、日が昇ると屋根の雪がぽたぽたと音を立てて落ち、軒先には小さな水たまりがいくつもできる。",
+      "四月に入ると、川の水かさが増えて流れが速くなる。雪どけの水は透きとおっていて、川底の石の色まではっきりと見える。",
+      "祖父は毎年この時期に水車小屋の点検をし、古くなった板を一枚ずつ取り替える。桜が咲くのは平地より二週間ほど遅い。",
+    ];
+    for (const t of body) assert(paras.includes(t), `${mode}：应有一段"${t.slice(0, 12)}…"，实际：${paras.map((p) => p.slice(0, 12)).join(" / ")}`);
+    // 列里横躺着的 "PDF 2.0" 接在所在的那一段里
+    assert(paras.some((p) => /^子どもたちは.*会議で ?PDF 2\.0 ?の話をする予定だと、父が言った。$/.test(p)), `${mode}：横躺的拉丁字母应在段落中原位`);
+    // 竖排字体给出的竖排标点表现形式（︑︒）换回通常的标点
+    assert(!/[\uFE10-\uFE19\uFE30-\uFE48]/.test(textOf(xml)), `${mode}：不应留下竖排标点的表现形式`);
+    // 横排的页码：按原页面坐标的文本框
+    for (const n of ["1", "2"]) assert((xml.match(/<w:txbxContent>[\s\S]*?<\/w:txbxContent>/g) ?? []).some((b) => textOf(b) === n), `${mode}：页码 ${n} 在文本框里`);
   }
 });
 
@@ -1532,7 +1575,7 @@ await test("所有夹具 PDF：两种排版方式都不报错、文字完整；L
   const run = promisify(execFile);
   const soffice = process.env.SOFFICE_PATH || "soffice";
   const hasSoffice = await run(soffice, ["--version"]).then(() => true, () => false);
-  const names = ["columns", "journal", "figures", "math", "journal-front", "journal-eq", "journal-fig", "bios", "colstart", "signature", "citecolor", "texpaper", "contract-cn", "scan-letter", "furniture-cn", "bates", "rotated-text", "mixed-pages", "image-slides", "open-table", "color-blocks", "form-boxes", "image-rows", "logo-corner", "overprint", "dense-cells", "rtl-list", "transparent-figure", "three-columns"];
+  const names = ["columns", "journal", "figures", "math", "journal-front", "journal-eq", "journal-fig", "bios", "colstart", "signature", "citecolor", "texpaper", "contract-cn", "scan-letter", "furniture-cn", "bates", "rotated-text", "mixed-pages", "image-slides", "open-table", "color-blocks", "form-boxes", "image-rows", "logo-corner", "overprint", "dense-cells", "rtl-list", "transparent-figure", "three-columns", "vertical-ja"];
   const dir = await fs.mkdtemp(path.join(tmp, "pages-"));
   const bad: string[] = [];
   for (const name of names) {

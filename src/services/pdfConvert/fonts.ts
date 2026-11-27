@@ -86,8 +86,62 @@ function texFont(name: string): FontInfo | null {
   return null;
 }
 
+/**
+ * 中日韩字体（Noto / 思源、小塚、平成、ヒラギノ、IPA、游明朝、方正、Adobe 宋体、韩文的明朝 / 哥特体……）：按语言、
+ * 衬线 / 无衬线（宋体、黑体、楷体、仿宋）归到 Word 里一定有的同类字体。
+ * 以前不认识的中日韩字体按 pdf.js 给的类别回退：中日韩字体的字形全角等宽，pdf.js 归为"等宽"，于是成了 Courier New
+ * （LibreOffice 排的日文縦書き NotoSerifCJKjp）；带连字符的名字（Noto-Sans-CJK-SC）按第一个连字符切出"Noto"，回退成 Arial
+ */
+export function cjkFamily(name: string): string | null {
+  const raw = name.replace(/^[A-Z]{6}\+/, "");
+  // 中文 / 日文 / 韩文写的字体名（GBK 编码解出来的"宋体"、"ＭＳ 明朝"）
+  if (/[぀-ヿ一-鿿가-힯]/.test(raw)) {
+    if (/仿宋/.test(raw)) return "FangSong";
+    if (/楷/.test(raw)) return /標/.test(raw) ? "DFKai-SB" : "KaiTi";
+    if (/雅黑/.test(raw)) return "Microsoft YaHei";
+    if (/正黑/.test(raw)) return "Microsoft JhengHei";
+    if (/明朝/.test(raw)) return "MS Mincho";
+    if (/ゴシック/.test(raw)) return "MS Gothic";
+    if (/明體|明体|細明/.test(raw)) return "PMingLiU";
+    if (/바탕|명조/.test(raw)) return "Batang";
+    if (/고딕|굴림|돋움/.test(raw)) return "Malgun Gothic";
+    if (/黑/.test(raw)) return "SimHei";
+    if (/宋/.test(raw)) return "SimSun";
+  }
+  const n = raw.toLowerCase().replace(/[^a-z0-9]/g, "");
+  // Noto / 思源（Source Han）：CJK 后面的地区码，或 Google Fonts 的分语言版（Noto Sans JP、Noto Serif SC）；
+  // 地区码后面只能是字重 / 样式（Noto Sans Tamil、Noto Sans 等拉丁 / 其他文字的 Noto 不算）
+  const noto = new RegExp("^(?:noto(sans|serif)(?:mono)?|sourcehan(sans|serif|code)(?:mono)?)(?:cjk(sc|tc|hk|jp|kr|j|k)?|(sc|tc|hk|jp|kr|cn|tw))?" +
+    "(?:regular|bold|light|medium|black|thin|semibold|semi|extrabold|extralight|demilight|ultralight|heavy|book|normal|italic|w\\d|\\d+)*$").exec(n);
+  let lang: "sc" | "tc" | "jp" | "kr" | null = null, kind: "serif" | "sans" | "kai" | "fang" = "serif";
+  if (noto && (n.includes("cjk") || noto[4] || n.startsWith("sourcehan"))) {
+    const r = noto[3] ?? noto[4] ?? "sc";
+    lang = r === "jp" || r === "j" ? "jp" : r === "kr" || r === "k" ? "kr" : r === "tc" || r === "hk" || r === "tw" ? "tc" : "sc";
+    kind = (noto[1] ?? noto[2]) === "serif" ? "serif" : "sans";
+  } else if (/kozmin|ryumin|heiseimin|hiramin|hiraginomin|ipaexmincho|ipap?mincho|takaop?mincho|yumin|msp?mincho|mincho/.test(n)) { lang = "jp"; kind = "serif"; }
+  else if (/kozgo|heiseikakugo|kakugo|marugo|hirakaku|hiraginokaku|hiraginosans(?!gb|cns)|ipaexgothic|ipap?gothic|takaop?gothic|yugoth|meiryo|msp?gothic|msuigothic|midashigo|shingo|gothicbbb/.test(n)) { lang = "jp"; kind = "sans"; }
+  else if (/myeongjo|batang/.test(n)) { lang = "kr"; kind = "serif"; }
+  else if (/gulim|dotum|malgun|nanum(barun)?gothic|hygothic|applesdgothic|applegothic/.test(n)) { lang = "kr"; kind = "sans"; }
+  else if (/mingliu|msung|lisong|uming|ming(std|pro)|dfming/.test(n)) { lang = "tc"; kind = "serif"; }
+  else if (/jhenghei|mhei|lihei|dfhei/.test(n)) { lang = "tc"; kind = "sans"; }
+  else if (/dfkai|kaiu|bkai/.test(n)) { lang = "tc"; kind = "kai"; }
+  else if (/kai(ti|std|gb)|fzkai|simkai|stkaiti|ukai|kaiti/.test(n)) { lang = "sc"; kind = "kai"; }
+  else if (/fangsong|fzfs|simfang|stfangsong/.test(n)) { lang = "sc"; kind = "fang"; }
+  else if (/songti|song(std|gb|pro)|stsong|adobesong|fz(shu|xiaobiao|bao|cu)?song|fzxbs|fzss|simsun|zhongsong/.test(n)) { lang = "sc"; kind = "serif"; }
+  else if (/heiti|hei(std|gb)|stheiti|adobeheiti|fz(da)?hei|fzht|simhei|wqy(zen|micro)hei|wenquanyi|pingfang|hiraginosansgb|yahei|dengxian/.test(n)) { lang = "sc"; kind = "sans"; }
+  if (!lang) return null;
+  if (lang === "jp") return kind === "sans" ? "MS Gothic" : "MS Mincho";
+  if (lang === "kr") return kind === "sans" ? "Malgun Gothic" : "Batang";
+  if (lang === "tc") return kind === "sans" ? "Microsoft JhengHei" : kind === "kai" ? "DFKai-SB" : "PMingLiU";
+  if (kind === "kai") return "KaiTi";
+  if (kind === "fang") return "FangSong";
+  // 思源 / Noto 的简体黑体沿用原来的映射（微软雅黑）；其余黑体（方正黑体、Adobe 黑体、华文黑体）用黑体
+  return kind === "sans" ? (noto || /pingfang|yahei|dengxian|wqy|wenquanyi/.test(n) ? "Microsoft YaHei" : "SimHei") : "SimSun";
+}
+
 /** Word / 常见系统里一定有的字体（映射表的目标字体 + 少数通用字体）；不在其中的族名在读者的电脑上多半没有，会被随意替换 */
-const SAFE_FAMILIES = new Set<string>([...Object.values(MAP), "Times New Roman", "Arial", "Courier New", "Calibri", "Cambria", "Cambria Math", "Symbol", "Wingdings", "SimSun", "SimHei", "Microsoft YaHei"]);
+const SAFE_FAMILIES = new Set<string>([...Object.values(MAP), "Times New Roman", "Arial", "Courier New", "Calibri", "Cambria", "Cambria Math", "Symbol", "Wingdings", "SimSun", "SimHei", "Microsoft YaHei",
+  "Batang", "DFKai-SB", "KaiTi", "FangSong", "MS Mincho", "MS Gothic", "Malgun Gothic", "PMingLiU", "Microsoft JhengHei"]);
 export const isSafeFamily = (family: string) => SAFE_FAMILIES.has(family);
 
 /** 小型大写字体（Elsevier 的 Gulliver SCOsF、Minion SC、…SmallCaps）：文字是小写字母，字形是小型大写 */
@@ -132,7 +186,10 @@ export function parseFontName(raw: string | undefined): FontInfo {
   let out = MAP[key] ?? MAP[key.replace(/\d+$/, "")];
   // 出版社定制字体（Times LT Std、Formata、Giovanni……）：按族名归到 Word 中一定有的同类字体，否则在没有该字体的电脑上会被随意替换
   if (!out) {
-    if (/^(times|tmsrm|nimbusrom|ptmr|tirom)/.test(key)) out = "Times New Roman";
+    // 中日韩字体先认：名字里的 "Sans" 不能让 Noto Sans CJK 落进下面的 Arial
+    const cjk = cjkFamily(name);
+    if (cjk) out = cjk;
+    else if (/^(times|tmsrm|nimbusrom|ptmr|tirom)/.test(key)) out = "Times New Roman";
     else if (/^(helvetica|helv|arialmt|phvr|formata|frutiger|univers|myriad|futura|gillsans|optima|syntax|segoe|opensans|roboto|lato|sourcesans|sans)/.test(key) || /sans|grotesk/.test(key)) out = narrow ? "Arial Narrow" : "Arial";
     else if (/^(minion|giovanni|utopia|charter|charis|baskerville|caslon|sabon|stempel|bembo|janson|plantin|lucidabright|stix|mtimes|adobetimes|serif)/.test(key)) out = "Times New Roman";
     else if (/^(courier|mono|lucidatypewriter|inconsolata|menlo)/.test(key) || /mono$/.test(key)) out = "Courier New";

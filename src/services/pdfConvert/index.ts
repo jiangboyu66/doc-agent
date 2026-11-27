@@ -40,6 +40,8 @@ export interface ConversionReport {
   tables: number;
   images: number;
   columnPages: number;
+  /** 竖排页（縦書き，写成竖排的节）的页数；没有时省略 */
+  verticalPages?: number;
   /** 按原样渲染为图片的矢量图 / 行间公式数量 */
   figures: number;
   equations: number;
@@ -152,6 +154,7 @@ async function runBuiltin(buf: Buffer, title: string, pages: PageModel[], mode: 
       (slanted ? `；其中 ${slanted} 行是斜放的，Word / WPS 里按原角度显示，LibreOffice 里显示为横排` : "") + "。");
   }
   if (model.stats.columnPages) notes.push(`${model.stats.columnPages} 页检测到分栏排版（两栏或三栏），已用 Word 分栏还原。`);
+  if (model.stats.verticalPages) notes.push(`${model.stats.verticalPages} 页是竖排文字（从上往下、从右往左），已写成竖排的节。`);
   if (model.notes) notes.push(...model.notes);
   return { data, stats: model.stats, notes, rasterText: model.rasterText };
 }
