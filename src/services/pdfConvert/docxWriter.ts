@@ -74,6 +74,7 @@ class Writer {
     if (r.underline) parts.push('<w:u w:val="single"/>');
     if (r.shade && !hl) parts.push(`<w:shd w:val="clear" w:color="auto" w:fill="${r.shade}"/>`);
     if (r.vertAlign) parts.push(`<w:vertAlign w:val="${r.vertAlign}"/>`);
+    if (r.rtl) parts.push("<w:rtl/>");
     return `<w:rPr>${parts.join("")}</w:rPr>`;
   }
 
@@ -246,7 +247,8 @@ class Writer {
     ppr.push('<w:widowControl w:val="0"/>');
     if (p.borderBottom) ppr.push(`<w:pBdr>${this.border("bottom", p.borderBottom, 0)}</w:pBdr>`);
     if (p.tabs.length) ppr.push(`<w:tabs>${p.tabs.map((t) => `<w:tab w:val="${t.align}" w:pos="${tw(t.pos)}"/>`).join("")}</w:tabs>`);
-    ppr.push('<w:autoSpaceDE w:val="0"/><w:autoSpaceDN w:val="0"/><w:adjustRightInd w:val="0"/><w:snapToGrid w:val="0"/>');
+    // bidi 段落（从右往左）：缩进的 left / right、对齐的 left / right 都指行首 / 行尾（右边 / 左边）
+    ppr.push(`<w:autoSpaceDE w:val="0"/><w:autoSpaceDN w:val="0"/>${p.bidi ? "<w:bidi/>" : ""}<w:adjustRightInd w:val="0"/><w:snapToGrid w:val="0"/>`);
     // 图片段落：单倍行距（行高自动等于图片高度；不用"最小值"——浏览器预览会把它当成行高，图片上方多出一大块空白），其余为固定行距
     // 固定行距会裁掉比行高更高的内容（首字母、行内公式图片）：这种段落改用"最小值"，行高不变、内容不被裁
     const tall = !p.tiny && p.runs.some((r) => (r.img ? (r.img.y1 - r.img.y0) * (r.imgScale ?? 1) > p.lineHeight : !r.tab && !r.br && !!r.text.trim() && r.size > 1.08 * p.lineHeight));

@@ -38,6 +38,8 @@ export interface Run {
   smallCaps?: boolean;
   /** 字距加宽的文字实测的字符间距（pt），优先于按样式统计的间距 */
   tracking?: number;
+  /** 从右往左书写的文字（阿拉伯文、希伯来文） */
+  rtl?: boolean;
   /** 域（页眉页脚中的页码、总页数） */
   field?: "PAGE" | "NUMPAGES";
   /** 域的数字格式：页码补零到的位数（PAGE \# "000000"） */
@@ -60,6 +62,8 @@ export interface Border { width: number; color: string }
 export interface Para {
   kind: "p";
   runs: Run[];
+  /** 从右往左的段落：缩进、对齐、制表位都从行首（右边）算起 */
+  bidi?: boolean;
   /** 制表位只用于首行编号后的正文（编号比悬挂缩进宽）：跨页合并时不算"带制表位的段落" */
   labelTab?: boolean;
   align: "left" | "center" | "right" | "both";
@@ -197,6 +201,34 @@ export interface Line {
   top: number; bottom: number;
   baseline: number;
   size: number;
+  /** 从右往左书写的行，已按版面区域左右镜像（行首在左边、片段按阅读顺序） */
+  rtl?: boolean;
+}
+
+/** 从右往左书写的文字（希伯来文、阿拉伯文及其表现形式） */
+const RTL_CH = /[\u0590-\u05FF\u0600-\u06FF\u0700-\u074F\u0750-\u077F\u08A0-\u08FF\uFB1D-\uFDFF\uFE70-\uFEFF]/g;
+const LTR_CH = /[A-Za-z\u00C0-\u024F\u0370-\u03FF\u0400-\u04FF\u3040-\u30FF\u4E00-\u9FFF\uAC00-\uD7AF]/g;
+const hasRtl = (t: string) => /[\u0590-\u05FF\u0600-\u06FF\u0700-\u074F\u0750-\u077F\u08A0-\u08FF\uFB1D-\uFDFF\uFE70-\uFEFF]/.test(t);
+
+/** 这一行以从右往左的文字为主（阿拉伯文、希伯来文的字母多于其他文字的字母） */
+function isRtlLine(l: Line): boolean {
+  let rtl = 0, ltr = 0;
+  for (const sp of l.spans) { rtl += (sp.text.match(RTL_CH) ?? []).length; ltr += (sp.text.match(LTR_CH) ?? []).length; }
+  return rtl >= 2 && rtl > ltr;
+}
+
+/**
+ * 从右往左的行按版面区域左右镜像：行首（右边）变成左边，片段按阅读顺序排列。之后判断编号、缩进、折行、制表位的
+ * 规则（都按从左往右写成）照样适用，算出的缩进、对齐、制表位在 bidi 段落里正好从行首（右边）算起。
+ * 列表编号单独成一个片段时，PDF 里是显示顺序（".1"、"(1"），改回阅读顺序（"1."、"1)"）
+ */
+function mirrorLine(l: Line, r: Region): Line {
+  const M = r.x0 + r.x1;
+  const spans = l.spans.map((s) => {
+    const m = /^([.(])(\d{1,3})$/.exec(s.text.trim());
+    return { ...s, x0: M - s.x1, x1: M - s.x0, text: m ? `${m[2]}${m[1] === "(" ? ")" : "."}` : s.text };
+  }).reverse();
+  return { ...l, spans, x0: M - l.x1, x1: M - l.x0, rtl: true };
 }
 
 const CELL_MARGIN = 2.85; // pt，单元格左右边距（57 twips）
@@ -1107,7 +1139,7 @@ function groupParagraphs(lines: Line[], r: Region, ctx?: Ctx): Array<{ lines: Li
       // （标题等非正文字号的行、两行都居中的行另按原来的判据，不在此列）
       const runOn = !wrapped && leftOk && !hasBigGap(a, true) && pitchKey(a.size) === bodySize && !(isCentered(a, r) && isCentered(l, r)) &&
         continuesSentence(a, l, edge);
-      if (sizeOk && gapOk && (!startsBullet || inlineToken) && !hasBigGap(l) && (((wrapped || runOn) && leftOk && !hasBigGap(a, true)) || centered)) {
+      if (sizeOk && gapOk && !!a.rtl === !!l.rtl && (!startsBullet || inlineToken) && !hasBigGap(l) && (((wrapped || runOn) && leftOk && !hasBigGap(a, true)) || centered)) {
         P.push(l);
         paraEdge[paraEdge.length - 1] = Math.max(paraEdge[paraEdge.length - 1], edges[idx]);
         return;
@@ -1151,11 +1183,11 @@ function spanFormat(s: Span, lineSize: number, lineBaseline: number): Omit<Run, 
     if (vertAlign) size = Math.max(s.size / 0.66, s.size);
   }
   if (s.img) return { font: s.font, size: lineSize, bold: false, italic: false, color: s.color, img: s.img, imgLower: s.img.y1 - lineBaseline };
-  return { font: s.font, size, bold: s.bold, italic: s.italic, color: s.color, underline: s.underline, strike: s.strike, vertAlign, smallCaps: s.smallCaps, tracking: s.tracking, shade: s.bg };
+  return { font: s.font, size, bold: s.bold, italic: s.italic, color: s.color, underline: s.underline, strike: s.strike, vertAlign, smallCaps: s.smallCaps, tracking: s.tracking, shade: s.bg, ...(hasRtl(s.text) ? { rtl: true } : {}) };
 }
 
 const sameFmt = (a: Run, b: Omit<Run, "text" | "tab">) =>
-  !a.tab && !a.br && !a.img && !b.img && a.font === b.font && a.size === b.size && a.bold === b.bold && a.italic === b.italic && a.color === b.color && !!a.underline === !!b.underline && !!a.strike === !!b.strike && a.vertAlign === b.vertAlign && !!a.smallCaps === !!b.smallCaps && a.tracking === b.tracking && a.shade === b.shade;
+  !a.tab && !a.br && !a.img && !b.img && a.font === b.font && a.size === b.size && a.bold === b.bold && a.italic === b.italic && a.color === b.color && !!a.underline === !!b.underline && !!a.strike === !!b.strike && a.vertAlign === b.vertAlign && !!a.smallCaps === !!b.smallCaps && a.tracking === b.tracking && a.shade === b.shade && !!a.rtl === !!b.rtl;
 
 function pushText(runs: Run[], text: string, fmt: Omit<Run, "text" | "tab">) {
   if (fmt.img) {
@@ -1509,6 +1541,7 @@ function buildPara(lines: Line[], r: Region, blockEdge: number, ctx: Ctx): Para 
     lastFull: Math.min(r.x1, blockEdge > r.x0 ? blockEdge : r.x1) - lastLine.x1 <= Math.max(3, 0.04 * W) ||
       (align === "left" && openEnded(lastLine, Math.min(r.x1, blockEdge > r.x0 ? blockEdge : r.x1))),
     kind: "p", runs: runs.filter((_, k) => kept[k]), align, indLeft, indRight, firstLine, ...(labelTab && tabs.length === 1 ? { labelTab: true } : {}),
+    ...(lines[0].rtl ? { bidi: true } : {}),
     spaceBefore: 0, lineHeight, tabs: tabs.sort((a, b) => a.pos - b.pos), size,
     lineFits: lineFits.map((f) => ({ ...f, start: remap(f.start), end: remap(f.end) })),
   };
@@ -1539,6 +1572,15 @@ function layoutLines(lines: Line[], r: Region, cursor: number, ctx: Ctx, floats?
       lines = lines.filter((l) => !minor.has(l));
     }
   }
+  // 从右往左书写的行（阿拉伯文、希伯来文）：左右镜像后按同样的规则分段、排版，段落写成 bidi 段落。
+  // 以前按从左往右排：行尾单独成片段的列表编号"1."排到了句末、显示成".1"，可编辑排版下第 1、2 条列表项并成一段
+  const orig = new Map<Line, Line>();
+  lines = lines.map((l) => {
+    if (!isRtlLine(l)) return l;
+    const m = mirrorLine(l, r);
+    orig.set(m, l);
+    return m;
+  });
   for (const { lines: group, edge } of groupParagraphs(lines, r, ctx)) {
     const p = buildPara(group, r, edge, ctx);
     const top = group[0].baseline - baselineOffset(p.lineHeight, p.size);
@@ -1546,7 +1588,7 @@ function layoutLines(lines: Line[], r: Region, cursor: number, ctx: Ctx, floats?
     p.srcTop = top;
     p.srcBottom = top + p.lineHeight * group.length;
     // 旁边的浮动图片挂在这一段上：相对栏左边界、段落顶部定位
-    for (const l of group) for (const img of floats?.get(l) ?? []) (p.floats ??= []).push({ img, dx: img.x0 - r.x0, dy: img.y0 - top });
+    for (const l of group) for (const img of floats?.get(orig.get(l) ?? l) ?? []) (p.floats ??= []).push({ img, dx: img.x0 - r.x0, dy: img.y0 - top });
     paras.push(p);
     cursor = Math.max(cursor, top) + p.lineHeight * group.length;
   }

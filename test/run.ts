@@ -688,6 +688,28 @@ await test("只有一行大字的绘本式幻灯片：默认字号不超过 14pt
   }
 });
 
+await test("从右往左的文字（希伯来文）：写成 bidi 段落；行右端的列表编号回到行首、显示顺序 \".1\" 改回 \"1.\"；可编辑排版下列表项各成一段（两种模式）", async () => {
+  const { pdfToDocx } = await import("../src/services/pdfConvert/index.js");
+  const pdf = await fixture("rtl-list.pdf");
+  const textOf = (x: string) => (x.match(/<w:t[^>]*>([^<]*)<\/w:t>/g) ?? []).map((t) => t.replace(/<[^>]+>/g, "")).join("");
+  for (const mode of ["exact", "flow"] as const) {
+    const { data, report } = await pdfToDocx(pdf, { mode });
+    eq(report.textCoverage, 1, `${mode}：文字完整性`);
+    const xml = new ZipPackage(data).readText("word/document.xml");
+    const paras = (xml.match(/<w:p\b[^>]*>[\s\S]*?<\/w:p>/g) ?? []).filter((p) => textOf(p).trim());
+    const items = paras.filter((p) => /^\d\./.test(textOf(p)));
+    eq(items.map((p) => textOf(p).slice(0, 2)).join(" "), "1. 2. 3.", `${mode}：三条列表项各成一段，编号在阅读顺序的最前面`);
+    for (const p of items) {
+      assert(p.includes("<w:bidi/>") && p.includes("<w:rtl/>"), `${mode}：列表项是 bidi 段落、希伯来文是从右往左的 run`);
+      assert(/<w:t[^>]*>\d\.<\/w:t><\/w:r><w:r>(?:(?!<\/w:r>).)*?<w:tab\/>/.test(p), `${mode}：编号后是制表符（悬挂缩进）`);
+    }
+    assert(!xml.includes(">.1<") && !xml.includes(">.2<"), `${mode}：不应出现显示顺序的 ".1"`);
+    const english = paras.find((p) => textOf(p).startsWith("English summary")) ?? "";
+    assert(!!english && !english.includes("<w:bidi/>"), `${mode}：英文段落不是 bidi 段落`);
+    if (mode === "flow") eq(paras.filter((p) => p.includes("<w:bidi/>") && !/^\d\./.test(textOf(p))).length, 2, "flow：希伯来文标题、正文各一段");
+  }
+});
+
 await test("叠印加粗（同一段文字在几乎同一位置画了四遍）只留一份、记为粗体（两种模式）", async () => {
   const { pdfToDocx } = await import("../src/services/pdfConvert/index.js");
   const pdf = await fixture("overprint.pdf");
@@ -1481,7 +1503,7 @@ await test("所有夹具 PDF：两种排版方式都不报错、文字完整；L
   const run = promisify(execFile);
   const soffice = process.env.SOFFICE_PATH || "soffice";
   const hasSoffice = await run(soffice, ["--version"]).then(() => true, () => false);
-  const names = ["columns", "journal", "figures", "math", "journal-front", "journal-eq", "journal-fig", "bios", "colstart", "signature", "citecolor", "texpaper", "contract-cn", "scan-letter", "furniture-cn", "bates", "rotated-text", "mixed-pages", "image-slides", "open-table", "color-blocks", "form-boxes", "image-rows", "logo-corner", "overprint", "dense-cells"];
+  const names = ["columns", "journal", "figures", "math", "journal-front", "journal-eq", "journal-fig", "bios", "colstart", "signature", "citecolor", "texpaper", "contract-cn", "scan-letter", "furniture-cn", "bates", "rotated-text", "mixed-pages", "image-slides", "open-table", "color-blocks", "form-boxes", "image-rows", "logo-corner", "overprint", "dense-cells", "rtl-list"];
   const dir = await fs.mkdtemp(path.join(tmp, "pages-"));
   const bad: string[] = [];
   for (const name of names) {
