@@ -276,7 +276,14 @@ export function buildLines(spans: Span[]): Line[] {
       // 同一个标点叠在自己的副本上（重复绘制的文字层）仍算冲突
       const lonePunct = (x: Span) => !x.img && LONE_PUNCT.test(x.text.trim());
       const punctOverlap = (o: Span) => (lonePunct(o) || lonePunct(s)) && o.text.trim() !== s.text.trim();
-      const clash = g.spans.some((o) => Math.min(o.x1, s.x1) - Math.max(o.x0, s.x0) > 0.3 * Math.min(o.x1 - o.x0, s.x1 - s.x0) && !punctOverlap(o) && !(accentLike(o) !== accentLike(s) && Math.abs(o.baseline - s.baseline) <= 0.45 * Math.max(o.size, s.size)));
+      // 识别文字层的字框偏大：后一个片段的开头压在前一个片段的末尾（"護が可肯" 的"肯"与后面的"巨"重叠 3pt），后一个片段
+      // 伸出前一个的右端、重叠不到它自身宽度的一半、字号相同：是同一行接着写，不是叠印。算作冲突的话这一行从"巨"起另成一行，
+      // 在流式排版里另起一段（2026-11-27 WO2017038541A1 首页 (84)）
+      const tailOverlap = (o: Span) => {
+        const ov = Math.min(o.x1, s.x1) - Math.max(o.x0, s.x0);
+        return Math.abs(o.size - s.size) < 0.6 && s.x0 >= o.x0 + 0.6 * (o.x1 - o.x0) && s.x1 > o.x1 + 0.3 * (s.x1 - s.x0) && ov <= 0.45 * (s.x1 - s.x0);
+      };
+      const clash = g.spans.some((o) => Math.min(o.x1, s.x1) - Math.max(o.x0, s.x0) > 0.3 * Math.min(o.x1 - o.x0, s.x1 - s.x0) && !punctOverlap(o) && !tailOverlap(o) && !(accentLike(o) !== accentLike(s) && Math.abs(o.baseline - s.baseline) <= 0.45 * Math.max(o.size, s.size)));
       if (clash) continue;
       // 上下标优先并入左右紧挨着它的那一行：另一栏恰好同基线的行不能把它抢走（左栏的 M_θ* 并进右栏那一行）
       const small = s.size < 0.85 * gSize;
@@ -1040,6 +1047,7 @@ function contentsTab(runs: Run[], tabs: TabStop[], pos: number): string | null {
 
 /** 行内有制表间距（并排的标签、签字栏）；skipLabel：行首编号后的制表间距不算（悬挂缩进的条款） */
 function hasBigGap(l: Line, skipLabel = false): boolean {
+  if (proseLines.has(l)) return false;
   const from = skipLabel && labelLead(l) ? 2 : 1;
   for (let i = from; i < l.spans.length; i++) if (l.spans[i].x0 - l.spans[i - 1].x1 > Math.max(1.2 * l.size, 12)) return true;
   return false;
@@ -1118,10 +1126,64 @@ function wrapEdges(lines: Line[], r: Region, edges: number[]): number[] {
   });
 }
 
+/** 行里最大的字号（不算行内图片）：识别文字层里中日文字和西文混排时两种字号，行的字号按字数取，同一段的各行忽大忽小 */
+const lineEm = (l: Line) => Math.max(l.size, ...l.spans.filter((s) => !s.img && s.text.trim()).map((s) => s.size));
+
+/**
+ * 被拉开的正文行（流式模式）。两端对齐的窄栏、扫描件的识别文字层（词宽按替代字体算，比扫描图上的字窄）里，
+ * 行内常有一两处词距超过制表间距的门槛 max(1.2×字号, 12pt)：按制表位处理，这一行单独成段、在原位置设制表位，
+ * 上下行也不并进来，译文变短后行中、行尾留下大片空白，一句话被拆到几段里分别翻
+ * （2026-11-27 WO2017038541A1 首页：英文摘要 19 行里 7 行各有一处 12.1–13.6pt 的词距，只是同一行普通词距的
+ * 1.1–1.9 倍，19 行成了 12 段；英文发明名称一行、(72)(74)(84) 著录项目同样）。下面这些行里不超过 3.5 个字宽的空隙
+ * 按词距算，不设制表位、不断段：
+ *   - 两端对齐的非末行：行尾到本栏右边界（容差 2 个字宽），下一行从本行起点或正文起点接着排（字号相近、
+ *     行距不超过 1.75 个字宽、不以编号开头）；至少 3 处空隙；
+ *   - 紧跟这样一行的下一行（段落末行等）：从上一行起点或正文起点起排，至少 2 处空隙，最宽不超过 2.5 个字宽；
+ *   - 词距均匀的一行（发明名称）：至少 4 处空隙，最宽的不超过中位数的 1.6 倍、不超过 3 个字宽，多数片段是词。
+ * 宽空隙在前后 3 行内又有两行与它对齐（空隙后的字从同一处起排，或空隙前的字在同一处结束：没认出的分栏、
+ * 表单里对齐的填写栏），仍是制表间距
+ */
+const proseLines = new WeakSet<Line>();
+
+function markProseLines(lines: Line[], r: Region, edges: number[], ctx?: Ctx): void {
+  if (ctx?.mode !== "flow" || !lines.length) return;
+  const limit = (l: Line) => Math.max(1.2 * l.size, 12);
+  const gapsOf = (l: Line) => {
+    const out: Array<{ x0: number; x1: number }> = [];
+    for (let k = labelLead(l) ? 2 : 1; k < l.spans.length; k++) out.push({ x0: l.spans[k - 1].x1, x1: l.spans[k].x0 });
+    return out;
+  };
+  const wide = lines.map((l) => gapsOf(l).filter((g) => g.x1 - g.x0 > limit(l)));
+  const aligned = (i: number) => wide[i].some((g) => {
+    let n = 0;
+    for (let j = Math.max(0, i - 3); j <= Math.min(lines.length - 1, i + 3); j++) {
+      // 对齐：空隙后的字从同一处起排（制表位、右栏的左边界），或空隙前的字在同一处结束（左栏的右边界）
+      if (j !== i && wide[j].some((h) => Math.min(g.x1, h.x1) > Math.max(g.x0, h.x0) && (Math.abs(g.x1 - h.x1) <= 2 || Math.abs(g.x0 - h.x0) <= 2))) n++;
+    }
+    return n >= 2;
+  });
+  const continues = (l: Line, n: Line | undefined): boolean => !!n && !labelHead(n) &&
+    Math.abs(lineEm(n) - lineEm(l)) <= 0.15 * lineEm(l) && n.baseline > l.baseline && n.baseline - l.baseline <= 1.75 * lineEm(l) &&
+    (Math.abs(n.x0 - l.x0) <= 3 || Math.abs(n.x0 - textStart(l)) <= 3);
+  const body = lines.map((l, i) => l.x1 >= Math.min(edges[i], r.x1) - Math.max(2 * lineEm(l), 0.04 * (edges[i] - textStart(l))) && continues(l, lines[i + 1]));
+  lines.forEach((l, i) => {
+    if (!wide[i].length || aligned(i)) return;
+    const gaps = gapsOf(l).map((g) => g.x1 - g.x0);
+    const max = Math.max(...gaps), em = lineEm(l);
+    if (body[i] && gaps.length >= 3 && max <= 3.5 * em) { proseLines.add(l); return; }
+    if (i > 0 && body[i - 1] && continues(lines[i - 1], l) && gaps.length >= 2 && max <= 2.5 * em) { proseLines.add(l); return; }
+    const pos = gaps.filter((g) => g > 0).sort((a, b) => a - b);
+    const med = pos.length ? pos[Math.floor(pos.length / 2)] : 0;
+    const words = l.spans.slice(labelLead(l) ? 1 : 0).filter((s) => !s.img && s.text.trim());
+    if (pos.length >= 4 && max <= 1.6 * med && max <= 3 * em && words.filter((s) => /\p{L}.*\p{L}/u.test(s.text)).length >= 0.6 * words.length) proseLines.add(l);
+  });
+}
+
 function groupParagraphs(lines: Line[], r: Region, ctx?: Ctx): Array<{ lines: Line[]; edge: number }> {
   const paras: Line[][] = [];
   const paraEdge: number[] = [];
   const edges = localEdges(lines, r);
+  markProseLines(lines, r, edges, ctx);
   const wraps = wrapEdges(lines, r, edges);
   // 这组行里占多数的字号（按字数）：只有正文字号的行才按"句子没写完"接到上一行（标题、题注另行判断）
   const bySize = new Map<number, number>();
@@ -1133,7 +1195,9 @@ function groupParagraphs(lines: Line[], r: Region, ctx?: Ctx): Array<{ lines: Li
       const a = P[P.length - 1];
       const gap = l.baseline - a.baseline;
       const pitch = P.length >= 2 ? P[P.length - 1].baseline - P[P.length - 2].baseline : 0;
-      const sizeOk = Math.abs(l.size - a.size) <= 0.15 * a.size;
+      // 识别文字层里中日文字和西文混排的行（著录项目），行的字号按字数取、同一段各行忽大忽小：按行里最大的字号也算同一字号
+      const sizeOk = Math.abs(l.size - a.size) <= 0.15 * a.size ||
+        (ctx?.mode === "flow" && Math.abs(lineEm(l) - lineEm(a)) <= 0.15 * lineEm(a) && Math.abs(l.size - a.size) <= 0.35 * lineEm(a));
       // 行距上限：西文正文的行距约为字号的 1.2 倍，1.75 倍足以区分"段内换行"与"段间空行"；
       // 中文合同常用 1.5 倍 / 2 倍行距（基线间距是字号的 2.1–2.6 倍），按 1.75 倍判断会把每一行都切成一段。
       // 同字号的正文在全文中有一个占绝对多数的行距：不超过它（容差 6%）的都是段内换行
@@ -1260,7 +1324,7 @@ function lineMeasure(l: Line): { actual: number; natural: number; word: number; 
       // 每个字都被加上字符间距、在 Word 里变宽后互相挤到下一行。
       // 以此前所有文字的最右端为准：与前文重叠的符号（伸进上一行的根号）后面不算空隙
       const open = s.x0 - before;
-      if (open > Math.max(1.2 * l.size, 12)) { tabGaps += open; return; }
+      if (open > Math.max(1.2 * l.size, 12) && !proseLines.has(l)) { tabGaps += open; return; }
       if (gap > 0.1 * s.size && !/\s$/.test(spans[i - 1].text) && !/^\s/.test(s.text)) {
         natural += Math.min(s.spaceW ?? 0.25 * s.size, spans[i - 1].spaceW ?? 0.25 * s.size);
         word += Math.min(s.wordSpaceW ?? s.spaceW ?? 0.25 * s.size, spans[i - 1].wordSpaceW ?? spans[i - 1].spaceW ?? 0.25 * s.size);
@@ -1283,7 +1347,9 @@ function stretch(l: Line): number | null {
  */
 function isJustified(lines: Line[], paraRight: number): boolean {
   const body = lines.slice(0, -1);
-  const atEdge = body.filter((l) => Math.abs(paraRight - l.x1) <= 1.5);
+  // 被拉开的识别文字行：行尾按替代字体的字宽算，参差一两个字宽
+  const tol = lines.some((l) => proseLines.has(l)) ? Math.max(1.5, 2 * lineEm(lines[0])) : 1.5;
+  const atEdge = body.filter((l) => Math.abs(paraRight - l.x1) <= tol);
   if (atEdge.length < Math.max(1, body.length * 0.8)) return false;
   // 非两端对齐的行，实测宽度与自然宽度一致（±0.1%）；两端对齐的行会被拉宽，或被压缩词间距（Word 2013+ / LibreOffice 的智能两端对齐）
   const ratios = atEdge.map(stretch).filter((r): r is number => r !== null);
@@ -1461,7 +1527,7 @@ function buildPara(lines: Line[], r: Region, blockEdge: number, ctx: Ctx): Para 
         const p = l.spans[si - 1];
         const gap = s.x0 - p.x1;
         const leftAligned = align === "left" || align === "both";
-        if (leftAligned && gap > Math.max(1.2 * l.size, 12)) {
+        if (leftAligned && gap > Math.max(1.2 * l.size, 12) && !proseLines.has(l)) {
           // 大间距 → 制表符，制表位就是原文字的横坐标；
           // 最后一段顶到右边界（公式编号"(1)"、页码等）→ 右对齐制表位，放在段尾的位置，
           // 不受字宽差异影响，永远不会被挤到下一行
@@ -2915,6 +2981,26 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
         ctx.boxes.push(...lineBoxes(m.line, ctx));
         items.splice(items.indexOf(m), 1);
       }
+    } else if (flow) {
+      // 流式模式：与通栏行同一高度、只有几个字的分栏行并进那一行（徽标下的 "WIPO | PCT" 被识别成 "W 画" 和
+      // "P O … P C T"，前者落在左栏范围、后者跨过栏间距）。否则它被挤到下面的分栏带里、占掉左栏的第一行，
+      // 左栏的 (51) 比右栏的 (74) 低一行（2026-11-27 WO2017038541A1 首页）
+      type LineItem = Extract<Item, { kind: "line" }> & { top: number };
+      const lineItems = items.filter((it): it is LineItem => it.kind === "line");
+      for (const a of lineItems) {
+        if (a.side !== "full") continue;
+        for (const b of lineItems) {
+          if (b.side === "full" || !items.includes(b) || lineChars(b.line) > 12 || !sameRow(a.line, b.line)) continue;
+          if (Math.abs(b.line.baseline - a.line.baseline) > 0.3 * Math.max(a.line.size, b.line.size)) continue;
+          a.line = {
+            ...a.line, spans: [...a.line.spans, ...b.line.spans].sort((p, q) => p.x0 - q.x0),
+            x0: Math.min(a.line.x0, b.line.x0), x1: Math.max(a.line.x1, b.line.x1),
+            top: Math.min(a.line.top, b.line.top), bottom: Math.max(a.line.bottom, b.line.bottom),
+          };
+          a.top = Math.min(a.top, b.top);
+          items.splice(items.indexOf(b), 1);
+        }
+      }
     }
 
     // 通栏条目把页面切成若干带；分栏条目只有在两侧都有内容的区域才构成分栏带
@@ -2959,7 +3045,17 @@ export function buildDocModel(pages0: PageModel[], opts: { mode?: LayoutMode; ra
           // 不加时 Word 平衡两栏，右栏开头的几行排到了左栏的附图下面（WO2017038541A1 首页，2026-11-27）
           const lastL = [...L.blocks].reverse().find((b) => !(b.kind === "p" && b.tiny && !b.inlineImages));
           const beside = R.blocks.length > 0 && !!lastL && (lastL.kind === "table" || (lastL.kind === "p" && !!lastL.inlineImages));
-          blocks.push(...L.blocks, ...(beside ? [tinyPara({ columnBreakBefore: true })] : []), ...R.blocks);
+          // 右栏另起一项（著录项目 "(74) 代理人…"、以编号开头的条目），带又不高（不是满页的两栏正文）：右栏不是左栏的续文，
+          // 也加分栏符。不加时由 Word / LibreOffice 平衡两栏决定右栏从哪一行起，译文左右两栏长短变化不一样，分栏点会移动；
+          // 被平衡排到栏顶的那一段，段前距在栏顶被去掉（2026-11-27 WO2017038541A1 首页：(74) 比左栏的 (51) 高出一行）
+          const firstR = band.items.find((i) => i.side === "R");
+          const bandH = Math.max(...band.items.map((i) => (i.kind === "line" ? i.line.bottom : i.top))) - Math.min(...band.items.map((i) => i.top));
+          const fresh = !beside && R.blocks.length > 0 && firstR?.kind === "line" && labelHead(firstR.line) && bandH <= 0.5 * pg.height;
+          const lead: Para[] = beside || fresh ? [tinyPara({ columnBreakBefore: true })] : [];
+          const f = R.blocks[0];
+          // 右栏顶部离带顶的距离：分栏符后的段前距 LibreOffice 会去掉，改成固定高度的空段（两种排版引擎都保留）
+          if (fresh && f?.kind === "p" && f.spaceBefore > 2 * TINY) { lead.push(spacer(f.spaceBefore - TINY)); f.spaceBefore = 0; }
+          blocks.push(...L.blocks, ...lead, ...R.blocks);
           cursor = Math.max(L.cursor, R.cursor);
           continue;
         }

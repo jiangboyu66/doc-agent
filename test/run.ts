@@ -1490,7 +1490,7 @@ await test("扫描件：整页扫描图按页面坐标铺满原页（不再 3 �
   }
 });
 
-await test("扫描件首页（看得见的 OCR 文字层）：著录项目的两栏不被栏内空隙、网格对齐的代码清单搅乱；大号公开号不吞并两侧小字；与左栏同高、跨过栏间的徽标碎字按原位置成文本框；OCR 标点字框压住下一个字不拆行", async () => {
+await test("扫描件首页（看得见的 OCR 文字层）：著录项目的两栏不被栏内空隙、网格对齐的代码清单搅乱；大号公开号不吞并两侧小字；与左栏同高、跨过栏间的徽标碎字按原位置成文本框；OCR 标点字框压住下一个字、同字号的字框首尾相压都不拆行", async () => {
   const { buildLines, detectGutter, buildDocModel } = await import("../src/services/pdfConvert/layout.js");
   // OCR 文字的字框偏高（上沿约一个字号）
   const sp = (text: string, x0: number, x1: number, bl: number, size: number) => ({ text, x0, x1, top: bl - size, bottom: bl + 0.27 * size, baseline: bl, size, font: "MS-Mincho", bold: false, italic: false, color: "000000" });
@@ -1500,6 +1500,8 @@ await test("扫描件首页（看得见的 OCR 文字层）：著录项目的两
   // 后面的内容整块下移；同一个标点叠在自己的副本上（重复绘制的文字层）仍要拆开
   eq(buildLines([sp("ステップ", 115, 160, 605, 10), sp("（", 165.2, 175.4, 605, 10), sp("S", 171.7, 178.5, 605, 10), sp("1 0 8", 185.4, 213.6, 605, 10), sp("）", 215, 225, 605, 10)] as any).length, 1, "（S108）应在同一行");
   eq(buildLines([sp("input image", 335.5, 375, 616, 6.5), sp("：", 381, 389.3, 616, 6.5), sp("frame so that the subject", 381.6, 470, 616, 6.5)] as any).length, 1, "input image ：frame … 应在同一行");
+  // 识别字框偏宽："肯" 的字框伸进后面的 "巨" 3pt（重叠超过 "巨" 宽度的 0.3），字号相同、"巨" 伸出 "肯" 的右端：同一行接着写
+  eq(buildLines([sp("護が可肯", 339.6, 381.4, 326.9, 8.5), sp("巨", 378.2, 386.6, 326.9, 8.5), sp("）", 384, 392.4, 326.9, 8.5), sp("：", 387.6, 396, 326.9, 8.5), sp("ARIPO", 392.6, 412.9, 327.9, 6.5)] as any).length, 1, "護が可肯巨）：ARIPO 应在同一行");
   const dup = buildLines([sp("abc", 50, 70, 100, 10), sp("abc", 50.2, 70.2, 100, 10), sp("，", 70, 76, 100, 10), sp("，", 70.2, 76.2, 100, 10)] as any);
   assert(dup.length === 2 && dup.every((l) => l.spans.filter((s) => s.text === "，").length === 1), `重复绘制的两层文字各成一行、各带一个逗号：${dup.map((l) => l.spans.map((s) => s.text).join("")).join(" | ")}`);
 
@@ -1913,6 +1915,34 @@ await test("扫描件首页（scan-front.pdf，WIPO 小册子首页的版式）�
   assert(!paras.slice(0, figure).some((t) => t.includes("Abstract")), "摘要的开头不排在附图上面");
   const last = xml.slice(xml.lastIndexOf("<w:sectPr"));
   assert(/<w:cols w:num="2"/.test(last), "附图与摘要在两栏的一节里");
+});
+
+await test("扫描件首页的识别文字按词摆放（scan-front-words.pdf）：两端对齐被拉开的词距不当制表位——摘要、(72)(74) 各成一段，发明名称一行不切开；真正的对齐字段仍用制表位；右栏以 (74) 起头时加分栏符", async () => {
+  const { pdfToDocx } = await import("../src/services/pdfConvert/index.js");
+  const { data, report } = await pdfToDocx(await fixture("scan-front-words.pdf"), { mode: "flow" });
+  eq(report.textCoverage, 1, "文字完整性");
+  const xml = new ZipPackage(data).readText("word/document.xml");
+  const paras = (xml.match(/<w:p[ >][\s\S]*?<\/w:p>/g) ?? [])
+    .map((p) => (p.includes('w:type="column"') ? "[COLBR]" : "") + p.replace(/<w:tab\/>/g, "⇥").replace(/<[^>]+>/g, ""))
+    .filter((t) => t.trim());
+  const find = (start: string) => paras.findIndex((t) => t.replace(/⇥/g, " ").replace(/\s+/g, " ").trim().startsWith(start));
+  const all = paras.join(" | ");
+  // 摘要：十一行一段，行内没有制表符
+  const abstract = paras[find("(57) Abstract:")] ?? "";
+  assert(abstract.endsWith("for a bullet-time video.") && !abstract.includes("⇥"), `摘要应整段、不含制表符：${all.slice(0, 600)}`);
+  // 发明名称：一行，"Title:" 之后不切开
+  const title = paras[find("(54) Title:")] ?? "";
+  assert(/Title: VIDEO PROCESSING DEVICE, VIDEO PROCESSING METHOD, AND PROGRAM$/.test(title), `发明名称一行、词间不是制表符：${title}`);
+  // (72)：三行一段（编号后的悬挂制表符除外，没有别的制表符）
+  const inventors = paras[find("(72) Inventors:")] ?? "";
+  assert(inventors.includes("SAMPLE Jiro; 1-7-1 Konan, Minato-ku, Tokyo (ZZ).") && inventors.split("⇥").length <= 2, `(72) 应整段：${inventors}`);
+  // (74)：右栏第一段，前面是分栏符，地址并进同一段
+  const agent = find("(74) Agent:");
+  assert(agent > 0 && paras[agent - 1] === "[COLBR]", `(74) 之前应有分栏符：${all.slice(0, 600)}`);
+  assert(paras[agent].includes("Nishi-Shinjuku, 7-5-25 Shinjuku-ku, Tokyo 160-0023 (ZZ).") && paras[agent].split("⇥").length <= 2, `(74) 应整段：${paras[agent]}`);
+  // 真正的对齐字段：IPC 两列、申请号靠右，仍用制表位
+  assert(/\(2006\.01\)⇥H04N/.test(paras[find("H04N 5/232")] ?? ""), "IPC 两列之间应是制表符");
+  assert(/Number:⇥PCT\/ZZ2099\/000001$/.test(paras[find("(21)")] ?? ""), "申请号前应是制表符");
 });
 
 await test("没有文字层的扫描专利（scan-turned.pdf，US20040163766A1 的 incoPat 文本）：转 90° 放的附图页转正、整页保留；页面框与扫描图横竖互换的页按扫描图的大小和方向转；文字页（scanBlocks）按栏、按段分成原位文本框——块图只有本块的字、底图抹掉这些字、附图留在底图上，两者拼回去就是原扫描图", async () => {
